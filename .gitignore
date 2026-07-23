@@ -1,0 +1,14 @@
+# Build output
+build/
+compile_commands.json
+
+# Machine-local secrets — the real file lives at /mnt/S/Telegram.json.
+# See Tools/Telegram.example.json for the template.
+Telegram.json
+
+# Local tool state
+.claude/settings.local.json
+
+# Stray runtime artifacts
+_clientId
+_sharedArrays.Count

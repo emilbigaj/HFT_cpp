@@ -1,0 +1,6 @@
+{
+  // Copy the active CMake preset's compile_commands.json to the workspace root on every
+  // (re)configure, so clangd always reads flags matching the build you're actually doing.
+  // Switch preset (Linux Debug <-> Linux Release) + configure -> root copy updates to match.
+  "cmake.copyCompileCommands": "${workspaceFolder}/compile_commands.json"
+}

@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cat)",
+      "Bash(g++ -std=c++20 -c /tmp/al_test.cpp -o /tmp/al_test.o)"
+    ]
+  }
+}
