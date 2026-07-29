@@ -34,7 +34,6 @@ class Server
 {
 public:
     const std::filesystem::path ServerName;
-
 private:
     const Socket::LetterBox<ServerHeader> _serverHeaderBox;
     Socket::ServerSocket _serverSocket;
@@ -86,6 +85,7 @@ public:
         .ClientIds = Tools::Bitset64(),
         .CoreGroupIds = Tools::Bitset64(),
         .OrdersPerClient = 64,
+        .Persistance = true,
     };
 
     std::function<void(const Execution::OrderTarget&)> OrderTarget;
@@ -95,6 +95,12 @@ public:
 
 
     std::function<void(const AllocateInstrument&)> AllocateInstrument;
+    std::function<void(const Socket::SocketHeader&)> AllocateClient;
+
+    std::function<void(int32_t)> ClientOpened;
+    std::function<void(int32_t)> ClientClosed;
+
+
 
     Server(const ServerHeader& serverHeader)
     : ServerName(serverHeader.ServerName.ToString()),
@@ -106,6 +112,10 @@ public:
       _riskLayer(ServerName, Execution::OrderRejectedSource::Server),
       _loggableManager()
     {
+        // Before anything else: LoadClients() runs between construction and Connect(), and
+        // CreateDetatchedClient() refuses to build a Detached socket while this is false.
+        _serverSocket.Persistance = serverHeader.Persistance;
+
         _instrumentData.resize(static_cast<size_t>(serverHeader.InstrumentIds.Length()));
         // +1: channel index == CoreGroupId, so we need slots 0..HighestSet() (matches BuildChannelLengths).
         _clientIdsByCoreGroupId.resize(static_cast<size_t>(serverHeader.CoreGroupIds.HighestSet() + 1));
@@ -115,25 +125,44 @@ public:
             if (coreGroupId != Socket::SocketChannel::Admin)
                 _orderTargetQueues[static_cast<size_t>(coreGroupId)] = std::make_unique<Tools::ByteQueue>(Tools::Memory::SmallPageLength);
 
-        _serverSocket.AllocateClientId = [this](const Socket::SocketHeader& header) {
-            return _serverContext.AllocateClientId(header); 
+        _serverSocket.AllocateClientId = [this](const Socket::SocketHeader& socketHeader) {
+            return _serverContext.AllocateClientId(socketHeader); 
         };
 
         _serverSocket.DeallocateClient = [this](int32_t clientId) {
             return _serverContext.DeallocateClient(clientId);
         };
 
-        _serverSocket.ClientAllocated = [this](const Socket::SocketHeader& header) { 
-            this->OnClientAllocated(header); 
+        _serverSocket.ClientAllocated = [this](const Socket::SocketHeader& socketHeader) { 
+            this->OnClientAllocated(socketHeader);
         };
 
-        _serverSocket.ClientDeallocated = [this](const Socket::SocketHeader& header) { 
-            this->OnClientDeallocated(header);
+        // never called with Persistance
+        _serverSocket.ClientDeallocated = [this](const Socket::SocketHeader& socketHeader) { 
+            this->OnClientDeallocated(socketHeader);
         };
 
-        _serverSocket.Listen();
+        
+        _serverSocket.ClientOpened = [this](int32_t clientId) { 
+            this->OnClientOpened(clientId);
+        };
+        
+        _serverSocket.ClientClosed = [this](int32_t clientId) { 
+            this->OnClientClosed(clientId);
+        };
+        
+        
+
         _loggingServer.Connect();
         _audit.Connect();
+
+    }
+
+    // Starts the listen thread. Call after LoadClients()/LoadInstruments() so the poll thread
+    // cannot race them for the same clientId. Persistance comes from the ServerHeader, not here.
+    void Connect()
+    {
+        _serverSocket.Listen();
     }
 
     template <typename T> requires Tools::PlainOldData<T>
@@ -176,11 +205,16 @@ public:
             Tools::Bitset64 clientIds = _serverSocket.ClientIds();
             closedClientIds = _clientIds & ~clientIds;
             _clientIds = clientIds;
+            if (closedClientIds.IsEmpty())
+                        return;
             for(int32_t clientId : closedClientIds)
                 CancelAllOrders(clientId);
         }
+
         
+
         {
+
             int32_t coreGroupsIdsCount = static_cast<int32_t>(_clientIdsByCoreGroupId.size());
             for(int32_t coreGroupId = 0; coreGroupId < coreGroupsIdsCount; coreGroupId++)
             {
@@ -464,6 +498,9 @@ public:
         int32_t instrumentId = _serverContext.AllocateInstrument(allocateInstrument.InstrumentHeaderId);
         allocateInstrument.InstrumentId = instrumentId;
 
+        if (_instrumentData[static_cast<size_t>(instrumentId)])
+            return instrumentId; // already attached + seeded
+
         Data::InstrumentHeader128& header128 = _serverContext.GetInstrumentHeader(allocateInstrument.InstrumentHeaderId).GetRef();
         allocateInstrument.Symbol = header128.Symbology()->ToString();
 
@@ -473,7 +510,6 @@ public:
 
         if (AllocateInstrument)
             AllocateInstrument(allocateInstrument);
-
 
         return instrumentId;
     }
@@ -555,6 +591,7 @@ public:
             return;
         std::string name = Socket::SocketChannel::GetInstrumentDataName(ServerName.string(), symbol);
         _instrumentData[static_cast<size_t>(instrumentId)] = std::make_unique<Socket::WriteOnlySocket>(name, Socket::SharedMemory::CreateOrOpen(name, Socket::SocketChannel::InstrumentDataChannelLength));
+        _instrumentData[static_cast<size_t>(instrumentId)]->Recover();
     }
 
     // Broadcast a trade/settlement tick verbatim to the instrument's ring.
@@ -665,29 +702,82 @@ public:
         _serverSocket.Dispose();
     }
 
+    void LoadClients(const Tools::Timestamp date)
+    {
+        std::filesystem::path clientsFilePath = _serverContext.GetClientsFilePath(date);
+        if (!std::filesystem::exists(clientsFilePath))
+            return;
+        std::ifstream clientsFile(clientsFilePath);
+        std::string line;
+        while (std::getline(clientsFile, line))
+        {
+            Socket::SocketHeader socketHeader = Tools::Json::Deserialize<Socket::SocketHeader>(line);
+            socketHeader.ClientId = _serverContext.AllocateClientId(socketHeader);
+            _serverSocket.CreateDetatchedClient(socketHeader);
+            OnClientAllocated(socketHeader);
+        }
+    }
+
+    void LoadInstruments(const Tools::Timestamp date)
+    {
+        std::filesystem::path instrumentsFilePath = _serverContext.GetInstrumentsFilePath(date);
+        if (!std::filesystem::exists(instrumentsFilePath))
+            return;
+        std::ifstream instrumentsFile(instrumentsFilePath);
+        std::string line;
+        while (std::getline(instrumentsFile, line))
+        {
+            Provider::AllocateInstrument allocateInstrument = Tools::Json::Deserialize<Provider::AllocateInstrument>(line);
+            OnAllocateInstrument(allocateInstrument);
+        }
+    }
+
+    void SaveClient(const Socket::SocketHeader& socketHeader, const Tools::Timestamp date)
+    {
+        std::filesystem::path clientsFilePath = _serverContext.GetClientsFilePath(date);
+        std::string line = Tools::Json::SerializeToLine(socketHeader);
+        std::ofstream clientsFile(clientsFilePath, std::ios::app);
+        clientsFile << line << std::endl;
+    }
+
+    void SaveInstrument(const Provider::AllocateInstrument& allocateInstrument, const Tools::Timestamp date)
+    {
+        std::filesystem::path instrumentsFilePath = _serverContext.GetInstrumentsFilePath(date);
+        std::string line = Tools::Json::SerializeToLine(allocateInstrument);
+        std::ofstream instrumentsFile(instrumentsFilePath, std::ios::app);
+        instrumentsFile << line << std::endl;
+    }
+
 private:
 
     void OnClientAllocated(const Socket::SocketHeader& socketHeader)
-    {       
+    {   
+        // this is the open signal for the logger
         _loggingServer.Write(socketHeader);
+        if(AllocateClient)
+            AllocateClient(socketHeader);
+    }
 
-        AllocateClient allocClient
-        {
-            .Header = Data::Header<AllocateType>(AllocateType::Client),
-            .ClientId = socketHeader.ClientId,
-            .ClientName = socketHeader.ClientName
-        };
-        _serverSocket.Write(socketHeader.ClientId, Socket::SocketChannel::Admin, allocClient);
+    void OnClientClosed(int32_t clientId)
+    {
+        CancelAllOrders(clientId);
+        if(ClientClosed)
+            ClientClosed(clientId);
+    }
+
+    void OnClientOpened(int32_t clientId)
+    {
+        for (int32_t instrumentId : _serverContext.GetInstrumentIdsByClientId(clientId).GetReadonlyRef())
+            _clientIdsByCoreGroupId[_serverContext.GetInstrument(instrumentId).Header().CoreGroupId].AtomicSet(clientId);
     }
 
     void OnClientDeallocated(const Socket::SocketHeader& socketHeader)
     {
-        CancelAllOrders(socketHeader.ClientId);
-
         Socket::SocketHeader clientSocketHeaderCopy = socketHeader;
         clientSocketHeaderCopy.ClientToServerChannelCount = 0;
         clientSocketHeaderCopy.ServerToClientChannelCount = 0;
-        _loggingServer.Write(clientSocketHeaderCopy); // this is the close signal for logger
+         // this is the close signal for logger
+        _loggingServer.Write(clientSocketHeaderCopy);
     }
 };
 

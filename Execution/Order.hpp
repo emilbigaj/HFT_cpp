@@ -67,6 +67,7 @@ namespace Execution
 		QuantityNotValid       = 20,
 		PriceNotValid          = 21,
 		SideNotValid           = 22,
+		OrderTypeNotSupported  = 23, // order type/TIF itself rejected — change the order, don't resend
 
 		// ---- 30..39: Sequencing / lifecycle: client misuse of the order slot ----
 		ConnectionBroken          = 30,
@@ -75,6 +76,7 @@ namespace Execution
 		CantAllocateClientOrderId = 33,
 		OrderIndexIsBusy          = 34,
 		OrderNotFound             = 35,
+		DuplicateOrderId            = 36, // ClOrdID reuse / would overwrite a resting order
 		// removed, already added above
 
 		// ---- 40..49: Discarded: intentional no-ops; system decided not to act, no alert ----
@@ -95,6 +97,8 @@ namespace Execution
 		TooManyOrdersPerSecond = 55,
 		TooManyOrdersPerSession    = 56,
 		MessageEfficiencyViolated  = 57,
+		TooManyActiveOrders = 58,
+		NotAuthorizedToTrade = 59, // entitlement/permission wall — stop retrying
 
 		// ---- 60..69: System ----
 		ExceptionThrownByRiskLayer = 60,

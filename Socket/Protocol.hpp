@@ -55,6 +55,20 @@ namespace Socket
             return (sequence & 1ULL) != 0ULL;
         }
 
+        // Resolves a cursor to the header the next entry lives at: bad magic or the wrap marker means
+        // the writer moved on to start. One redirect rule, shared by the read, skip and probe paths.
+        static inline uint64_t ReadRingSeq(Header64*& srcHdr, uint8_t* start)
+        {
+            uint64_t seq = srcHdr->Sequence.load(std::memory_order_acquire);
+            uint64_t magic = srcHdr->Magic.load(std::memory_order_acquire);
+            if (magic != s_magic || seq == s_ringWrapMarker) [[unlikely]]
+            {
+                srcHdr = reinterpret_cast<Header64*>(start);
+                seq = srcHdr->Sequence.load(std::memory_order_acquire);
+            }
+            return seq;
+        }
+
         // -------- Lock primitives (slot path) --------
 
         static inline void AcquireLock(Header64* hdr)
@@ -326,28 +340,16 @@ namespace Socket
 
             Header64* srcHdr = reinterpret_cast<Header64*>(src);
 
-            auto readSeq = [&]() -> uint64_t
-            {
-                uint64_t seq = srcHdr->Sequence.load(std::memory_order_acquire);
-                uint64_t magic = srcHdr->Magic.load(std::memory_order_acquire);
-                if (magic != s_magic || seq == s_ringWrapMarker) [[unlikely]]
-                {
-                    srcHdr = reinterpret_cast<Header64*>(start);
-                    seq = srcHdr->Sequence.load(std::memory_order_acquire);
-                }
-                return seq;
-            };
-
             while (true)
             {
                 // 1. Initial Read of Sequence
-                uint64_t seq0 = readSeq();
+                uint64_t seq0 = ReadRingSeq(srcHdr, start);
 
                 // 2. Spin while Writer is Active
                 while (IsWriteInProgress(seq0))
                 {
                     _mm_pause();
-                    seq0 = readSeq();
+                    seq0 = ReadRingSeq(srcHdr, start);
                 }
 
                 // 3. Bail early if Stale or Empty
@@ -360,7 +362,7 @@ namespace Socket
                 int32_t len = srcHdr->Length;
 
                 // 4. Pre-Copy Validation
-                uint64_t seq1 = readSeq();
+                uint64_t seq1 = ReadRingSeq(srcHdr, start);
                 if (seq0 != seq1)
                     continue;
 
@@ -369,7 +371,7 @@ namespace Socket
                 std::atomic_thread_fence(std::memory_order_acquire);
 
                 // 6. Post-Copy Validation
-                uint64_t seq2 = readSeq();
+                uint64_t seq2 = ReadRingSeq(srcHdr, start);
                 if (seq0 != seq2)
                     continue;
 
@@ -386,28 +388,69 @@ namespace Socket
                 return ReadStatus::New;
             }
         }
+        static void SkipRing(uint8_t*& src, uint8_t* start, uint8_t* end, uint64_t& lastReadEvenSeq)
+        {
+            if (((uintptr_t)start & 63) != 0 || ((uintptr_t)end & 63) != 0)
+                throw std::runtime_error("Ring alignment error.");
+
+            const int32_t ringSize = static_cast<int32_t>(end - start);
+
+            while (true)
+            {
+                // 1. Resolve Cursor (loop-local, so length and advance share one header)
+                Header64* srcHdr = reinterpret_cast<Header64*>(src);
+                uint64_t seq = ReadRingSeq(srcHdr, start);
+
+                // 2. Stop at the Head. No spin: a torn entry never completes.
+                if (IsWriteInProgress(seq) || !IsThisNewerThan(seq, lastReadEvenSeq))
+                    return;
+
+                int32_t len = srcHdr->Length;
+
+                // 3. Validation: a writer touching this slot means we reached the head
+                if (seq != srcHdr->Sequence.load(std::memory_order_acquire))
+                    return;
+
+                // 4. Range-check the Length (no Copy() to bound it here)
+                if (len < 0 || len > ringSize)
+                    return;
+
+                int32_t alignedEntryLength = GetAlignedEntryLength(len);
+                if (alignedEntryLength > static_cast<int32_t>(end - reinterpret_cast<uint8_t*>(srcHdr)))
+                    return;
+
+                // 5. Commit Skip and Advance Pointers
+                lastReadEvenSeq = seq;
+
+                src = reinterpret_cast<uint8_t*>(srcHdr) + alignedEntryLength;
+                if (src == end)
+                    src = start;
+            }
+        }
 
         // -------- Status probes --------
 
+        // Bad magic is not an entry (uninitialised, or never written), so it probes Empty like a
+        // zero sequence does. Matches TryRead's readSeq.
         static ReadStatus GetReadStatus(Header64* srcHdr, uint64_t lastEvenSeq)
         {
             uint64_t seq = srcHdr->Sequence.load(std::memory_order_acquire);
+            uint64_t magic = srcHdr->Magic.load(std::memory_order_acquire);
 
-            if (seq == 0ULL)
+            if (magic != s_magic || seq == 0ULL)
                 return ReadStatus::Empty;
 
             return IsThisNewerThan(seq, lastEvenSeq) ? ReadStatus::New : ReadStatus::Old;
         }
 
+        // Must resolve the cursor exactly as the read path does, or probe and read disagree about
+        // where the next entry is - and neither ever advances to correct it.
         static ReadStatus GetReadStatusFromRing(Header64* srcHdr, uint8_t* start, uint8_t* end, uint64_t lastEvenSeq)
         {
             if (((uintptr_t)start & 63) != 0 || ((uintptr_t)end & 63) != 0)
                 throw std::runtime_error("Ring alignment error.");
 
-            uint64_t seq = srcHdr->Sequence.load(std::memory_order_acquire);
-
-            if (seq == s_ringWrapMarker)
-                srcHdr = reinterpret_cast<Header64*>(start);
+            ReadRingSeq(srcHdr, start);   // resolves srcHdr; GetReadStatus re-reads the sequence
 
             return GetReadStatus(srcHdr, lastEvenSeq) == ReadStatus::New ? ReadStatus::New : ReadStatus::Empty;
         }

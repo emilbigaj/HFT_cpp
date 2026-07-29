@@ -59,8 +59,8 @@ class ContextManager; // Forward declaration
 class Context
 {
 public:
-	const std::string ServerName;
-	const std::string LoggingServerName;
+	const std::filesystem::path ServerName;
+	const std::filesystem::path LoggingServerName;
 	const std::filesystem::path DirectoryPath;
 
 	const Tools::Access ServerAccess;
@@ -153,10 +153,10 @@ protected:
 	std::vector<std::unique_ptr<Position>> _positions;
 
 protected:
-	Context(const std::string& serverName, const std::filesystem::path& directoryPath, Tools::Access serverAccess, Tools::Access clientAccess)
+	Context(const std::filesystem::path& serverName, const std::filesystem::path& directoryPath, Tools::Access serverAccess, Tools::Access clientAccess)
     : 
     ServerName(serverName),
-    LoggingServerName(GetLoggingServerDirectoryPath(ServerName).string()),
+    LoggingServerName(GetLoggingServerDirectoryPath(ServerName)),
     DirectoryPath(directoryPath),
     ServerAccess(serverAccess),
     ClientAccess(clientAccess),
@@ -167,21 +167,17 @@ protected:
     AuditDirectoryPath(GetAuditDirectoryPath(directoryPath)),
     SeriesDirectoryPath(directoryPath / "Series"),
     WorkspaceDirectoryPath(directoryPath / "Workspaces"),
-    _serverHeaderBox(serverName + "ServerHeader", ServerAccess),
-    _clientSocketHeaders((EnsureConnected(), serverName + "ClientHeaders"), ServerHeader().GetReadonlyRef().ClientIds.Length(), ServerAccess),
-    _instrumentHeaders(serverName + "InstrumentHeaders", ServerHeader().GetReadonlyRef().InstrumentsCapacity, ServerAccess),
-    _instrumentHeaderIdByInstrumentId(serverName + "InstrumentHeaderIdByInstrumentId", ServerHeader().GetReadonlyRef().InstrumentIds.Length(), ServerAccess),
-    _instrumentIdsByClientId(serverName + "InstrumentIdsByClientId", ServerHeader().GetReadonlyRef().ClientIds.Length(), ServerAccess),
-    _clientIdsByInstrumentId(serverName + "ClientIdsByInstrumentId", ServerHeader().GetReadonlyRef().InstrumentIds.Length(), ServerAccess),
-    // Book ownership: the server owns the authoritative book (serverName-keyed, writable); each client
-    // owns its own replica (clientName-keyed, writable) that it builds from snapshot + ring deltas.
-    // directoryPath == serverName for a ServerContext and == clientName for a ClientContext, so this
-    // single line gives each context its own book with the right access.
-    _marketsByPrice(directoryPath.string() + "MarketsByPrice", ServerHeader().GetReadonlyRef().InstrumentIds.Length(), (directoryPath.string() == serverName) ? serverAccess : clientAccess),
-    _riskLimits(serverName + "RiskLimits", ServerHeader().GetReadonlyRef().InstrumentIds.Length(), ServerAccess),
-    _orderStates(serverName + "OrderStates", ServerHeader().GetReadonlyRef().OrdersCapacity(), ServerAccess, false),
-    _orderTargets(serverName + "OrderTargets", ServerHeader().GetReadonlyRef().OrdersCapacity(), ClientAccess, false),
-    _localPositionHeaders(serverName + "LocalPositionHeaders", ServerHeader().GetReadonlyRef().LocalPositionsCapacity(), ServerAccess, false)
+    _serverHeaderBox(serverName / "ServerHeader", ServerAccess),
+    _clientSocketHeaders((EnsureConnected(), serverName / "ClientHeaders"), ServerHeader().GetReadonlyRef().ClientIds.Length(), ServerAccess),
+    _instrumentHeaders(serverName / "InstrumentHeaders", ServerHeader().GetReadonlyRef().InstrumentsCapacity, ServerAccess),
+    _instrumentHeaderIdByInstrumentId(serverName / "InstrumentHeaderIdByInstrumentId", ServerHeader().GetReadonlyRef().InstrumentIds.Length(), ServerAccess),
+    _instrumentIdsByClientId(serverName / "InstrumentIdsByClientId", ServerHeader().GetReadonlyRef().ClientIds.Length(), ServerAccess),
+    _clientIdsByInstrumentId(serverName / "ClientIdsByInstrumentId", ServerHeader().GetReadonlyRef().InstrumentIds.Length(), ServerAccess),
+    _marketsByPrice(directoryPath / "MarketsByPrice", ServerHeader().GetReadonlyRef().InstrumentIds.Length(), (directoryPath == serverName) ? serverAccess : clientAccess),
+    _riskLimits(serverName / "RiskLimits", ServerHeader().GetReadonlyRef().InstrumentIds.Length(), ServerAccess),
+    _orderStates(serverName / "OrderStates", ServerHeader().GetReadonlyRef().OrdersCapacity(), ServerAccess, false),
+    _orderTargets(serverName / "OrderTargets", ServerHeader().GetReadonlyRef().OrdersCapacity(), ClientAccess, false),
+    _localPositionHeaders(serverName / "LocalPositionHeaders", ServerHeader().GetReadonlyRef().LocalPositionsCapacity(), ServerAccess, false)
 	{
         std::cout << Tools::GetTypeName(typeid(*this)) << "(" << serverName << ", " << directoryPath.string() << ", "
                   << static_cast<int>(serverAccess) << ", " << static_cast<int>(clientAccess) << ")" << std::endl;
@@ -381,8 +377,19 @@ class ServerContext : public Context
 
 public:
 
+	std::filesystem::path GetClientsFilePath(Tools::Timestamp date)
+	{
+		return ServerName / "Clients" / (date.ToDateString() + ".allocateclient");
+	}
+
+	std::filesystem::path GetInstrumentsFilePath(Tools::Timestamp date)
+	{
+		return ServerName / "Instruments" / (date.ToDateString() + ".allocateinstrument");
+	}
+
+
 	ServerContext(const std::filesystem::path& serverName, Tools::Access access)
-    : Context(serverName.string(), serverName, access, Tools::Access::Read), _serverPositionHeaders(ServerName + "ServerPositionHeaders", ServerHeader().GetReadonlyRef().InstrumentIds.Length(), ServerAccess)
+    : Context(serverName.string(), serverName, access, Tools::Access::Read), _serverPositionHeaders(ServerName / "ServerPositionHeaders", ServerHeader().GetReadonlyRef().InstrumentIds.Length(), ServerAccess)
 	{
 		ThrowIfInvalidServerName(serverName);
 
@@ -557,11 +564,7 @@ public:
         {
             std::cout << "Context::AllocateInstrument(" <<  symbol << ") Loaded RiskLimit: " << riskLimitLine.value() << std::endl;
         }
-		Execution::RiskLimit riskLimit = riskLimitLine
-            ? Tools::Json::Deserialize<Execution::RiskLimit>(riskLimitLine.value())
-            : (Clock::Mode == ClockMode::Simulation
-                ? Execution::RiskLimit::GetMaxLimits(instrumentId)
-                : Execution::RiskLimit::GetMinLimits(instrumentId));
+		Execution::RiskLimit riskLimit = riskLimitLine ? Tools::Json::Deserialize<Execution::RiskLimit>(riskLimitLine.value()) : (Clock::Mode == ClockMode::Simulation ? Execution::RiskLimit::GetMaxLimits(instrumentId) : Execution::RiskLimit::GetMinLimits(instrumentId));
 		riskLimit.InstrumentId = instrumentId;
         _riskLimits.GetEntry(instrumentId).Write(riskLimit);
 
@@ -669,7 +672,7 @@ public:
 			if (header.ClientName == nameCopy)
 				return i;
 		}
-		throw std::runtime_error(std::string(typeid(*this).name()) + ".GetClientIdFromMap(" + clientName + "), Client not connected to server '" + ServerName + "'.");
+		throw std::runtime_error(std::string(typeid(*this).name()) + ".GetClientIdFromMap(" + clientName + "), Client not connected to server '" + ServerName.string() + "'.");
 	}
 
 	// --- Local Implementations ---

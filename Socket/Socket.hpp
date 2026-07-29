@@ -169,8 +169,9 @@ namespace Socket
 	enum class ClientStatus : uint8_t
 	{
 		Disposed = 0,
-		Open = 1,
-		Closed = 2
+		Detached = 1,
+		Open = 2,
+		Closed = 3
 	};
 
 	// Forward declaration of Socket to satisfy C++ scope for static constants
@@ -224,6 +225,16 @@ namespace Socket
 		inline int32_t Length() const
 		{
 			return static_cast<int32_t>(_endPtr - _startPtr);
+		}
+
+		// Attaches to a ring already in use: park at the head rather than replay the backlog.
+		inline void Recover()
+		{
+			if (_isDisposed)
+				throw std::runtime_error("ObjectDisposedException");
+
+			Protocol::SkipRing(_readPtr, _startPtr, _endPtr, _readSeq);
+			_isClosed = false;   // the previous session's close message is not ours
 		}
 
 		inline void Reset()
@@ -322,6 +333,16 @@ namespace Socket
 			return static_cast<int32_t>(_endPtr - _startPtr);
 		}
 
+		// Attaches to a ring already in use: resume the existing sequence space. Restarting at 0
+		inline void Recover()
+		{
+			if (_isDisposed)
+				throw std::runtime_error("ObjectDisposedException");
+
+			Protocol::SkipRing(_writePtr, _startPtr, _endPtr, _writeSeq);
+			_isClosed = false;   // else Write() emits close messages instead of payloads
+		}
+
 		inline void Reset()
 		{
 			if (_isDisposed)
@@ -387,6 +408,7 @@ namespace Socket
 				if (!writeViews[i].IsDisposed())
 				{
 					_writeOnlySockets[i] = std::make_unique<WriteOnlySocket>(SocketUtils::GetChannelName(Name, static_cast<int32_t>(i), ChannelDirection::ServerToClient), writeViews[i]);
+					_writeOnlySockets[i]->Recover();
 				}
 			}
 
@@ -395,6 +417,7 @@ namespace Socket
 				if (!readViews[i].IsDisposed())
 				{
 					_readOnlySockets[i] = std::make_unique<ReadOnlySocket>(SocketUtils::GetChannelName(Name, static_cast<int32_t>(i), ChannelDirection::ClientToServer), readViews[i]);
+					_readOnlySockets[i]->Recover();
 				}
 			}
 		}
@@ -819,12 +842,12 @@ namespace Socket
 			return !_socket || _socket->IsClosed();
 		}
 
-		inline void Connect()
+		inline int32_t Connect()
 		{
 			if (!_socket)
 				throw std::runtime_error("No socket");
 			if (IsClosed())
-				return;
+				return -1;
 
 			LetterBox<SocketHeader> clientBox(ClientName, Tools::Access::Read);
 			LetterBox<SocketHeader> serverBox(ServerName, Tools::Access::Write);
@@ -858,6 +881,7 @@ namespace Socket
 			}
 
 			std::cout << ClientName << ": Connected." << std::endl;
+			return reply.ClientId;
 		}
 
 		inline void Close()
@@ -945,10 +969,15 @@ namespace Socket
 		};
 
 	public:
+		bool Persistance = false;
 		const int32_t Capacity;
 		const std::string ServerName;
 		std::function<void(const SocketHeader&)> ClientAllocated;
 		std::function<void(const SocketHeader&)> ClientDeallocated;
+
+		std::function<void(int32_t)> ClientOpened;
+		std::function<void(int32_t)> ClientClosed;
+
 		std::function<void(std::exception&)> Exception;
 		std::function<int32_t(const SocketHeader&)> AllocateClientId;
 		std::function<SocketHeader(int32_t)> DeallocateClient;
@@ -994,6 +1023,20 @@ namespace Socket
 					std::this_thread::sleep_for(std::chrono::milliseconds(1));
 				}
 			});
+		}
+
+		void CreateDetatchedClient(const SocketHeader& socketHeader)
+		{
+			if (!Persistance)
+				throw std::runtime_error("PersistClients is disabled");
+
+			if (socketHeader.ClientId < 0 || socketHeader.ClientId >= Capacity)
+				throw std::invalid_argument("Invalid client id");			
+
+			CreateClient(socketHeader);
+
+			ClientHeader& clientHeader = _clientHeaders[static_cast<size_t>(socketHeader.ClientId)];
+			clientHeader.Status.store(ClientStatus::Detached, std::memory_order_release);
 		}
 
 	private:
@@ -1044,7 +1087,7 @@ namespace Socket
 			}
 		}
 
-		void CreateClient(int32_t clientId, const SocketHeader& socketHeader)
+		void CreateClient(const SocketHeader& socketHeader)
 		{
 			std::string socketName = socketHeader.Name();
 			SharedMemory sharedMemory = socketHeader.CreateOrOpenSharedMemory();
@@ -1073,16 +1116,18 @@ namespace Socket
 				offset += len;
 			}
 
-			ClientHeader& clientHeader = _clientHeaders[static_cast<size_t>(clientId)];
+			ClientHeader& clientHeader = _clientHeaders[static_cast<size_t>(socketHeader.ClientId)];
 			clientHeader.ClientSocket = std::make_unique<Socket>(socketName, std::move(sharedMemory), std::move(serverToClient), std::move(clientToServer));
 		}
 
 
-		void OpenClient(int32_t clientId, const SocketHeader& socketHeader)
+		void OpenClient(const SocketHeader& socketHeader)
 		{
-			ClientHeader& clientHeader = _clientHeaders[static_cast<size_t>(clientId)];
+			ClientHeader& clientHeader = _clientHeaders[static_cast<size_t>(socketHeader.ClientId)];
 
-			clientHeader.ClientSocket->Reset();
+			if (!Persistance)
+				clientHeader.ClientSocket->Reset();
+
 			clientHeader.SetClosedTimestamp(Tools::Timestamp::MaxValue);
 			clientHeader.ClientProcessId = socketHeader.ClientProcessId;
 
@@ -1094,20 +1139,29 @@ namespace Socket
 			}
 
 			clientHeader.Status.store(ClientStatus::Open, std::memory_order_release);
-			_clientIds.AtomicSet(clientId);
+			_clientIds.AtomicSet(socketHeader.ClientId);
 
-			if (ClientAllocated)
-				ClientAllocated(socketHeader);
+			if (ClientOpened)
+				ClientOpened(socketHeader.ClientId);
 
-			std::cout << ServerName << ": " << socketHeader.ClientName.ToString() << " Connected id " << clientId << std::endl;
+			std::cout << ServerName << ": " << socketHeader.ClientName.ToString() << " Connected id " << socketHeader.ClientId << std::endl;
 		}
 
 		void CloseClient(int32_t clientId)
 		{
 			_clientIds.AtomicClear(clientId);
 			ClientHeader& clientHeader = _clientHeaders[static_cast<size_t>(clientId)];
-			clientHeader.SetClosedTimestamp(Tools::Timestamp::UtcNow());
-			clientHeader.Status.store(ClientStatus::Closed, std::memory_order_release);
+			if (Persistance)
+			{
+				clientHeader.Status.store(ClientStatus::Detached, std::memory_order_release);
+			}
+			else
+			{
+				clientHeader.SetClosedTimestamp(Tools::Timestamp::UtcNow());
+				clientHeader.Status.store(ClientStatus::Closed, std::memory_order_release);
+			}
+			if (ClientClosed)
+				ClientClosed(clientId);
 		}
 
 		void PollLetterBox()
@@ -1127,22 +1181,30 @@ namespace Socket
 					std::cout << "ServerSocket::" << ServerName << ": Client " << clientName << " failed to allocate clientId." << std::endl;
 					return;
 				}
-				else if (_clientHeaders[static_cast<size_t>(clientId)].Status.load(std::memory_order_acquire) == ClientStatus::Open)
+				ClientStatus status = _clientHeaders[static_cast<size_t>(clientId)].Status.load(std::memory_order_acquire);
+
+				if (status == ClientStatus::Open)
 				{
 					std::cout << "ServerSocket::" << ServerName << ": Client " << clientName << " is already connected." << std::endl;
 					return;
 				}
-				else if (_clientHeaders[static_cast<size_t>(clientId)].Status.load(std::memory_order_acquire) == ClientStatus::Closed)
+				else if (status == ClientStatus::Closed)
 				{
 					std::cout << "ServerSocket::" << ServerName << ": Client " << clientName << " is in the process of disposing. Try again in a moment." << std::endl;
 					return;
 				}
-				else
+				else if (status == ClientStatus::Detached)
 				{
-					CreateClient(clientId, socketHeader);
+
+				}
+				else if (status == ClientStatus::Disposed)
+				{
+					if (ClientAllocated)
+						ClientAllocated(socketHeader);
+					CreateClient(socketHeader);
 				}
 
-				OpenClient(clientId, socketHeader);
+				OpenClient(socketHeader);
 			}
 		}
 
@@ -1201,7 +1263,9 @@ namespace Socket
 
 			ClientHeader& client = _clientHeaders[static_cast<size_t>(clientId)];
 
-			if (client.Status.load(std::memory_order_acquire) != ClientStatus::Open)
+			ClientStatus status = client.Status.load(std::memory_order_acquire);
+
+			if (status != ClientStatus::Open)
 				return ReadStatus::Closed;
 
 			try
@@ -1277,8 +1341,10 @@ namespace Socket
 				return;
 
 			ClientHeader& client = _clientHeaders[static_cast<size_t>(clientId)];
+			ClientStatus status = client.Status.load(std::memory_order_acquire);
+			bool canWrite = status == ClientStatus::Open || status == ClientStatus::Detached;
 
-			if (client.Status.load(std::memory_order_acquire) != ClientStatus::Open)
+			if (!canWrite)
 				return;
 
 			try
@@ -1302,7 +1368,10 @@ namespace Socket
 
 			ClientHeader& client = _clientHeaders[static_cast<size_t>(clientId)];
 
-			if (client.Status.load(std::memory_order_acquire) != ClientStatus::Open)
+			ClientStatus status = client.Status.load(std::memory_order_acquire);
+			bool canWrite = status == ClientStatus::Open || status == ClientStatus::Detached;
+
+			if (!canWrite)
 				return;
 
 			try

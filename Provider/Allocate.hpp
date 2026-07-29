@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include "../Tools/Json.hpp"
 #include "../Tools/String.hpp"
 #include "Bitset.hpp"
 #include "Tools.hpp"
@@ -26,6 +27,21 @@ namespace Provider
 		Data::Header<AllocateType> Header = Data::Header<AllocateType>(AllocateType::Client);
 		int32_t ClientId = 0;
 		Tools::String128 ClientName;
+
+		std::string ToString() const
+		{
+			return Tools::Json::Serialize(*this);
+		}
+
+		struct glaze
+		{
+			using T = AllocateClient;
+			static constexpr auto value = glz::object(
+				"Header", &T::Header,
+				"ClientId", &T::ClientId,
+				"ClientName", &T::ClientName
+			);
+		};
 	};
 	static_assert(Tools::PlainOldData<AllocateClient>);
 
@@ -38,6 +54,23 @@ namespace Provider
 		int32_t InstrumentHeaderId = -1;
 		int32_t InstrumentId = -1;
 		Tools::String64 Symbol;
+
+		std::string ToString() const
+		{
+			return Tools::Json::Serialize(*this);
+		}
+
+		struct glaze
+		{
+			using T = AllocateInstrument;
+			static constexpr auto value = glz::object(
+				"Header", &T::Header,
+				"ClientId", &T::ClientId,
+				"InstrumentHeaderId", &T::InstrumentHeaderId,
+				"InstrumentId", &T::InstrumentId,
+				"Symbol", &T::Symbol
+			);
+		};
 	};
 	static_assert(Tools::PlainOldData<AllocateInstrument>);
 
@@ -66,6 +99,11 @@ namespace Provider
 		Tools::Bitset64 CoreGroupIds = Tools::Bitset64();
 
 		int32_t OrdersPerClient = 64;
+
+		// Client sockets outlive their client process: a dropped client goes Detached instead of
+		// being disposed, so the server keeps writing into its ring and the audit tap keeps reading.
+		// WIRE FIELD — the C# side must mirror it byte-for-byte.
+		bool Persistance = true;
 
 		int32_t OrdersCapacity() const
 		{

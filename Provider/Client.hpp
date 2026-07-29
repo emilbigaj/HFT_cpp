@@ -56,13 +56,6 @@ private:
         return allocate.ClientId;
     }
 
-    int32_t Connect()
-    {
-        _socket.Connect();
-        std::span<const uint8_t> rdst = ReadAdmin();
-        return OnClientAllocated(*reinterpret_cast<const Provider::AllocateClient*>(rdst.data()));
-    }
-
     // Peek the server's published ServerHeader (shared memory) for the CoreGroup layout, so we can
     // size our channels BEFORE _socket is built. The server publishes it as a LetterBox named
     // "<serverName>ServerHeader" (see ServerContext::Connect / Context). Returns the channel-length
@@ -107,7 +100,7 @@ public:
           _socket(ClientName, ServerName, ReadServerChannelLengths(ServerName), ReadServerChannelLengths(ServerName)),
           _isOrderActive(0ULL),
           _riskLayer(ServerName, Execution::OrderRejectedSource::Client),
-          ClientId(Connect()),
+          ClientId(_socket.Connect()),
           ClientContext(ClientName, ServerName, Tools::Access::Write),
           _serverMarketsByPrice(ServerName.string() + "MarketsByPrice", ClientContext.ServerHeader().GetReadonlyRef().InstrumentIds.Length(), Tools::Access::Read)
     {
@@ -139,28 +132,34 @@ public:
     {
         int32_t instrumentId = -1;
         if (ClientContext.TryGetInstrumentId(instrumentHeaderId, instrumentId))
-            return ClientContext.GetInstrument(instrumentId);
-
-        const Data::InstrumentHeader128& header128 = ClientContext.GetInstrumentHeader(instrumentHeaderId).GetReadonlyRef();
-
-        Provider::AllocateInstrument allocateInstrument
         {
-            .Header = Data::Header<Provider::AllocateType>(Provider::AllocateType::Instrument),
-            .ClientId = ClientId,
-            .InstrumentHeaderId = instrumentHeaderId,
-            .InstrumentId = -1,
-            .Symbol = header128.Symbology()->ToString()
-        };
+            if (_instrumentData[static_cast<size_t>(instrumentId)])
+                return ClientContext.GetInstrument(instrumentId); // already attached + seeded
+        }
+        else
+        {
+            const Data::InstrumentHeader128& header128 = ClientContext.GetInstrumentHeader(instrumentHeaderId).GetReadonlyRef();
+            Provider::AllocateInstrument allocateInstrument
+            {
+                .Header = Data::Header<Provider::AllocateType>(Provider::AllocateType::Instrument),
+                .ClientId = ClientId,
+                .InstrumentHeaderId = instrumentHeaderId,
+                .InstrumentId = -1,
+                .Symbol = header128.Symbology()->ToString()
+            };
+            
+            _socket.Write(Socket::SocketChannel::Admin, allocateInstrument);
+            std::span<const uint8_t> rdst = ReadAdmin();
 
-        _socket.Write(Socket::SocketChannel::Admin, allocateInstrument);
+            allocateInstrument = *reinterpret_cast<const Provider::AllocateInstrument*>(rdst.data());
+            instrumentId = allocateInstrument.InstrumentId;
+        }
 
-        std::span<const uint8_t> rdst = ReadAdmin();
-        return OnInstrumentAllocated(*reinterpret_cast<const Provider::AllocateInstrument*>(rdst.data()));
+        return OnInstrumentAllocated(instrumentId);
     }
 
-    Data::Instrument& OnInstrumentAllocated(const Provider::AllocateInstrument& allocated)
+    Data::Instrument& OnInstrumentAllocated(int32_t instrumentId)
     {
-        int32_t instrumentId = allocated.InstrumentId;
         Data::Instrument& instrument = ClientContext.GetInstrument(instrumentId);
         ClientContext.GetPosition(instrumentId);   // ensure the position is created
         OpenInstrumentDataSocket(instrumentId, instrument.Symbol());

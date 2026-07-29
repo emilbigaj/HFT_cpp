@@ -340,6 +340,23 @@ namespace Tools
             return Timestamp(nanos);
         }
 
+        template <typename D>
+        [[nodiscard]] static Timestamp FromChrono(std::chrono::sys_time<D> tp)
+        {
+            // floor (not duration_cast) so sub-ns-representable inputs truncate toward -inf
+            int64_t ns = std::chrono::floor<std::chrono::nanoseconds>(tp.time_since_epoch()).count();
+            if (ns < 0)
+                throw std::runtime_error("Timestamp error: Value cannot be before 1970 (negative).");
+            return Timestamp(ns);
+        }
+
+        [[nodiscard]] std::chrono::sys_time<std::chrono::nanoseconds> ToChrono() const
+        {
+            return std::chrono::sys_time<std::chrono::nanoseconds>{
+                std::chrono::nanoseconds{NanosSinceEpoch}};
+        }
+
+
         [[nodiscard]] static Timestamp Min(Timestamp a, Timestamp b) { return a.NanosSinceEpoch <= b.NanosSinceEpoch ? a : b; }
         [[nodiscard]] static Timestamp Max(Timestamp a, Timestamp b) { return a.NanosSinceEpoch >= b.NanosSinceEpoch ? a : b; }
 
