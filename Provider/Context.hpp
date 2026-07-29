@@ -419,7 +419,9 @@ public:
 	static inline Socket::LetterBox<Provider::ServerHeader> Connect(const Provider::ServerHeader& serverHeader)
 	{
         std::string serverNameStr = serverHeader.ServerName.ToString();
-		Socket::LetterBox<Provider::ServerHeader> serverHeaderBox(serverNameStr + "ServerHeader", Tools::Access::Write);
+		// Path-joined, matching Context's _serverHeaderBox. Concatenating here names a different
+		// region, and Context::EnsureConnected() then spins forever on a box nobody writes.
+		Socket::LetterBox<Provider::ServerHeader> serverHeaderBox(std::filesystem::path(serverNameStr) / "ServerHeader", Tools::Access::Write);
 		if (!serverHeaderBox.TryStore(serverHeader))
 			throw std::runtime_error("ServerContext.Connect(" + serverNameStr + "), Failed to write ServerHeader to shared memory.");
 

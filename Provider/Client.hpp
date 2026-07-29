@@ -58,11 +58,11 @@ private:
 
     // Peek the server's published ServerHeader (shared memory) for the CoreGroup layout, so we can
     // size our channels BEFORE _socket is built. The server publishes it as a LetterBox named
-    // "<serverName>ServerHeader" (see ServerContext::Connect / Context). Returns the channel-length
+    // "<serverName>/ServerHeader" (see ServerContext::Connect / Context). Returns the channel-length
     // array (identical for both directions). Blocks until the server is up.
     static std::vector<int32_t> ReadServerChannelLengths(const std::filesystem::path& serverName)
     {
-        Socket::LetterBox<Provider::ServerHeader> serverHeaderBox(serverName.string() + "ServerHeader", Tools::Access::Read);
+        Socket::LetterBox<Provider::ServerHeader> serverHeaderBox(serverName / "ServerHeader", Tools::Access::Read);
         Provider::ServerHeader serverHeader;
         while (!serverHeaderBox.TryPeek(serverHeader))
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -102,7 +102,7 @@ public:
           _riskLayer(ServerName, Execution::OrderRejectedSource::Client),
           ClientId(_socket.Connect()),
           ClientContext(ClientName, ServerName, Tools::Access::Write),
-          _serverMarketsByPrice(ServerName.string() + "MarketsByPrice", ClientContext.ServerHeader().GetReadonlyRef().InstrumentIds.Length(), Tools::Access::Read)
+          _serverMarketsByPrice(ServerName / "MarketsByPrice", ClientContext.ServerHeader().GetReadonlyRef().InstrumentIds.Length(), Tools::Access::Read)
     {
         _instrumentData.resize(static_cast<size_t>(ClientContext.ServerHeader().GetReadonlyRef().InstrumentIds.Length()));
     }
@@ -147,7 +147,7 @@ public:
                 .InstrumentId = -1,
                 .Symbol = header128.Symbology()->ToString()
             };
-            
+
             _socket.Write(Socket::SocketChannel::Admin, allocateInstrument);
             std::span<const uint8_t> rdst = ReadAdmin();
 
