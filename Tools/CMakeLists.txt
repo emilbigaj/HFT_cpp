@@ -42,6 +42,7 @@ add_library(ToolsLib STATIC
     "Types.hpp"
     "Application.hpp"
     "ByteQueue.hpp"
+    "ObjectQueue.hpp"
     "Memory.hpp"
     "BlockingQueue.hpp"
     "Logger.hpp"
