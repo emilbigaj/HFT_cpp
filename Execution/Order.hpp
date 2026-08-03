@@ -30,6 +30,16 @@ namespace Execution
 		RiskLimit = 16,
 	};
 
+	enum class TimeInForce : uint8_t
+	{
+		Day = 0,
+		GoodTillCancel = 1,
+		ImmediateOrCancel = 2,
+		FillOrKill = 3,
+		OpeningAuction = 4,
+		ClosingAuction = 5,
+	};
+
 	enum class OrderStateDoneReason : uint8_t
 	{
 		None = 0,
@@ -118,15 +128,6 @@ namespace Execution
 		Create = 0,
 		Amend = 1,
 		Cancel = 2,
-	};
-
-	enum class TimeInForce : uint8_t
-	{
-		GoodTillCancel = 0,
-		ImmediateOrCancel = 1,
-		FillOrKill = 2,
-		OpeningAuction = 3,
-		ClosingAuction = 4,
 	};
 
 	enum class OrderFlags : uint8_t
@@ -276,10 +277,10 @@ namespace Execution
 	{
 		Data::Header<OrderType> Header = Data::Header<OrderType>(OrderType::Fill);
 		Execution::OrderHeader OrderHeader;
-		Execution::FillType FillType = Execution::FillType::Maker;
-		uint8_t Reserved[3] = { 0 };
 		uint64_t FillId = 0;
 		Execution::OrderProfile OrderProfile;
+		Execution::FillType FillType = Execution::FillType::Maker;
+		uint8_t Reserved[3] = { 0 };
 
 		std::string ToString() const
 		{
@@ -371,9 +372,10 @@ namespace Execution
 		// The exchange's id for this order, assigned on ack; lets us match against the MarketByOrder
 		// feed (queue position / own-order recognition). Lives on the state, not the header.
 		uint64_t ExchangeOrderId = 0;
-		Execution::OrderStateStatus OrderStateStatus = Execution::OrderStateStatus::Active;
-		uint8_t Reserved[3] = { 0, 0, 0};
 		Execution::OrderProfile OrderProfile;
+		Execution::TimeInForce TimeInForce = Execution::TimeInForce::Day;
+		Execution::OrderStateStatus OrderStateStatus = Execution::OrderStateStatus::Active;
+		uint8_t Reserved[2] = { 0, 0 };
 		int32_t QuantityFilled = 0;
 		int32_t QuantityAhead = 0;
 
@@ -394,8 +396,9 @@ namespace Execution
 				"Header", &T::Header,
 				"OrderHeader", &T::OrderHeader,
 				"ExchangeOrderId", &T::ExchangeOrderId,
-				"OrderStateStatus", &T::OrderStateStatus,
 				"OrderProfile", &T::OrderProfile,
+				"TimeInForce", &T::TimeInForce,
+				"OrderStateStatus", &T::OrderStateStatus,
 				"QuantityFilled", &T::QuantityFilled,
 				"QuantityAhead", &T::QuantityAhead
 			);
@@ -428,10 +431,11 @@ namespace Execution
 	{
 		Data::Header<OrderType> Header = Data::Header<OrderType>(OrderType::OrderTarget);
 		Execution::OrderHeader OrderHeader;
-		Execution::OrderTargetAction OrderTargetAction;
-		Execution::OrderStateStatus OrderTargetStatus;
-		uint8_t Reserved[2] = {0, 0};
 		Execution::OrderProfile OrderProfile;
+		Execution::TimeInForce TimeInForce = Execution::TimeInForce::Day;
+		Execution::OrderTargetAction OrderTargetAction = Execution::OrderTargetAction::Create;
+		Execution::OrderStateStatus OrderTargetStatus = Execution::OrderStateStatus::Active;
+		uint8_t Reserved[1] = { 0 };
 
 		std::string ToString() const
 		{
@@ -444,9 +448,10 @@ namespace Execution
 			static constexpr auto value = glz::object(
 				"Header", &T::Header,
 				"OrderHeader", &T::OrderHeader,
+				"OrderProfile", &T::OrderProfile,
+				"TimeInForce", &T::TimeInForce,
 				"OrderTargetAction", &T::OrderTargetAction,
-				"OrderTargetStatus", &T::OrderTargetStatus,
-				"OrderProfile", &T::OrderProfile
+				"OrderTargetStatus", &T::OrderTargetStatus
 			);
 		};
 	};

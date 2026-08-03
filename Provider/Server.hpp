@@ -455,8 +455,9 @@ public:
             {
                 .Header = Data::Header<Execution::OrderType>(Execution::OrderType::OrderState),
                 .OrderHeader = orderTarget.OrderHeader,
-                .OrderStateStatus = isValid ? Execution::OrderStateStatus::Active : Execution::OrderStateStatus::Done,
                 .OrderProfile = orderTarget.OrderProfile,
+                .TimeInForce = orderTarget.TimeInForce,
+                .OrderStateStatus = isValid ? Execution::OrderStateStatus::Active : Execution::OrderStateStatus::Done,
                 .QuantityFilled = 0,
                 .QuantityAhead = 0,
             };
@@ -503,6 +504,7 @@ public:
 
         Data::InstrumentHeader128& header128 = _serverContext.GetInstrumentHeader(allocateInstrument.InstrumentHeaderId).GetRef();
         allocateInstrument.Symbol = header128.Symbology()->ToString();
+        allocateInstrument.ExchangeInstrumentId = header128.AsInstrumentHeader().ExchangeInstrumentId;
 
         OpenInstrumentData(instrumentId, allocateInstrument.Symbol.ToString());
 
@@ -728,6 +730,17 @@ public:
         while (std::getline(instrumentsFile, line))
         {
             Provider::AllocateInstrument allocateInstrument = Tools::Json::Deserialize<Provider::AllocateInstrument>(line);
+
+            // The saved header id is only where this instrument sat in the definition file that built
+            // the previous catalog. That file is republished and reordered, so today it may name a
+            // different contract entirely; the venue's own id is what still identifies this one.
+            allocateInstrument.InstrumentHeaderId = _serverContext.GetInstrumentHeaderIdByExchangeInstrumentId(allocateInstrument.ExchangeInstrumentId);
+            if (allocateInstrument.InstrumentHeaderId < 0)
+            {
+                std::cout << "Server::LoadInstruments: " << allocateInstrument.Symbol.ToString() << " (exchange instrument id "
+                          << allocateInstrument.ExchangeInstrumentId << ") is no longer listed; not restored." << std::endl;
+                continue;
+            }
             OnAllocateInstrument(allocateInstrument);
         }
     }

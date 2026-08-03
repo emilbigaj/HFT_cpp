@@ -59,6 +59,10 @@ class ContextManager; // Forward declaration
 class Context
 {
 public:
+	// The one mount every durable path on this machine hangs off: servers, strategies, venue logs and
+	// session state alike. Named here so no caller ever spells it out again.
+	static inline const std::filesystem::path RootDirectoryPath = "/mnt/S";
+
 	const std::filesystem::path ServerName;
 	const std::filesystem::path LoggingServerName;
 	const std::filesystem::path DirectoryPath;
@@ -375,7 +379,19 @@ class ServerContext : public Context
 {
 	Socket::SharedArray<Execution::PositionHeader> _serverPositionHeaders;
 
+	// Where each venue instrument id sits in the catalog, built as the headers are committed. A header
+	// id is only an instrument's index in the definition file the catalog was built from, so it moves
+	// whenever that file is republished; the venue's own id stays with the contract for its whole life.
+	std::unordered_map<int32_t, int32_t> _instrumentHeaderIdByExchangeInstrumentId;
+
 public:
+
+	// Today's catalog position for a venue instrument id, or -1 when that contract is no longer listed.
+	int32_t GetInstrumentHeaderIdByExchangeInstrumentId(int32_t exchangeInstrumentId) const
+	{
+		auto entry = _instrumentHeaderIdByExchangeInstrumentId.find(exchangeInstrumentId);
+		return entry == _instrumentHeaderIdByExchangeInstrumentId.end() ? -1 : entry->second;
+	}
 
 	std::filesystem::path GetClientsFilePath(Tools::Timestamp date)
 	{
@@ -407,7 +423,7 @@ public:
 
 	static inline std::filesystem::path DirectoriesPath()
 	{
-		return std::filesystem::path("/mnt/S/Servers");
+		return RootDirectoryPath / "Servers";
 	}
 
 	static inline std::filesystem::path GetDirectoryPath(const std::string& serverName)
@@ -524,6 +540,7 @@ public:
         Data::InstrumentHeader& header = header128.AsInstrumentHeader();
         header.InstrumentId = -1;
         header.InstrumentHeaderId = serverHeader.InstrumentsCount;
+        _instrumentHeaderIdByExchangeInstrumentId[header.ExchangeInstrumentId] = header.InstrumentHeaderId;
         Socket::SharedArrayEntry<Data::InstrumentHeader128> header128Entry = _instrumentHeaders[header.InstrumentHeaderId];
         header128Entry.Write(header128);
 
@@ -652,7 +669,7 @@ public:
 
 	static inline std::filesystem::path DirectoriesPath()
 	{
-		return std::filesystem::path("/mnt/S/Strategies");
+		return RootDirectoryPath / "Strategies";
 	}
 
 	static inline std::filesystem::path GetDirectoryPath(const std::string& clientName)

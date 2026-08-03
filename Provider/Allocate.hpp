@@ -53,6 +53,7 @@ namespace Provider
 		int32_t ClientId = -1;
 		int32_t InstrumentHeaderId = -1;
 		int32_t InstrumentId = -1;
+		int32_t ExchangeInstrumentId = -1;
 		Tools::String64 Symbol;
 
 		std::string ToString() const
@@ -68,6 +69,7 @@ namespace Provider
 				"ClientId", &T::ClientId,
 				"InstrumentHeaderId", &T::InstrumentHeaderId,
 				"InstrumentId", &T::InstrumentId,
+				"ExchangeInstrumentId", &T::ExchangeInstrumentId,
 				"Symbol", &T::Symbol
 			);
 		};
