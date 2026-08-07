@@ -1,5 +1,7 @@
 #pragma once
 
+#include <algorithm>
+#include <cstdlib>
 #include <future>
 #include <vector>
 #include <stdexcept>
@@ -143,6 +145,54 @@ public:
 
 		BlockInterruptSignalsCurrentThread();
 		SetThreadPriorityCritical();
+	}
+
+	// The cores that share a last-level cache with this one — on an AMD part its core complex, four
+	// cores and one cache slice; on an Intel part its socket. The threads of one pipeline belong on
+	// one of these lists: every hand-off between them then stays in that cache instead of crossing
+	// the interconnect. Empty when the kernel publishes no cache topology, so a caller checking an
+	// allocation against it can tell "not on this complex" from "nothing to check against".
+	static std::vector<int32_t> GetCoresSharingLastLevelCache(int32_t core)
+	{
+		// Step 1: Walk this core's cache levels and keep the list from the deepest one the kernel names.
+		std::string sharedCoreList;
+		int32_t deepestLevel = 0;
+		for (int32_t index = 0; index < 16; ++index)
+		{
+			const std::string directoryPath = "/sys/devices/system/cpu/cpu" + std::to_string(core) + "/cache/index" + std::to_string(index) + "/";
+			std::ifstream levelFile(directoryPath + "level");
+			std::string level;
+			if (!std::getline(levelFile, level))
+				continue;
+
+			std::ifstream sharedFile(directoryPath + "shared_cpu_list");
+			std::string shared;
+			if (!std::getline(sharedFile, shared))
+				continue;
+
+			const int32_t levelNumber = static_cast<int32_t>(std::strtol(level.c_str(), nullptr, 10));
+			if (levelNumber <= deepestLevel)
+				continue;
+
+			deepestLevel = levelNumber;
+			sharedCoreList = shared;
+		}
+
+		// Step 2: Expand what the kernel writes — comma-separated cores and dashed ranges, "8-11" or "0,2,4-5".
+		std::vector<int32_t> cores;
+		size_t at = 0;
+		while (at < sharedCoreList.size())
+		{
+			const size_t comma = std::min(sharedCoreList.find(',', at), sharedCoreList.size());
+			const std::string part = sharedCoreList.substr(at, comma - at);
+			const size_t dash = part.find('-');
+			const int32_t first = static_cast<int32_t>(std::strtol(part.c_str(), nullptr, 10));
+			const int32_t last = dash == std::string::npos ? first : static_cast<int32_t>(std::strtol(part.c_str() + dash + 1, nullptr, 10));
+			for (int32_t sharing = first; sharing <= last; ++sharing)
+				cores.push_back(sharing);
+			at = comma + 1;
+		}
+		return cores;
 	}
 
 

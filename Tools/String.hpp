@@ -2,6 +2,7 @@
 
 #include "Tools.hpp"
 #include <algorithm>
+#include <compare>
 #include <cstdint>
 #include <cstring>
 #include <glaze/glaze.hpp>
@@ -86,6 +87,13 @@ struct alignas(1) StringN
 	bool operator!=(const StringN& other) const
 	{
 		return !(*this == other);
+	}
+
+	// Ordering, and with it <, >, <= and >=. Fixed width and zero padded, so the bytes compare in
+	// alphabetical order and a shorter string's padding sorts ahead of any character: "ES" before "ESZ".
+	std::strong_ordering operator<=>(const StringN& other) const
+	{
+		return std::memcmp(Chars, other.Chars, N) <=> 0;
 	}
 
 	// Implicit string conversion for convenience
