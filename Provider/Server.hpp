@@ -18,6 +18,7 @@
 #include "ByteQueue.hpp"
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <functional>
 #include <iostream>
 #include <memory>
@@ -288,6 +289,25 @@ public:
             }
         }
     }
+
+    void OnRiskLimit(const Execution::RiskLimit& riskLimit)
+    {
+        _serverContext.GetRiskLimit(riskLimit.InstrumentId).Write(riskLimit);
+        if (riskLimit.StrategyId >= 0)
+            WriteToExecution(riskLimit.StrategyId, _serverContext.GetInstrument(riskLimit.InstrumentId).Header().CoreGroupId, riskLimit);
+        SaveRiskLimit(riskLimit.InstrumentId, riskLimit);
+    }
+
+    void SaveRiskLimit(int32_t instrumentId, const Execution::RiskLimit& riskLimit)
+    {
+        std::string symbol = _serverContext.GetInstrument(instrumentId).Symbol();
+        std::filesystem::path riskLimitFilePath = Context::GetRiskLimitsFilePath(_serverContext.DirectoryPath, symbol);
+        std::string riskLimitLine = Tools::Json::SerializeToLine(riskLimit);
+        std::cout << "ServerSimulator::SaveRiskLimit(" << riskLimitFilePath << "):" << std::endl << riskLimitLine << std::endl;
+        std::ofstream outFile(riskLimitFilePath, std::ios::app);
+        outFile << riskLimitLine << std::endl;
+    }
+
     
     void OnControlAlgoStatus(int32_t strategyId, int32_t instrumentId, Execution::AlgoStatus algoStatus)
     {
@@ -352,6 +372,12 @@ public:
                     {
                         const Provider::ControlAlgoStatus& controlAlgoStatus = *reinterpret_cast<const Provider::ControlAlgoStatus*>(rdst.data());
                         OnControlAlgoStatus(controlAlgoStatus.StrategyId, controlAlgoStatus.InstrumentId, controlAlgoStatus.AlgoStatus);
+                        break;
+                    }
+                    case static_cast<uint8_t>(Execution::OrderType::RiskLimit):
+                    {
+                        const Execution::RiskLimit& riskLimit = *reinterpret_cast<const Execution::RiskLimit*>(rdst.data());
+                        OnRiskLimit(riskLimit);
                         break;
                     }
                     default:
@@ -730,10 +756,6 @@ public:
         while (std::getline(instrumentsFile, line))
         {
             Provider::AllocateInstrument allocateInstrument = Tools::Json::Deserialize<Provider::AllocateInstrument>(line);
-
-            // The saved header id is only where this instrument sat in the definition file that built
-            // the previous catalog. That file is republished and reordered, so today it may name a
-            // different contract entirely; the venue's own id is what still identifies this one.
             allocateInstrument.InstrumentHeaderId = _serverContext.GetInstrumentHeaderIdByExchangeInstrumentId(allocateInstrument.ExchangeInstrumentId);
             if (allocateInstrument.InstrumentHeaderId < 0)
             {

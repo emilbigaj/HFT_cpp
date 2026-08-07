@@ -149,7 +149,9 @@ namespace Execution
 	struct RiskLimit
 	{
         Data::Header<OrderType> Header = Data::Header<OrderType>(OrderType::RiskLimit);
-		int32_t InstrumentId = 0;
+		int32_t InstrumentId = -1;
+		Tools::Timestamp Timestamp = Tools::Timestamp::MinValue;
+		int32_t StrategyId = -1;
 		int32_t MaxOrderQuantity = 0;
 		int32_t MaxPositionQuantity = 0;
 		Execution::RateLimit MaxOrdersPerSession;
