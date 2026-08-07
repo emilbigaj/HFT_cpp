@@ -379,35 +379,48 @@ class ServerContext : public Context
 {
 	Socket::SharedArray<Execution::PositionHeader> _serverPositionHeaders;
 
-	// Where each venue instrument id sits in the catalog, built as the headers are committed. A header
-	// id is only an instrument's index in the definition file the catalog was built from, so it moves
-	// whenever that file is republished; the venue's own id stays with the contract for its whole life.
-	std::unordered_map<int32_t, int32_t> _instrumentHeaderIdByExchangeInstrumentId;
-
 public:
 
-	// Today's catalog position for a venue instrument id, or -1 when that contract is no longer listed.
-	int32_t GetInstrumentHeaderIdByExchangeInstrumentId(int32_t exchangeInstrumentId) const
+	// Server-only: the client and instrument allocations the server replays at startup. A client
+	// context has neither, so these live here rather than on Context.
+	const std::filesystem::path ClientsDirectoryPath;
+	const std::filesystem::path InstrumentsDirectoryPath;
+
+	// Startup-only reverse lookup for Server::LoadInstruments: the persisted record carries the
+	// exchange's id, which is stable across sessions, whereas InstrumentHeaderId is just this run's
+	// load order. Returns -1 when the contract is no longer listed, so the caller can skip it.
+	int32_t GetInstrumentHeaderIdByExchangeInstrumentId(int32_t exchangeInstrumentId)
 	{
-		auto entry = _instrumentHeaderIdByExchangeInstrumentId.find(exchangeInstrumentId);
-		return entry == _instrumentHeaderIdByExchangeInstrumentId.end() ? -1 : entry->second;
+		int32_t instrumentsCount = ServerHeader().GetReadonlyRef().InstrumentsCount;
+		for (int32_t instrumentHeaderId = 0; instrumentHeaderId < instrumentsCount; instrumentHeaderId++)
+		{
+			if (_instrumentHeaders[instrumentHeaderId].GetReadonlyRef().AsInstrumentHeader().ExchangeInstrumentId == exchangeInstrumentId)
+				return instrumentHeaderId;
+		}
+		return -1;
 	}
 
 	std::filesystem::path GetClientsFilePath(Tools::Timestamp date)
 	{
-		return ServerName / "Clients" / (date.ToDateString() + ".allocateclient");
+		return ClientsDirectoryPath / (date.ToDateString() + ".allocateclient");
 	}
 
 	std::filesystem::path GetInstrumentsFilePath(Tools::Timestamp date)
 	{
-		return ServerName / "Instruments" / (date.ToDateString() + ".allocateinstrument");
+		return InstrumentsDirectoryPath / (date.ToDateString() + ".allocateinstrument");
 	}
 
 
 	ServerContext(const std::filesystem::path& serverName, Tools::Access access)
-    : Context(serverName.string(), serverName, access, Tools::Access::Read), _serverPositionHeaders(ServerName / "ServerPositionHeaders", ServerHeader().GetReadonlyRef().InstrumentIds.Length(), ServerAccess)
+    : Context(serverName.string(), serverName, access, Tools::Access::Read),
+      _serverPositionHeaders(ServerName / "ServerPositionHeaders", ServerHeader().GetReadonlyRef().InstrumentIds.Length(), ServerAccess),
+      ClientsDirectoryPath(ServerName / "Clients"),
+      InstrumentsDirectoryPath(ServerName / "Instruments")
 	{
 		ThrowIfInvalidServerName(serverName);
+
+		std::filesystem::create_directories(ClientsDirectoryPath);
+		std::filesystem::create_directories(InstrumentsDirectoryPath);
 
 		int32_t cliCapacity = ServerHeader().GetReadonlyRef().ClientIds.Length();
 		if (cliCapacity > 64)
@@ -540,7 +553,6 @@ public:
         Data::InstrumentHeader& header = header128.AsInstrumentHeader();
         header.InstrumentId = -1;
         header.InstrumentHeaderId = serverHeader.InstrumentsCount;
-        _instrumentHeaderIdByExchangeInstrumentId[header.ExchangeInstrumentId] = header.InstrumentHeaderId;
         Socket::SharedArrayEntry<Data::InstrumentHeader128> header128Entry = _instrumentHeaders[header.InstrumentHeaderId];
         header128Entry.Write(header128);
 
