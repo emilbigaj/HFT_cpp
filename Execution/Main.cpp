@@ -1,5 +1,6 @@
 #include "Order.hpp"
 #include <iostream>
+#include <stdexcept>
 #include <string>
 
 // Minimal check harness: prints each failure, returns non-zero if any check failed.
@@ -36,8 +37,21 @@ int main()
     CHECK(OrderIdAllocator::OrdersPerClient == 64);
     CHECK(OrderIdAllocator::MaxClientId == 63);
     CHECK(OrderIdAllocator::MaxStrategyId == 63);
-    CHECK(OrderIdAllocator::MaxInstrumentId == 16383);
+    CHECK(OrderIdAllocator::NoInstrumentId == 16383);   // the field's top value, reserved: names no instrument
+    CHECK(OrderIdAllocator::MaxInstrumentId == 16382);   // so the highest allocatable instrument is one below it
     CHECK(OrderIdAllocator::IndexBits == 12);
+
+    // The reserved value is never allocatable: range validation refuses it, so nothing can hand out an
+    // id that would later read as "no instrument".
+    {
+        bool refusedReserved = false, acceptedHighest = true;
+        try { OrderIdAllocator::ThrowIfInstrumentIdOutOfRange(OrderIdAllocator::NoInstrumentId); }
+        catch (const std::out_of_range&) { refusedReserved = true; }
+        try { OrderIdAllocator::ThrowIfInstrumentIdOutOfRange(OrderIdAllocator::MaxInstrumentId); }
+        catch (const std::out_of_range&) { acceptedHighest = false; }
+        CHECK(refusedReserved);
+        CHECK(acceptedHighest);
+    }
 
     // ---------------------------------------------------------------------
     // Per-field set/get round-trips at corner values (0 and max per field, mixed)
@@ -54,8 +68,8 @@ int main()
     }
     {
         OrderId id;
-        id.LocalIndex(63).ClientId(63).StrategyId(63).InstrumentId(OrderIdAllocator::MaxInstrumentId).Generation(0xFFFFFFFFu);
-        CHECK(id.ClientOrderId == 0xFFFFFFFFFFFFFFFFULL); // every field at max fills the word exactly
+        id.LocalIndex(63).ClientId(63).StrategyId(63).InstrumentId(OrderIdAllocator::NoInstrumentId).Generation(0xFFFFFFFFu);
+        CHECK(id.ClientOrderId == 0xFFFFFFFFFFFFFFFFULL); // every field at its top value fills the word exactly
 
         id.LocalIndex(0).ClientId(0).StrategyId(0).InstrumentId(0).Generation(0);
         CHECK(id.ClientOrderId == 0ULL);
@@ -71,7 +85,7 @@ int main()
         CHECK(id.ClientId() == 0);
         CHECK(id.LocalIndex() == 63);
         CHECK(id.StrategyId() == 63);
-        CHECK(id.InstrumentId() == OrderIdAllocator::MaxInstrumentId);
+        CHECK(id.InstrumentId() == OrderIdAllocator::NoInstrumentId);
         CHECK(id.Generation() == 0xFFFFFFFFu);
 
         id.ClientId(64 + 5); // 7 bits -> wraps to 5 within the 6-bit field

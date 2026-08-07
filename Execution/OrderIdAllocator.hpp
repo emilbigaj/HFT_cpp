@@ -30,7 +30,13 @@ namespace Execution
         static constexpr int32_t OrdersPerClientBitShift = LocalIndexBits;
         static constexpr int32_t MaxClientId = (1 << ClientBits) - 1;         // 63
         static constexpr int32_t MaxStrategyId = (1 << StrategyBits) - 1;     // 63
-        static constexpr int32_t MaxInstrumentId = (1 << InstrumentBits) - 1; // 16 383
+        // The instrument field's top value names no instrument, and is reserved at every size. An id that
+        // carries no instrument — a session-wide request, an unresolved reference — must not read as
+        // instrument 0, nor as whatever the highest real instrument becomes once the allocated space grows.
+        // Reserving the top of the field rather than the top of today's allocation is what makes that hold,
+        // and ThrowIfInstrumentIdOutOfRange below already refuses everything above MaxInstrumentId.
+        static constexpr int32_t NoInstrumentId = (1 << InstrumentBits) - 1;  // 16 383
+        static constexpr int32_t MaxInstrumentId = NoInstrumentId - 1;        // 16 382
 
     private:
 
