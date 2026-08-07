@@ -292,10 +292,18 @@ public:
 
     void OnRiskLimit(const Execution::RiskLimit& riskLimit)
     {
-        _serverContext.GetRiskLimit(riskLimit.InstrumentId).Write(riskLimit);
-        if (riskLimit.StrategyId >= 0)
-            WriteToExecution(riskLimit.StrategyId, _serverContext.GetInstrument(riskLimit.InstrumentId).Header().CoreGroupId, riskLimit);
-        SaveRiskLimit(riskLimit.InstrumentId, riskLimit);
+        // The sender read-modify-writes the whole struct, so the running working quantities in its
+        // copy are as stale as the moment it opened the edit dialog. They are server-owned state, not
+        // config — carry the live ones across or an operator editing a limit silently rewinds them.
+        Execution::RiskLimit riskLimitCopy = riskLimit;
+        const Execution::RiskLimit& existing = _serverContext.GetRiskLimit(riskLimit.InstrumentId).GetReadonlyRef();
+        riskLimitCopy.WorstLongWorkingQuantity = existing.WorstLongWorkingQuantity;
+        riskLimitCopy.WorstShortWorkingQuantity = existing.WorstShortWorkingQuantity;
+
+        _serverContext.GetRiskLimit(riskLimit.InstrumentId).Write(riskLimitCopy);
+        if (riskLimitCopy.StrategyId >= 0)
+            WriteToExecution(riskLimitCopy.StrategyId, _serverContext.GetInstrument(riskLimit.InstrumentId).Header().CoreGroupId, riskLimitCopy);
+        SaveRiskLimit(riskLimit.InstrumentId, riskLimitCopy);
     }
 
     void SaveRiskLimit(int32_t instrumentId, const Execution::RiskLimit& riskLimit)
@@ -423,11 +431,15 @@ public:
             existingOrderState.ExchangeOrderId = orderState.ExchangeOrderId;
             existingOrderState.OrderProfile = orderState.OrderProfile;
             existingOrderState.OrderStateStatus = orderState.OrderStateStatus;
+            existingOrderState.OrderStateReason = orderState.OrderStateReason;
             existingOrderState.QuantityFilled = orderState.QuantityFilled;
             existingOrderState.OrderHeader.ExchangeTimestamp = orderState.OrderHeader.ExchangeTimestamp;
             existingOrderState.OrderHeader.NicTimestamp = Tools::Timestamp::UtcNow();
             orderStateEntry.ReleaseLock();
         }
+        // Retire the slot's reservation from the stored state, not the inbound one: an unsafe-to-
+        // overwrite state was never applied, so releasing against it would drop exposure we still hold.
+        _riskLayer.OnOrderState(existingOrderState);
         WriteToExecution(existingOrderState);
             if (OrderState)
                 OrderState(existingOrderState);
@@ -442,6 +454,7 @@ public:
         if (orderState.OrderHeader.OrderId == orderRejected.OrderHeader.OrderId)
         {
             orderRejected.OrderHeader.NicTimestamp = Tools::Timestamp::UtcNow();
+            _riskLayer.OnOrderRejected(orderRejected);
             Reject(orderRejected, message);
             return orderRejected;
         }
@@ -596,7 +609,11 @@ public:
         localPositionHeaderEntry.AcquireLock();
         localPosition.OnFill(fill, tickSize, multiplier);
         localPositionHeaderEntry.ReleaseLock();
-        
+
+        // After both positions move: the fill converts reservation into position, and OnFill shrinks
+        // the reservation by exactly the fill quantity.
+        _riskLayer.OnFill(fill);
+
         int32_t coreGroupId = instrument.Header().CoreGroupId;
         WriteToExecution(strategyId, coreGroupId, fill);
         WriteToExecution(strategyId, coreGroupId, localPosition);

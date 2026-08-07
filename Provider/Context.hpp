@@ -149,6 +149,9 @@ protected:
 	Socket::SharedArray<Execution::RiskLimit> _riskLimits;
 	Socket::SharedArray<Execution::OrderState> _orderStates;
 	Socket::SharedArray<Execution::OrderTarget> _orderTargets;
+	// Reserved exposure per order slot. Server-owned: the RiskLayer is the only writer, and it runs
+	// server-side only. Keyed by OrderId::GlobalIndex, so a client and the server name the same row.
+	Socket::SharedArray<Execution::OrderRisk> _orderRisks;
 	
 	// positions
 	Socket::SharedArray<Execution::PositionHeader> _localPositionHeaders;
@@ -181,6 +184,7 @@ protected:
     _riskLimits(serverName / "RiskLimits", ServerHeader().GetReadonlyRef().InstrumentIds.Length(), ServerAccess),
     _orderStates(serverName / "OrderStates", ServerHeader().GetReadonlyRef().OrdersCapacity(), ServerAccess, false),
     _orderTargets(serverName / "OrderTargets", ServerHeader().GetReadonlyRef().OrdersCapacity(), ClientAccess, false),
+    _orderRisks(serverName / "OrderRisks", ServerHeader().GetReadonlyRef().OrdersCapacity(), ServerAccess, false),
     _localPositionHeaders(serverName / "LocalPositionHeaders", ServerHeader().GetReadonlyRef().LocalPositionsCapacity(), ServerAccess, false)
 	{
         std::cout << Tools::GetTypeName(typeid(*this)) << "(" << serverName << ", " << directoryPath.string() << ", "
@@ -231,6 +235,13 @@ public:
 	{
 		ThrowIfInstrumentIdOutOfRange(instrumentId);
 		return _riskLimits[instrumentId];
+	}
+
+	// Keyed by GlobalIndex, not the virtual local/global split GetOrderState uses: the ledger is
+	// server-owned and every writer of it already holds the full OrderId.
+	Socket::SharedArrayEntry<Execution::OrderRisk>& GetOrderRisk(Execution::OrderId orderId)
+	{
+		return _orderRisks[orderId.GlobalIndex()];
 	}
 
 	Socket::SharedArrayEntry<Data::MarketByPrice64>& GetMarketByPrice64(int32_t instrumentId)

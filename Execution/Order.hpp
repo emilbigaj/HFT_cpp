@@ -54,6 +54,19 @@ namespace Execution
 		Active = 1,
 	};
 
+	// Why are we publishing a new OrderState? Filled onwards is terminal.
+	enum class OrderStateReason : uint8_t
+	{
+		Unknown = 0,
+		PendingNew = 1,
+		Acked = 2,
+		PartialFill = 3,
+		Filled = 4, // here onwards -> Done
+		Canceled = 5,
+		Rejected = 6, // create rejected, not amend/cancel rejected
+		Eliminated = 7,
+	};
+
 	enum class OrderRejectedReason : uint8_t
 	{
 		Unknown = 0,
@@ -86,8 +99,7 @@ namespace Execution
 		CantAllocateClientOrderId = 33,
 		OrderIndexIsBusy          = 34,
 		OrderNotFound             = 35,
-		DuplicateOrderId            = 36, // ClOrdID reuse / would overwrite a resting order
-		// removed, already added above
+		DuplicateOrderId          = 36, // ClOrdID reuse / would overwrite a resting order
 
 		// ---- 40..49: Discarded: intentional no-ops; system decided not to act, no alert ----
 		StateIsDone            = 40,
@@ -95,23 +107,24 @@ namespace Execution
 		CancelIsActive         = 42,
 		TargetIsActive         = 43,
 		TargetIsStale          = 44,
-		AlgoIsPaused           = 45,
-
+		TooManyActiveTargets   = 45,
+		AlgoIsPaused           = 46,
 
 		// ---- 50..59: Risk and business limits ----
 		NotInSession           = 50,
 		PositionIsSuspended    = 51,
-		QuantityTooLarge       = 52,
-		PositionTooLarge       = 53,
-		NotEnoughMargin        = 54,
-		TooManyOrdersPerSecond = 55,
-		TooManyOrdersPerSession    = 56,
-		MessageEfficiencyViolated  = 57,
-		TooManyActiveOrders = 58,
-		NotAuthorizedToTrade = 59, // entitlement/permission wall — stop retrying
+		QuantityExceedsRiskLimit   = 52,
+		QuantityTooLarge           = 53,
+		PositionExceedsRiskLimit   = 54,
+		NotEnoughMargin        = 55,
+		TooManyOrdersPerSecond = 56,
+		TooManyOrdersPerSession    = 57,
+		MessageEfficiencyViolated  = 58,
+		TooManyActiveOrders = 59,
+		NotAuthorizedToTrade = 60, // entitlement/permission wall — stop retrying
 
 		// ---- 60..69: System ----
-		ExceptionThrownByRiskLayer = 60,
+		ExceptionThrownByRiskLayer = 63,
 	};
 
 
@@ -154,29 +167,38 @@ namespace Execution
 		int32_t StrategyId = -1;
 		int32_t MaxOrderQuantity = 0;
 		int32_t MaxPositionQuantity = 0;
-		Execution::RateLimit MaxOrdersPerSession;
-		Execution::RateLimit MaxOrdersPerSecond;
+		// The reserved exposure the RiskLayer is currently holding against this instrument, one
+		// aggregate per side. Long is signed positive, short signed negative — GetShortQuantityAllowance
+		// and the position test both depend on that, so a delta added here must carry the order's sign.
+		int32_t WorstLongWorkingQuantity = 0;
+		int32_t WorstShortWorkingQuantity = 0;
 
 		RiskLimit() = default;
 		explicit RiskLimit(int32_t instrumentId) : InstrumentId(instrumentId) {}
 
-		static RiskLimit GetMaxLimits(int32_t instrumentId)	
+		[[nodiscard]] int32_t GetLongQuantityAllowance(int32_t position) const
+		{
+			return std::max(0, MaxPositionQuantity - position - WorstLongWorkingQuantity);
+		}
+
+		[[nodiscard]] int32_t GetShortQuantityAllowance(int32_t position) const
+		{
+			return std::min(0, -MaxPositionQuantity - position - WorstShortWorkingQuantity);
+		}
+
+		static RiskLimit GetMaxLimits(int32_t instrumentId)
 		{
 			RiskLimit maxLimit(instrumentId);
 			maxLimit.MaxOrderQuantity = std::numeric_limits<int32_t>::max();
 			maxLimit.MaxPositionQuantity = std::numeric_limits<int32_t>::max();
-			maxLimit.MaxOrdersPerSession = Execution::RateLimit(Tools::Duration::FromDays(1LL), 1'000'000);
-			maxLimit.MaxOrdersPerSecond = Execution::RateLimit(Tools::Duration::FromSeconds(static_cast<int64_t>(1LL)), 300);
 			return maxLimit;
 		}
 
-		static RiskLimit GetMinLimits(int32_t instrumentId)	
+		static RiskLimit GetMinLimits(int32_t instrumentId)
 		{
 			RiskLimit minLimit(instrumentId);
 			minLimit.MaxOrderQuantity = 0;
 			minLimit.MaxPositionQuantity = 0;
-			minLimit.MaxOrdersPerSession = Execution::RateLimit(Tools::Duration::FromDays(1LL), 0);
-			minLimit.MaxOrdersPerSecond = Execution::RateLimit(Tools::Duration::FromSeconds(static_cast<int64_t>(1LL)), 0);	
 			return minLimit;
 		}
 
@@ -191,13 +213,85 @@ namespace Execution
 			static constexpr auto value = glz::object(
                 "Header", &T::Header,
 				"InstrumentId", &T::InstrumentId,
+				"Timestamp", &T::Timestamp,
+				"StrategyId", &T::StrategyId,
 				"MaxOrderQuantity", &T::MaxOrderQuantity,
 				"MaxPositionQuantity", &T::MaxPositionQuantity,
-				"MaxOrdersPerSession", &T::MaxOrdersPerSession,
-				"MaxOrdersPerSecond", &T::MaxOrdersPerSecond
+				"WorstLongWorkingQuantity", &T::WorstLongWorkingQuantity,
+				"WorstShortWorkingQuantity", &T::WorstShortWorkingQuantity
 			);
 		};
 	};
+
+	static_assert(sizeof(RiskLimit) == 36, "RiskLimit must be 36 bytes");
+
+	// Per-order-slot reservation state, server-owned. Counts how many unacked targets are live at each
+	// absolute quantity, so the worst case an order can still reach is the highest live quantity rather
+	// than the last one sent — a pipelined amend 10 -> 3 -> 7 must reserve 10 until the 10 is retired.
+	// A bitset of occupied quantities makes that worst case a single HighestSet.
+	struct OrderRisk
+	{
+		// Quantities are indexed 1..55; the counts array is sized to the field the bitset can address.
+		static constexpr int32_t MaxOrderQuantity = 56;
+
+		Tools::Bitset64 Quantities;
+		uint8_t Counts[MaxOrderQuantity] = {};
+
+		// Branchless abs. Returns INT32_MIN for INT32_MIN (no throw); callers range-check unsigned.
+		ALWAYS_INLINE static int32_t Abs(int32_t value)
+		{
+			uint32_t mask = static_cast<uint32_t>(value >> 31);
+			return static_cast<int32_t>((static_cast<uint32_t>(value) ^ mask) - mask);
+		}
+
+		[[nodiscard]] int32_t GetWorstOrderQuantity(int32_t ackedOrderQuantity) const
+		{
+			return std::max(Abs(ackedOrderQuantity), Quantities.HighestSet());
+		}
+
+		bool TryAdd(int32_t orderQuantity, OrderRejectedReason& reason)
+		{
+			int32_t absQuantity = Abs(orderQuantity);
+			if (static_cast<uint32_t>(absQuantity) >= static_cast<uint32_t>(MaxOrderQuantity) || absQuantity == 0)
+			{
+				reason = OrderRejectedReason::QuantityNotValid;
+				return false;
+			}
+
+			uint8_t& count = Counts[absQuantity];
+			if (count == UINT8_MAX)
+			{
+				reason = OrderRejectedReason::TooManyActiveTargets;
+				return false;
+			}
+
+			if (++count == 1)
+				Quantities.Set(absQuantity);
+
+			reason = OrderRejectedReason::Unknown;
+			return true;
+		}
+
+		void Ack(int32_t orderQuantity) { Remove(orderQuantity); }
+		void Reject(int32_t orderQuantity) { Remove(orderQuantity); }
+
+		void Remove(int32_t orderQuantity)
+		{
+			int32_t absQuantity = Abs(orderQuantity);
+			if (static_cast<uint32_t>(absQuantity) >= static_cast<uint32_t>(MaxOrderQuantity))
+				return;
+
+			uint8_t& count = Counts[absQuantity];
+			if (count == 0)
+				return;
+
+			if (--count == 0)
+				Quantities.Clear(absQuantity);
+		}
+	};
+
+	static_assert(sizeof(OrderRisk) == 64, "OrderRisk must be 64 bytes");
+	static_assert(Tools::PlainOldData<OrderRisk>, "OrderRisk must be unmanaged");
 
 	struct OrderProfile
 	{
@@ -346,6 +440,7 @@ namespace Execution
 			b.Set(static_cast<int32_t>(OrderRejectedReason::TargetIsActive));
 			b.Set(static_cast<int32_t>(OrderRejectedReason::AlgoIsPaused));
 			b.Set(static_cast<int32_t>(OrderRejectedReason::TooManyOrdersPerSecond));
+			b.Set(static_cast<int32_t>(OrderRejectedReason::TooManyActiveTargets));
 			return b;
 		}();
 
@@ -377,7 +472,8 @@ namespace Execution
 		Execution::OrderProfile OrderProfile;
 		Execution::TimeInForce TimeInForce = Execution::TimeInForce::Day;
 		Execution::OrderStateStatus OrderStateStatus = Execution::OrderStateStatus::Active;
-		uint8_t Reserved[2] = { 0, 0 };
+		Execution::OrderStateReason OrderStateReason = Execution::OrderStateReason::Unknown;
+		uint8_t Reserved[1] = { 0 };
 		int32_t QuantityFilled = 0;
 		int32_t QuantityAhead = 0;
 
@@ -401,6 +497,7 @@ namespace Execution
 				"OrderProfile", &T::OrderProfile,
 				"TimeInForce", &T::TimeInForce,
 				"OrderStateStatus", &T::OrderStateStatus,
+				"OrderStateReason", &T::OrderStateReason,
 				"QuantityFilled", &T::QuantityFilled,
 				"QuantityAhead", &T::QuantityAhead
 			);
