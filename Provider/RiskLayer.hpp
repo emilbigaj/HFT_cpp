@@ -16,13 +16,17 @@ namespace Provider
 class RiskLayer
 {
 private:
-    Provider::ServerContext _serverContext;
+    // Borrowed, not owned. The server hands in the context it opened with Access::Write, because the
+    // ledger writes RiskLimit and OrderRisk rows — a context of its own would be Access::Read and every
+    // GetRef() below would throw "Readonly" straight into the ExceptionThrownByRiskLayer catch,
+    // rejecting every order. A client passes a read-only one; its reservation block is gated off.
+    Provider::ServerContext& _serverContext;
     std::vector<uint64_t> _maxClientOrderIds;
     Execution::OrderRejectedSource _orderRejectedSource;
 
 public:
-    explicit RiskLayer(const std::filesystem::path& serverName, Execution::OrderRejectedSource orderRejectedSource)
-    : _serverContext(serverName, Tools::Access::Read), _orderRejectedSource(orderRejectedSource)
+    RiskLayer(Provider::ServerContext& serverContext, Execution::OrderRejectedSource orderRejectedSource)
+    : _serverContext(serverContext), _orderRejectedSource(orderRejectedSource)
     {
         _maxClientOrderIds.resize(static_cast<size_t>(_serverContext.ServerHeader().GetReadonlyRef().ClientIds.Length()), 0ULL);
     }

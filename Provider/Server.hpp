@@ -112,7 +112,7 @@ public:
       _serverContext(ServerName, Tools::Access::Write),
       _loggingServer(ServerName.string() + ".server", _serverContext.LoggingServerName, {Socket::SocketChannel::AdminChannelLength}, {Socket::SocketChannel::AdminChannelLength}),
       _audit(ServerName.string() + ".audit", _serverContext.LoggingServerName, Socket::SocketChannel::BuildChannelLengths(serverHeader.CoreGroupIds), {Socket::SocketChannel::AdminChannelLength}),
-      _riskLayer(ServerName, Execution::OrderRejectedSource::Server),
+      _riskLayer(_serverContext, Execution::OrderRejectedSource::Server),
       _loggableManager()
     {
         InitDirectories();

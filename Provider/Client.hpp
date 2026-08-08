@@ -36,6 +36,9 @@ private:
     Socket::ClientSocket _socket;
     Tools::Bitset64 _isOrderActive;
     bool _isDisposed = false;
+    // Read-only view of the server's rows for validation only. RiskLayer borrows rather than owns,
+    // so the client has to hold the instance it hands over.
+    Provider::ServerContext _riskServerContext;
     Provider::RiskLayer _riskLayer;
 
     // CoreGroupIds of the instruments this client has allocated => which execution channels ReadSocket drains.
@@ -99,7 +102,8 @@ public:
           // server's declared CoreGroupIds (read before connecting).
           _socket(ClientName, ServerName, ReadServerChannelLengths(ServerName), ReadServerChannelLengths(ServerName)),
           _isOrderActive(0ULL),
-          _riskLayer(ServerName, Execution::OrderRejectedSource::Client),
+          _riskServerContext(ServerName, Tools::Access::Read),
+          _riskLayer(_riskServerContext, Execution::OrderRejectedSource::Client),
           ClientId(_socket.Connect()),
           ClientContext(ClientName, ServerName, Tools::Access::Write),
           _serverMarketsByPrice(ServerName / "MarketsByPrice", ClientContext.ServerHeader().GetReadonlyRef().InstrumentIds.Length(), Tools::Access::Read)
