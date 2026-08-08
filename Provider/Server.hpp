@@ -65,6 +65,8 @@ private:
     // admin thread at instrument allocation, read on the exec threads => atomic ops. Indexed by
     // CoreGroupId; a set bit is a clientId. Sized to highest CoreGroupId + 1 in the ctor.
     std::vector<Tools::Bitset64> _clientIdsByCoreGroupId;
+
+    bool _isDisposed = false;
 public:
 
     Provider::ServerContext& Context()
@@ -113,6 +115,8 @@ public:
       _riskLayer(ServerName, Execution::OrderRejectedSource::Server),
       _loggableManager()
     {
+        InitDirectories();
+
         // Before anything else: LoadClients() runs between construction and Connect(), and
         // CreateDetatchedClient() refuses to build a Detached socket while this is false.
         _serverSocket.Persistance = serverHeader.Persistance;
@@ -451,6 +455,15 @@ public:
         int32_t globalOrderIndex = Execution::OrderIdAllocator::GetGlobalIndex(orderRejected.OrderHeader.OrderId);
         Socket::SharedArrayEntry<Execution::OrderState>& orderStateEntry = _serverContext.GetOrderState(globalOrderIndex);
         Execution::OrderState& orderState = orderStateEntry.GetRef();
+
+        // The exchange saying "no such order" for a slot we already know is finished is not news, and
+        // it must not pause the algo. Restate it as StateIsDone, which OrderDiscarded covers.
+        if (orderState.OrderStateStatus == Execution::OrderStateStatus::Done
+            && orderRejected.OrderRejectedReasons.Raw() == (1ULL << static_cast<int32_t>(Execution::OrderRejectedReason::OrderNotFound)))
+        {
+            orderRejected.OrderRejectedReasons = Tools::Bitset64(1ULL << static_cast<int32_t>(Execution::OrderRejectedReason::StateIsDone));
+        }
+
         if (orderState.OrderHeader.OrderId == orderRejected.OrderHeader.OrderId)
         {
             orderRejected.OrderHeader.NicTimestamp = Tools::Timestamp::UtcNow();
@@ -497,6 +510,9 @@ public:
                 .OrderProfile = orderTarget.OrderProfile,
                 .TimeInForce = orderTarget.TimeInForce,
                 .OrderStateStatus = isValid ? Execution::OrderStateStatus::Active : Execution::OrderStateStatus::Done,
+                // Seq 0 already means "not acked"; naming it lets the RiskLayer retire hooks tell
+                // PendingNew from an ack without inferring it from the sequence.
+                .OrderStateReason = isValid ? Execution::OrderStateReason::PendingNew : Execution::OrderStateReason::Rejected,
                 .QuantityFilled = 0,
                 .QuantityAhead = 0,
             };
@@ -744,7 +760,21 @@ public:
 
     void Dispose()
     {
+        if (_isDisposed)
+            return;
+        _isDisposed = true;
+
         _serverSocket.Dispose();
+
+        for (std::unique_ptr<Socket::WriteOnlySocket>& instrumentData : _instrumentData)
+        {
+            if (instrumentData)
+                instrumentData->Dispose();
+        }
+
+        _audit.Dispose();
+        _loggingServer.Dispose();
+        // _serverContext and _serverHeaderBox are RAII here; C# disposes them explicitly.
     }
 
     void LoadClients(const Tools::Timestamp date)
@@ -756,6 +786,9 @@ public:
         std::string line;
         while (std::getline(clientsFile, line))
         {
+            if (line.find_first_not_of(" \t\r\n") == std::string::npos)
+                continue;
+
             Socket::SocketHeader socketHeader = Tools::Json::Deserialize<Socket::SocketHeader>(line);
             socketHeader.ClientId = _serverContext.AllocateClientId(socketHeader);
             _serverSocket.CreateDetatchedClient(socketHeader);
@@ -772,6 +805,9 @@ public:
         std::string line;
         while (std::getline(instrumentsFile, line))
         {
+            if (line.find_first_not_of(" \t\r\n") == std::string::npos)
+                continue;
+
             Provider::AllocateInstrument allocateInstrument = Tools::Json::Deserialize<Provider::AllocateInstrument>(line);
             allocateInstrument.InstrumentHeaderId = _serverContext.GetInstrumentHeaderIdByExchangeInstrumentId(allocateInstrument.ExchangeInstrumentId);
             if (allocateInstrument.InstrumentHeaderId < 0)
@@ -802,8 +838,32 @@ public:
 
 private:
 
+    static inline const std::array<const char*, 7> SubDirectories =
+        { "Alerts", "Audit", "Fills", "Positions", "Series", "Clients", "Instruments" };
+
+    // Outside Realtime the server's own output directories are emptied, so a backtest starts from a
+    // clean slate rather than replaying yesterday's clients, instruments, fills and positions.
+    void InitDirectories()
+    {
+        for (const char* subDirectory : SubDirectories)
+        {
+            std::filesystem::path subDirectoryPath = ServerName / subDirectory;
+            std::filesystem::create_directories(subDirectoryPath);
+
+            if (Clock::Mode == ClockMode::Realtime)
+                continue;
+
+            std::error_code error;
+            for (const std::filesystem::directory_entry& entry : std::filesystem::directory_iterator(subDirectoryPath, error))
+            {
+                if (entry.is_regular_file(error))
+                    std::filesystem::remove(entry.path(), error);
+            }
+        }
+    }
+
     void OnClientAllocated(const Socket::SocketHeader& socketHeader)
-    {   
+    {
         // this is the open signal for the logger
         _loggingServer.Write(socketHeader);
         if(AllocateClient)
