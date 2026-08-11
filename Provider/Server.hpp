@@ -440,10 +440,8 @@ public:
             existingOrderState.OrderHeader.ExchangeTimestamp = orderState.OrderHeader.ExchangeTimestamp;
             existingOrderState.OrderHeader.NicTimestamp = Tools::Timestamp::UtcNow();
             orderStateEntry.ReleaseLock();
+            _riskLayer.OnOrderState(existingOrderState);
         }
-        // Retire the slot's reservation from the stored state, not the inbound one: an unsafe-to-
-        // overwrite state was never applied, so releasing against it would drop exposure we still hold.
-        _riskLayer.OnOrderState(existingOrderState);
         WriteToExecution(existingOrderState);
             if (OrderState)
                 OrderState(existingOrderState);

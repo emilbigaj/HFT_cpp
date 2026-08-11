@@ -15,7 +15,6 @@
 #include "Tick.hpp"
 #include "Bitset.hpp"
 #include "Instrument.hpp"
-#include "RateLimit.hpp"
 
 namespace Execution
 {

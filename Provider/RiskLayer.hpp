@@ -6,7 +6,6 @@
 #include "Bitset.hpp"
 #include "Tools.hpp"
 #include <cmath>
-#include <filesystem>
 #include <iostream>
 
 namespace Provider
@@ -334,6 +333,9 @@ public:
             // ExceptionThrownByRiskLayer. It must not double-count exposure either.
             if (_orderRejectedSource != Execution::OrderRejectedSource::Server)
                 return orderRejectedReasons.IsEmpty();
+
+            if (!orderRejectedReasons.IsEmpty())
+                return false;
 
             // 10. RISK LIMITS
             // Only check risk on New or Amend (increasing size)
