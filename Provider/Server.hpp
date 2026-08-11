@@ -457,6 +457,8 @@ public:
         return existingOrderState;
     }
 
+    static constexpr uint64_t OrderNotFoundOnly = 1ULL << static_cast<int32_t>(Execution::OrderRejectedReason::OrderNotFound);
+
     Execution::OrderRejected OnOrderRejected(Execution::OrderRejected& orderRejected, const std::string& message)
     {
         int32_t globalOrderIndex = Execution::OrderIdAllocator::GetGlobalIndex(orderRejected.OrderHeader.OrderId);
@@ -466,7 +468,7 @@ public:
         // The exchange saying "no such order" for a slot we already know is finished is not news, and
         // it must not pause the algo. Restate it as StateIsDone, which OrderDiscarded covers.
         if (orderState.OrderStateStatus == Execution::OrderStateStatus::Done
-            && orderRejected.OrderRejectedReasons.Raw() == (1ULL << static_cast<int32_t>(Execution::OrderRejectedReason::OrderNotFound)))
+            && orderRejected.OrderRejectedReasons.Raw() == OrderNotFoundOnly)
         {
             orderRejected.OrderRejectedReasons = Tools::Bitset64(1ULL << static_cast<int32_t>(Execution::OrderRejectedReason::StateIsDone));
         }
@@ -480,9 +482,6 @@ public:
         }
         else
         {
-            std::cout << "Server::OnOrderRejected: unknown clientOrderId\n"
-                      << orderRejected.ToString()
-                      << std::endl;
             return Execution::OrderRejected{};
         }
     }
