@@ -28,6 +28,9 @@ namespace Execution
         static constexpr int32_t IndexBits = LocalIndexBits + ClientBits; // global order index
         static constexpr int32_t OrdersPerClient = 1 << LocalIndexBits;
         static constexpr int32_t OrdersPerClientBitShift = LocalIndexBits;
+        // The house book. Reserved before any client can connect so the allocator can never hand it
+        // out, and so the slot stays addressable by the id/allocation guards. See Spec.md.
+        static constexpr int32_t ServerStrategyId = 0;
         static constexpr int32_t MaxClientId = (1 << ClientBits) - 1;         // 63
         static constexpr int32_t MaxStrategyId = (1 << StrategyBits) - 1;     // 63
         // The instrument field's top value names no instrument, and is reserved at every size. An id that

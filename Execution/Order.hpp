@@ -39,14 +39,6 @@ namespace Execution
 		ClosingAuction = 5,
 	};
 
-	enum class OrderStateDoneReason : uint8_t
-	{
-		None = 0,
-		Filled = 1,
-		Canceled = 2,
-		Rejected = 3,
-	};
-
 	enum class OrderStateStatus : uint8_t
 	{
 		Done = 0,
@@ -633,6 +625,34 @@ namespace Execution
 	};
 
 	static_assert(sizeof(PositionHeader) == 57, "PositionHeader must be 57 bytes");
+
+	// Field offsets, not just sizes. Every divergence found against the C# side so far had the right
+	// total size and the wrong field order, which sizeof alone cannot catch.
+	static_assert(offsetof(OrderHeader, Seq) == 0 && offsetof(OrderHeader, OrderId) == 4
+		&& offsetof(OrderHeader, ExchangeTimestamp) == 12 && offsetof(OrderHeader, NicTimestamp) == 20);
+	static_assert(offsetof(RiskLimit, InstrumentId) == 4 && offsetof(RiskLimit, Timestamp) == 8
+		&& offsetof(RiskLimit, StrategyId) == 16 && offsetof(RiskLimit, MaxOrderQuantity) == 20
+		&& offsetof(RiskLimit, MaxPositionQuantity) == 24
+		&& offsetof(RiskLimit, WorstLongWorkingQuantity) == 28
+		&& offsetof(RiskLimit, WorstShortWorkingQuantity) == 32);
+	static_assert(offsetof(OrderRisk, Quantities) == 0 && offsetof(OrderRisk, Counts) == 8);
+	static_assert(offsetof(Fill, OrderHeader) == 4 && offsetof(Fill, FillId) == 32
+		&& offsetof(Fill, OrderProfile) == 40 && offsetof(Fill, FillType) == 48);
+	static_assert(offsetof(OrderState, OrderHeader) == 4 && offsetof(OrderState, ExchangeOrderId) == 32
+		&& offsetof(OrderState, OrderProfile) == 40 && offsetof(OrderState, TimeInForce) == 48
+		&& offsetof(OrderState, OrderStateStatus) == 49 && offsetof(OrderState, OrderStateReason) == 50
+		&& offsetof(OrderState, QuantityFilled) == 52 && offsetof(OrderState, QuantityAhead) == 56);
+	static_assert(offsetof(OrderTarget, OrderHeader) == 4 && offsetof(OrderTarget, OrderProfile) == 32
+		&& offsetof(OrderTarget, TimeInForce) == 40 && offsetof(OrderTarget, OrderTargetAction) == 41
+		&& offsetof(OrderTarget, OrderTargetStatus) == 42);
+	static_assert(offsetof(OrderRejected, OrderHeader) == 4
+		&& offsetof(OrderRejected, OrderTargetAction) == 32
+		&& offsetof(OrderRejected, OrderRejectedSource) == 33
+		&& offsetof(OrderRejected, OrderProfile) == 36
+		&& offsetof(OrderRejected, OrderRejectedReasons) == 44);
+	static_assert(offsetof(PositionHeader, OrderHeader) == 4 && offsetof(PositionHeader, Quantity) == 32
+		&& offsetof(PositionHeader, AvgPrice) == 36 && offsetof(PositionHeader, RealizedProfit) == 44
+		&& offsetof(PositionHeader, QuantityTraded) == 52 && offsetof(PositionHeader, AlgoStatus) == 56);
 
 #pragma pack(pop)
 }

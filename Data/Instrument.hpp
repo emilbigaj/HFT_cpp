@@ -118,12 +118,12 @@ namespace Data
 	{
 		Data::InstrumentHeader InstrumentHeader;
 		double Multiplier;
-		Tools::Timestamp ExpiryDate;
-		Data::ExpiryType ExpiryType;
+		Tools::Timestamp MaturityDate;
+		Data::MaturityType MaturityType;
 
 		std::unique_ptr<Data::FutureSymbology> Symbology() const
 		{
-			return std::make_unique<Data::FutureSymbology>(InstrumentHeader.Exchange.ToString(), InstrumentHeader.Root.ToString(), ExpiryType, ExpiryDate);
+			return std::make_unique<Data::FutureSymbology>(InstrumentHeader.Exchange.ToString(), InstrumentHeader.Root.ToString(), MaturityType, MaturityDate);
 		}
 
 		std::string ToString() const
@@ -137,8 +137,8 @@ namespace Data
 			static constexpr auto value = glz::object(
 				"InstrumentHeader", &T::InstrumentHeader,
 				"Multiplier", &T::Multiplier,
-				"ExpiryDate", &T::ExpiryDate,
-				"ExpiryType", &T::ExpiryType
+				"MaturityDate", &T::MaturityDate,
+				"MaturityType", &T::MaturityType
 			);
 		};
 	};
@@ -147,17 +147,17 @@ namespace Data
 	{
 		Data::InstrumentHeader InstrumentHeader;
 		double Multiplier;
-		Tools::Timestamp LongExpiryDate;
-		Tools::Timestamp ShortExpiryDate;
+		Tools::Timestamp LongMaturityDate;
+		Tools::Timestamp ShortMaturityDate;
 		int32_t LongInstrumentId;
 		int32_t ShortInstrumentId;
-		Data::ExpiryType LongExpiryType;
-		Data::ExpiryType ShortExpiryType;
+		Data::MaturityType LongMaturityType;
+		Data::MaturityType ShortMaturityType;
 
 
 		std::unique_ptr<Data::SpreadSymbology> Symbology() const
 		{
-			return std::make_unique<Data::SpreadSymbology>(InstrumentHeader.Exchange.ToString(), InstrumentHeader.Root.ToString(), LongExpiryType, LongExpiryDate, ShortExpiryType, ShortExpiryDate);
+			return std::make_unique<Data::SpreadSymbology>(InstrumentHeader.Exchange.ToString(), InstrumentHeader.Root.ToString(), LongMaturityType, LongMaturityDate, ShortMaturityType, ShortMaturityDate);
 		}
 
 		std::string ToString() const
@@ -171,10 +171,10 @@ namespace Data
 			static constexpr auto value = glz::object(
 				"InstrumentHeader", &T::InstrumentHeader,
 				"Multiplier", &T::Multiplier,
-				"LongExpiryDate", &T::LongExpiryDate,
-				"LongExpiryType", &T::LongExpiryType,
-				"ShortExpiryDate", &T::ShortExpiryDate,
-				"ShortExpiryType", &T::ShortExpiryType,
+				"LongMaturityDate", &T::LongMaturityDate,
+				"LongMaturityType", &T::LongMaturityType,
+				"ShortMaturityDate", &T::ShortMaturityDate,
+				"ShortMaturityType", &T::ShortMaturityType,
 				"LongInstrumentId", &T::LongInstrumentId,
 				"ShortInstrumentId", &T::ShortInstrumentId
 			);
@@ -447,14 +447,14 @@ namespace Data
 			_multiplier = FutureHeader().Multiplier;
 		}
 
-		Data::ExpiryType ExpiryType() const
+		Data::MaturityType MaturityType() const
 		{
-			return FutureHeader().ExpiryType;
+			return FutureHeader().MaturityType;
 		}
 
-		Tools::Timestamp ExpiryDate() const
+		Tools::Timestamp MaturityDate() const
 		{
-			return FutureHeader().ExpiryDate;
+			return FutureHeader().MaturityDate;
 		}
 
 		const Data::FutureHeader& FutureHeader() const
@@ -501,24 +501,24 @@ namespace Data
 			_multiplier = SpreadHeader().Multiplier;
 		}
 
-		Data::ExpiryType LongExpiryType() const
+		Data::MaturityType LongMaturityType() const
 		{
-			return _long.ExpiryType();
+			return _long.MaturityType();
 		}
 
-		Tools::Timestamp LongExpiryDate() const
+		Tools::Timestamp LongMaturityDate() const
 		{
-			return _long.ExpiryDate();
+			return _long.MaturityDate();
 		}
 
-		Data::ExpiryType ShortExpiryType() const
+		Data::MaturityType ShortMaturityType() const
 		{
-			return _short.ExpiryType();
+			return _short.MaturityType();
 		}
 
-		Tools::Timestamp ShortExpiryDate() const
+		Tools::Timestamp ShortMaturityDate() const
 		{
-			return _short.ExpiryDate();
+			return _short.MaturityDate();
 		}
 
 		const Future& Long() const

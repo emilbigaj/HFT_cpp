@@ -122,6 +122,14 @@ public:
 		return directoryPath / "LoggingServer";
 	}
 
+	// The Strategies tree for the current clock mode. ClientContext::GetDirectoryPath is the public
+	// spelling; it lives here because ServerContext is declared first and needs it for strategy 0.
+	static std::filesystem::path GetStrategyDirectoryPath(const std::string& clientName)
+	{
+		std::string modeStr = Clock::Mode == ClockMode::Simulation ? "Simulation" : "Realtime";
+		return RootDirectoryPath / "Strategies" / modeStr / clientName;
+	}
+
 	const std::filesystem::path FillsDirectoryPath;
 	const std::filesystem::path PositionsDirectoryPath;
 	const std::filesystem::path AlertsDirectoryPath;
@@ -426,7 +434,8 @@ public:
     : Context(serverName.string(), serverName, access, Tools::Access::Read),
       _serverPositionHeaders(ServerName / "ServerPositionHeaders", ServerHeader().GetReadonlyRef().InstrumentIds.Length(), ServerAccess),
       ClientsDirectoryPath(ServerName / "Clients"),
-      InstrumentsDirectoryPath(ServerName / "Instruments")
+      InstrumentsDirectoryPath(ServerName / "Instruments"),
+      ServerStrategyName(GetStrategyDirectoryPath(ServerName.filename().string()))
 	{
 		ThrowIfInvalidServerName(serverName);
 
@@ -456,13 +465,26 @@ public:
 		return DirectoriesPath() / modeStr / serverName;
 	}
 
+	// The house book's directory: the Strategies tree under the server's leaf name. Strategy 0 has no
+	// socket to take a name from, so its position files hang off this instead. See Spec.md.
+	const std::filesystem::path ServerStrategyName;
+
 	static inline Socket::LetterBox<Provider::ServerHeader> Connect(const Provider::ServerHeader& serverHeader)
 	{
         std::string serverNameStr = serverHeader.ServerName.ToString();
 		// Path-joined, matching Context's _serverHeaderBox. Concatenating here names a different
 		// region, and Context::EnsureConnected() then spins forever on a box nobody writes.
 		Socket::LetterBox<Provider::ServerHeader> serverHeaderBox(std::filesystem::path(serverNameStr) / "ServerHeader", Tools::Access::Write);
-		if (!serverHeaderBox.TryStore(serverHeader))
+
+		// Reserve the house book before anyone can connect. AllocateClientId hands out
+		// ClientIds.LowestClear(), so without this the FIRST client to attach takes id 0 and every
+		// manual order from a server workspace would be attributed to it. Pre-setting the bit both
+		// keeps it out of the allocator and makes the slot addressable — ThrowIfClientIdOutOfRange
+		// and the RiskLayer's StrategyIdNotAllocated check each test this bit.
+		Provider::ServerHeader reserved = serverHeader;
+		reserved.ClientIds.Set(Execution::OrderIdAllocator::ServerStrategyId);
+
+		if (!serverHeaderBox.TryStore(reserved))
 			throw std::runtime_error("ServerContext.Connect(" + serverNameStr + "), Failed to write ServerHeader to shared memory.");
 
 		return serverHeaderBox;
@@ -505,6 +527,11 @@ public:
 
     int32_t AllocateClientId(const Socket::SocketHeader& socketHeader)
     {       
+        // The server's leaf name is reserved for strategy 0's directory — a client named after the
+        // server would share the house book's files. See Spec.md.
+        if (socketHeader.ClientName == Tools::String128(ServerStrategyName.string()))
+            throw std::runtime_error("ServerContext.AllocateClientId(" + ServerName.string() + "), client name " + socketHeader.ClientName.ToString() + " collides with the reserved server strategy name.");
+
         Socket::SharedArrayEntry<Provider::ServerHeader>& serverHeaderEntry = ServerHeader();
         Provider::ServerHeader& serverHeader = serverHeaderEntry.GetRef();
         Tools::Bitset64& clientIds = serverHeader.ClientIds;
@@ -638,7 +665,10 @@ public:
 		Data::InstrumentHeader128& header128 = GetInstrumentHeader(instrumentHeaderId).GetRef();
 		std::unique_ptr<Data::Symbology> symbology = header128.Symbology();
 
-		std::string clientName = GetSocketHeader(clientId).GetReadonlyRef().ClientName.ToString();
+		// Strategy 0 has no socket to take a name from; its book lives at ServerStrategyName (see Spec.md).
+		std::string clientName = clientId == Execution::OrderIdAllocator::ServerStrategyId
+			? ServerStrategyName.string()
+			: GetSocketHeader(clientId).GetReadonlyRef().ClientName.ToString();
 		std::string positionPath = GetPositionFilePath(clientName, symbology->Symbol()).string();
 		std::optional<std::string> positionLine = Tools::ReadLastLine(positionPath);
 		Execution::PositionHeader positionHeader = positionLine ? Tools::Json::Deserialize<Execution::PositionHeader>(positionLine.value()) : Execution::PositionHeader{};
@@ -697,8 +727,7 @@ public:
 
 	static inline std::filesystem::path GetDirectoryPath(const std::string& clientName)
 	{
-		std::string modeStr = Clock::Mode == ClockMode::Simulation ? "Simulation" : "Realtime";
-		return DirectoriesPath() / modeStr / clientName;
+		return GetStrategyDirectoryPath(clientName);
 	}
 
 	int32_t GetClientIdFromMap(const std::string& clientName)

@@ -118,6 +118,14 @@ namespace Provider
 		}
 	};
 	static_assert(Tools::PlainOldData<ServerHeader>);
+	// Persistance is the newest wire field; C# asserts the same two numbers at type-init.
+	static_assert(sizeof(ServerHeader) == 173 && offsetof(ServerHeader, Persistance) == 172);
+	static_assert(offsetof(AllocateInstrument, ClientId) == 4
+		&& offsetof(AllocateInstrument, InstrumentHeaderId) == 8
+		&& offsetof(AllocateInstrument, InstrumentId) == 12
+		&& offsetof(AllocateInstrument, ExchangeInstrumentId) == 16
+		&& offsetof(AllocateInstrument, Symbol) == 20);
+	static_assert(sizeof(Data::Header<AllocateType>) == 4);
 
 #pragma pack(pop)
 }

@@ -67,7 +67,14 @@ private:
     std::vector<Tools::Bitset64> _clientIdsByCoreGroupId;
 
     bool _isDisposed = false;
+
 public:
+    // A silent default: in the dispatchers hid a real bug on the C# side for weeks — a zeroed
+    // Header::Type made every risk-limit edit a no-op with no reject and no log line. Counted, not
+    // swallowed.
+    uint64_t UnknownAdminMessages = 0;
+    uint64_t UnknownExecutionMessages = 0;
+
 
     Provider::ServerContext& Context()
     {
@@ -288,6 +295,7 @@ public:
                         break;
                     }
                     default:
+                        UnknownExecutionMessages++;
                         break;
                 }
             }
@@ -393,6 +401,7 @@ public:
                         break;
                     }
                     default:
+                        UnknownAdminMessages++;
                         break;
                 }
             }
@@ -580,6 +589,12 @@ public:
         int32_t instrumentId = OnAllocateInstrument(allocateInstrument);
 
         _serverContext.AllocateInstrument(clientId, instrumentId);
+
+        // Strategy 0 is the house book: it holds the union of every client's allocations, which is what
+        // lets a server workspace trade anything anyone can see without a validator special-case. It gets
+        // no core-group poll bit (no socket) and no admin echo (nobody listening). See Spec.md.
+        if (clientId != Execution::OrderIdAllocator::ServerStrategyId)
+            _serverContext.AllocateInstrument(Execution::OrderIdAllocator::ServerStrategyId, instrumentId);
 
         // Remember this client now trades the instrument's CoreGroup, so ReadExecution polls that channel.
         int32_t coreGroupId = _serverContext.GetInstrument(instrumentId).Header().CoreGroupId;

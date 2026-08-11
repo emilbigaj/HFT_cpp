@@ -37,11 +37,16 @@ public:
         {
             Data::InstrumentHeader128 header128 = _client.ClientContext.GetInstrumentHeader(instrumentHeaderId).Read();
             Data::InstrumentHeader& header = header128.AsInstrumentHeader();
+
+            // A realtime context holds spreads and unfilled slots too; AsFuture on those is a bad cast.
+            if (header.InstrumentType != Data::InstrumentType::Future)
+                continue;
+
             Data::FutureHeader& future = header128.AsFuture();
 
             if(header.Exchange == "XCME" && header.Root == "6E")
             {
-                if (future.ExpiryDate >= expiry)
+                if (future.MaturityDate >= expiry)
                 {
                     return header128;
                 }

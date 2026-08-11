@@ -10,7 +10,7 @@
 namespace Data
 {
 
-enum ExpiryType : char
+enum MaturityType : char
 {
 	Day = 'D',
 	Week = 'W',
@@ -103,7 +103,7 @@ static InstrumentType ParseInstrumentType(const std::string& text)
 	throw std::invalid_argument("Invalid InstrumentType");
 }
 
-// Abbreviated "<Mon> <Year>" for a contract expiry, e.g. "Jun 2025". Locale-free (fixed table)
+// Abbreviated "<Mon> <Year>" for a contract maturity, e.g. "Jun 2025". Locale-free (fixed table)
 // so it matches the C# ShortSymbol exactly (CultureInfo.InvariantCulture abbreviated month).
 static std::string ShortMonthYear(Tools::Timestamp date)
 {
@@ -186,23 +186,23 @@ public:
 	}
 
 protected:
-	static void ParseExpiryTokenUsingFromDateString(const std::string& token, ExpiryType& expiryType, Tools::Timestamp& expiryDate)
+	static void ParseMaturityToken(const std::string& token, MaturityType& maturityType, Tools::Timestamp& maturityDate)
 	{
 		if (IsStringNullOrWhiteSpace(token) || token.length() < 2)
-			throw std::invalid_argument("Expiry token must start with a letter and include a date, e.g., M20251215.");
+			throw std::invalid_argument("Maturity token must start with a letter and include a date, e.g., M20251215.");
 
 		char typeChar = token[0];
-		expiryType = static_cast<ExpiryType>(typeChar);
+		maturityType = static_cast<MaturityType>(typeChar);
 
 		std::string dateText = token.substr(1);
 
 		try
 		{
-			expiryDate = Tools::Timestamp::FromString(dateText, "%Y-%m-%d");
+			maturityDate = Tools::Timestamp::FromString(dateText, "%Y-%m-%d");
 		}
 		catch (const std::exception& ex)
 		{
-			throw std::invalid_argument("Invalid expiry date: \"" + dateText + "\".");
+			throw std::invalid_argument("Invalid maturity date: \"" + dateText + "\".");
 		}
 	}
 };
@@ -210,29 +210,29 @@ protected:
 class FutureSymbology : public Symbology
 {
 protected:
-	Data::ExpiryType _expiryType;
-	Tools::Timestamp _expiryDate;
+	Data::MaturityType _maturityType;
+	Tools::Timestamp _maturityDate;
 
 public:
-	FutureSymbology(const std::string& exchange, const std::string& root, ExpiryType expiryType, Tools::Timestamp expiryDate) : FutureSymbology(Data::InstrumentType::Future, exchange, root, root + " " + static_cast<char>(expiryType) + expiryDate.ToDateString(), expiryType, expiryDate)
+	FutureSymbology(const std::string& exchange, const std::string& root, MaturityType maturityType, Tools::Timestamp maturityDate) : FutureSymbology(Data::InstrumentType::Future, exchange, root, root + " " + static_cast<char>(maturityType) + maturityDate.ToDateString(), maturityType, maturityDate)
 	{
 	}
 
 protected:
-	FutureSymbology(Data::InstrumentType instrumentType, const std::string& exchange, const std::string& root, const std::string& ticker, ExpiryType expiryType, Tools::Timestamp expiryDate) : Symbology(instrumentType, exchange, root, ticker), _expiryType(expiryType), _expiryDate(expiryDate)
+	FutureSymbology(Data::InstrumentType instrumentType, const std::string& exchange, const std::string& root, const std::string& ticker, MaturityType maturityType, Tools::Timestamp maturityDate) : Symbology(instrumentType, exchange, root, ticker), _maturityType(maturityType), _maturityDate(maturityDate)
 	{
-		_shortSymbol = root + " " + ShortMonthYear(expiryDate);
+		_shortSymbol = root + " " + ShortMonthYear(maturityDate);
 	}
 
 public:
-	Data::ExpiryType ExpiryType() const
+	Data::MaturityType MaturityType() const
 	{
-		return _expiryType;
+		return _maturityType;
 	}
 
-	Tools::Timestamp ExpiryDate() const
+	Tools::Timestamp MaturityDate() const
 	{
-		return _expiryDate;
+		return _maturityDate;
 	}
 };
 
@@ -243,9 +243,9 @@ private:
 	std::unique_ptr<FutureSymbology> _shortSymbology;
 
 public:
-	SpreadSymbology(const std::string& exchange, const std::string& root, Data::ExpiryType longExpiryType, Tools::Timestamp longExpiryDate, Data::ExpiryType shortExpiryType, Tools::Timestamp shortExpiryDate) : FutureSymbology(Data::InstrumentType::Spread, exchange, root, root + " " + static_cast<char>(longExpiryType) + longExpiryDate.ToDateString() + " - " + static_cast<char>(shortExpiryType) + shortExpiryDate.ToDateString(), (longExpiryDate <= shortExpiryDate) ? longExpiryType : shortExpiryType, (longExpiryDate <= shortExpiryDate) ? longExpiryDate : shortExpiryDate), _longSymbology(std::make_unique<FutureSymbology>(exchange, root, longExpiryType, longExpiryDate)), _shortSymbology(std::make_unique<FutureSymbology>(exchange, root, shortExpiryType, shortExpiryDate))
+	SpreadSymbology(const std::string& exchange, const std::string& root, Data::MaturityType longMaturityType, Tools::Timestamp longMaturityDate, Data::MaturityType shortMaturityType, Tools::Timestamp shortMaturityDate) : FutureSymbology(Data::InstrumentType::Spread, exchange, root, root + " " + static_cast<char>(longMaturityType) + longMaturityDate.ToDateString() + " - " + static_cast<char>(shortMaturityType) + shortMaturityDate.ToDateString(), (longMaturityDate <= shortMaturityDate) ? longMaturityType : shortMaturityType, (longMaturityDate <= shortMaturityDate) ? longMaturityDate : shortMaturityDate), _longSymbology(std::make_unique<FutureSymbology>(exchange, root, longMaturityType, longMaturityDate)), _shortSymbology(std::make_unique<FutureSymbology>(exchange, root, shortMaturityType, shortMaturityDate))
 	{
-		_shortSymbol = root + " " + ShortMonthYear(longExpiryDate) + " - " + ShortMonthYear(shortExpiryDate);
+		_shortSymbol = root + " " + ShortMonthYear(longMaturityDate) + " - " + ShortMonthYear(shortMaturityDate);
 	}
 
 	FutureSymbology& LongSymbology() const
@@ -279,19 +279,19 @@ inline std::unique_ptr<Symbology> Symbology::FromString(const std::string& symbo
 	std::size_t spaceAfterRoot = ticker.find(' ');
 	
 	if (spaceAfterRoot == std::string::npos)
-		throw std::invalid_argument("Ticker must contain root and an expiry part.");
+		throw std::invalid_argument("Ticker must contain root and a maturity part.");
 
 	std::string root = ticker.substr(0, spaceAfterRoot);
 	std::string remainder = ticker.substr(spaceAfterRoot + 1);
 
 	if (instrumentType == Data::InstrumentType::Future)
 	{
-		Data::ExpiryType expiryType;
-		Tools::Timestamp expiryDate;
+		Data::MaturityType maturityType;
+		Tools::Timestamp maturityDate;
 		
-		ParseExpiryTokenUsingFromDateString(remainder, expiryType, expiryDate);
+		ParseMaturityToken(remainder, maturityType, maturityDate);
 
-		return std::make_unique<FutureSymbology>(exchange, root, expiryType, expiryDate);
+		return std::make_unique<FutureSymbology>(exchange, root, maturityType, maturityDate);
 	}
 	else if (instrumentType == Data::InstrumentType::Spread)
 	{
@@ -303,17 +303,17 @@ inline std::unique_ptr<Symbology> Symbology::FromString(const std::string& symbo
 		std::string longLeg = TrimString(remainder.substr(0, separatorPos));
 		std::string shortLeg = TrimString(remainder.substr(separatorPos + 3));
 
-		Data::ExpiryType longExpiryType;
-		Tools::Timestamp longExpiryDate;
+		Data::MaturityType longMaturityType;
+		Tools::Timestamp longMaturityDate;
 		
-		ParseExpiryTokenUsingFromDateString(longLeg, longExpiryType, longExpiryDate);
+		ParseMaturityToken(longLeg, longMaturityType, longMaturityDate);
 
-		Data::ExpiryType shortExpiryType;
-		Tools::Timestamp shortExpiryDate;
+		Data::MaturityType shortMaturityType;
+		Tools::Timestamp shortMaturityDate;
 		
-		ParseExpiryTokenUsingFromDateString(shortLeg, shortExpiryType, shortExpiryDate);
+		ParseMaturityToken(shortLeg, shortMaturityType, shortMaturityDate);
 
-		return std::make_unique<SpreadSymbology>(exchange, root, longExpiryType, longExpiryDate, shortExpiryType, shortExpiryDate);
+		return std::make_unique<SpreadSymbology>(exchange, root, longMaturityType, longMaturityDate, shortMaturityType, shortMaturityDate);
 	}
 
 	throw std::logic_error("FromString does not yet support this InstrumentType.");
