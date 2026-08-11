@@ -853,12 +853,16 @@ private:
             if (Clock::Mode == ClockMode::Realtime)
                 continue;
 
+            
+            //Just in case we accidently run a simulation on live server
+            throw std::runtime_error("Server::InitDirectories: Simulation on live server is not allowed. Please check the server name and run again.");
             std::error_code error;
             for (const std::filesystem::directory_entry& entry : std::filesystem::directory_iterator(subDirectoryPath, error))
             {
                 if (entry.is_regular_file(error))
                     std::filesystem::remove(entry.path(), error);
             }
+            
         }
     }
 

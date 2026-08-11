@@ -244,7 +244,7 @@ namespace Execution
 			return static_cast<int32_t>((static_cast<uint32_t>(value) ^ mask) - mask);
 		}
 
-		[[nodiscard]] int32_t GetWorstOrderQuantity(int32_t ackedOrderQuantity) const
+		[[nodiscard]] int32_t GetAbsWorstOrderQuantity(int32_t ackedOrderQuantity) const
 		{
 			return std::max(Abs(ackedOrderQuantity), Quantities.HighestSet());
 		}

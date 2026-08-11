@@ -151,17 +151,20 @@ public:
             Execution::OrderRisk& orderRisk = _serverContext.GetOrderRisk(orderState.OrderHeader.OrderId).GetRef();
             Data::Side side = orderState.OrderProfile.Side();
 
-            int32_t worstOrderQuantityBefore = orderRisk.GetWorstOrderQuantity(orderState.OrderProfile.Quantity);
+            int32_t worstOrderQuantityBefore = orderRisk.GetAbsWorstOrderQuantity(orderState.OrderProfile.Quantity);
             orderRisk.Ack(orderState.OrderProfile.Quantity);
-            int32_t worstOrderQuantityAfter = orderRisk.GetWorstOrderQuantity(orderState.OrderProfile.Quantity);
-            int32_t worstOrderQuantityDelta = (worstOrderQuantityAfter - worstOrderQuantityBefore) * orderState.OrderProfile.Sign();
+            int32_t worstOrderQuantityAfter = orderRisk.GetAbsWorstOrderQuantity(orderState.OrderProfile.Quantity);
+            int32_t worstOrderQuantityDelta = worstOrderQuantityAfter - worstOrderQuantityBefore;
 
             if (worstOrderQuantityDelta == 0)
                 return;
 
+            // The delta is a magnitude; the SIDE SELECTOR carries the sign, because the short aggregate
+            // is signed negative. Signing the delta as well squares the sign away to +1 and drives the
+            // short aggregate positive — after which the short position check can never trip.
             Execution::RiskLimit& riskLimit = _serverContext.GetRiskLimit(orderState.OrderHeader.OrderId.InstrumentId()).GetRef();
             riskLimit.WorstLongWorkingQuantity += worstOrderQuantityDelta * (side == Data::Side::Buy ? 1 : 0);
-            riskLimit.WorstShortWorkingQuantity += worstOrderQuantityDelta * (side == Data::Side::Sell ? 1 : 0);
+            riskLimit.WorstShortWorkingQuantity += worstOrderQuantityDelta * (side == Data::Side::Sell ? -1 : 0);
         }
         else if (orderState.OrderStateStatus == Execution::OrderStateStatus::Done)
         {
@@ -170,8 +173,8 @@ public:
             Execution::OrderRisk& orderRisk = _serverContext.GetOrderRisk(orderState.OrderHeader.OrderId).GetRef();
             Data::Side side = orderState.OrderProfile.Side();
 
-            int32_t worstOrderQuantity = orderRisk.GetWorstOrderQuantity(orderState.OrderProfile.Quantity);
-            int32_t released = worstOrderQuantity - orderState.QuantityFilled;
+            int32_t worstOrderQuantity = orderRisk.GetAbsWorstOrderQuantity(orderState.OrderProfile.Quantity);
+            int32_t released = worstOrderQuantity - std::abs(orderState.QuantityFilled);
 
             orderRisk = Execution::OrderRisk{};
 
@@ -180,7 +183,7 @@ public:
 
             Execution::RiskLimit& riskLimit = _serverContext.GetRiskLimit(orderState.OrderHeader.OrderId.InstrumentId()).GetRef();
             riskLimit.WorstLongWorkingQuantity -= released * (side == Data::Side::Buy ? 1 : 0);
-            riskLimit.WorstShortWorkingQuantity -= released * (side == Data::Side::Sell ? 1 : 0);
+            riskLimit.WorstShortWorkingQuantity -= released * (side == Data::Side::Sell ? -1 : 0);
         }
     }
 
@@ -209,17 +212,20 @@ public:
         Execution::OrderRisk& orderRisk = _serverContext.GetOrderRisk(orderRejected.OrderHeader.OrderId).GetRef();
         Data::Side side = orderRejected.OrderProfile.Side();
 
-        int32_t worstOrderQuantityBefore = orderRisk.GetWorstOrderQuantity(orderState.OrderProfile.Quantity);
+        int32_t worstOrderQuantityBefore = orderRisk.GetAbsWorstOrderQuantity(orderState.OrderProfile.Quantity);
         orderRisk.Reject(orderRejected.OrderProfile.Quantity);
-        int32_t worstOrderQuantityAfter = orderRisk.GetWorstOrderQuantity(orderState.OrderProfile.Quantity);
+        int32_t worstOrderQuantityAfter = orderRisk.GetAbsWorstOrderQuantity(orderState.OrderProfile.Quantity);
         int32_t worstOrderQuantityDelta = worstOrderQuantityAfter - worstOrderQuantityBefore;
 
         if (worstOrderQuantityDelta == 0)
             return;
 
+        // Same magnitude-space shape as the Ack path, so the sell selector is -1 for the same reason:
+        // rejecting a sell amend from acked -10 to -12 gives delta 10-12 = -2, and with +1 the short
+        // aggregate would move -2 instead of +2 — a permanent error in the wrong direction.
         Execution::RiskLimit& riskLimit = _serverContext.GetRiskLimit(orderRejected.OrderHeader.OrderId.InstrumentId()).GetRef();
         riskLimit.WorstLongWorkingQuantity += worstOrderQuantityDelta * (side == Data::Side::Buy ? 1 : 0);
-        riskLimit.WorstShortWorkingQuantity += worstOrderQuantityDelta * (side == Data::Side::Sell ? 1 : 0);
+        riskLimit.WorstShortWorkingQuantity += worstOrderQuantityDelta * (side == Data::Side::Sell ? -1 : 0);
     }
 
     ALWAYS_INLINE bool ValidateOrder(const Execution::OrderTarget& orderTarget, Tools::Bitset64& orderRejectedReasons)
@@ -354,7 +360,7 @@ public:
                     orderRisk = Execution::OrderRisk{};
 
                 int32_t sign = orderTarget.OrderProfile.Sign();
-                int32_t worstQuantityFilledBefore = orderRisk.GetWorstOrderQuantity(ackedOrderQuantity) * sign;
+                int32_t worstQuantityFilledBefore = orderRisk.GetAbsWorstOrderQuantity(ackedOrderQuantity);
 
                 Execution::OrderRejectedReason reason = Execution::OrderRejectedReason::Unknown;
                 if (!orderRisk.TryAdd(orderTarget.OrderProfile.Quantity, reason))
@@ -363,12 +369,12 @@ public:
                     return false;
                 }
 
-                int32_t worstQuantityFilledAfter = orderRisk.GetWorstOrderQuantity(ackedOrderQuantity) * sign;
-                // GetWorstOrderQuantity is a magnitude. Both aggregates are signed — long positive,
-                // short negative, which is what GetShortQuantityAllowance and the position check below
-                // assume — so the delta has to carry the order's sign. Adding an unsigned delta to
-                // WorstShortWorkingQuantity drives it positive, and then the short leg of the position
-                // check can never trip however much is working.
+                int32_t worstQuantityFilledAfter = orderRisk.GetAbsWorstOrderQuantity(ackedOrderQuantity);
+                // GetAbsWorstOrderQuantity is a magnitude and both aggregates are signed — long positive,
+                // short negative — so the order's sign is applied exactly ONCE, here on the delta.
+                // Applying it to the before/after operands as well multiplies the delta by sign twice,
+                // which squares away to +1: the delta degrades to an unsigned magnitude, the short
+                // aggregate goes positive, and the short position check can never trip.
                 int32_t worstWorkingQuantityDelta = (worstQuantityFilledAfter - worstQuantityFilledBefore) * sign;
 
                 // branchless
