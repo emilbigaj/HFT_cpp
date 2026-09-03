@@ -5,6 +5,7 @@
 #include "Context.hpp"
 #include "Instrument.hpp"
 #include "Loggable.hpp"
+#include "OrderIdAllocator.hpp"
 #include "Protocol.hpp"
 #include "RiskLayer.hpp"
 #include "SharedArray.hpp"
@@ -17,6 +18,7 @@
 #include "SeqLock.hpp"
 #include "ByteQueue.hpp"
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <functional>
@@ -206,37 +208,6 @@ public:
     }
 
 
-    // Disconnect housekeeping — run by ONE thread (the hub), NOT per-segment: it owns _clientIds and
-    // CancelAllOrders is cross-segment. Cancels a dropped client's working orders and clears it from
-    // each CoreGroup's client set so ReadExecution stops polling it (AtomicClear => race-free vs readers).
-    Tools::Bitset64 _clientIds = {};
-    void PollDisconnects()
-    {
-        Tools::Bitset64 closedClientIds;
-        {
-            Tools::Bitset64 clientIds = _serverSocket.ClientIds();
-            closedClientIds = _clientIds & ~clientIds;
-            _clientIds = clientIds;
-            if (closedClientIds.IsEmpty())
-                        return;
-            for(int32_t clientId : closedClientIds)
-                CancelAllOrders(clientId);
-        }
-
-        
-
-        {
-
-            int32_t coreGroupsIdsCount = static_cast<int32_t>(_clientIdsByCoreGroupId.size());
-            for(int32_t coreGroupId = 0; coreGroupId < coreGroupsIdsCount; coreGroupId++)
-            {
-                Tools::Bitset64& clientIds = _clientIdsByCoreGroupId[static_cast<size_t>(coreGroupId)];
-                for(int32_t clientId : closedClientIds)
-                    clientIds.AtomicClear(clientId);    
-            }
-        }
-    }
-
     // Producer API for the injection queue (derives cg from the instrument). Hub + vendor RX call this
     // instead of sending; writers serialise on _sendToExchangeLocks, full queue spins (never drops).
     void EnqueueOrderTarget(const Execution::OrderTarget& orderTarget)
@@ -344,15 +315,17 @@ public:
 
     void CancelAllOrders(int32_t clientId)
     {
-        int32_t firstGlobalOrderIndex = Execution::OrderIdAllocator::GetFirstGlobalIndex(clientId);
-        int32_t lastGlobalOrderIndex = Execution::OrderIdAllocator::GetLastGlobalIndex(clientId);
-        for(int globalOrderIndex = firstGlobalOrderIndex; globalOrderIndex <= lastGlobalOrderIndex; globalOrderIndex++)
+        // Context keys order rows by OrderId, so build a probe whose GlobalIndex is
+        // (clientId, localIndex) — same row, no extra accessor. Matches C#.
+        for (int32_t localIndex = 0; localIndex < Execution::OrderIdAllocator::OrdersPerClient; localIndex++)
         {
-            Socket::SharedArrayEntry<Execution::OrderTarget>& orderTargetEntry = _serverContext.GetOrderTarget(globalOrderIndex);
+            Execution::OrderId probe = Execution::OrderId().ClientId(clientId).LocalIndex(localIndex);
+
+            Socket::SharedArrayEntry<Execution::OrderTarget>& orderTargetEntry = _serverContext.GetOrderTarget(probe);
             if (orderTargetEntry.IsEmpty())
                 continue;
             Execution::OrderTarget orderTarget = orderTargetEntry.GetReadonlyRef(); // dont lock because client may have crashed mid write
-            const Execution::OrderState& orderState = _serverContext.GetOrderState(globalOrderIndex).GetReadonlyRef();
+            const Execution::OrderState& orderState = _serverContext.GetOrderState(probe).GetReadonlyRef();
             if (orderState.OrderStateStatus == Execution::OrderStateStatus::Active || orderTarget.OrderTargetStatus == Execution::OrderStateStatus::Active)
             {
                 orderTarget.OrderTargetStatus = Execution::OrderStateStatus::Active;
@@ -370,8 +343,6 @@ public:
 
     void ReadAdmin()
     {
-        PollDisconnects();
-
         std::span<const uint8_t> rdst;
         for(int32_t clientId : _serverSocket.ClientIds())
         {
@@ -413,24 +384,20 @@ public:
         _serverContext.OnInstrumentHeader(instrumentHeader128);
     }
 
-    void OnQuantityAhead(uint64_t clientOrderId, int32_t quantityAhead)
+    void OnQuantityAhead(Execution::OrderId clientOrderId, int32_t quantityAhead)
     {
-        int32_t globalOrderIndex = Execution::OrderIdAllocator::GetGlobalIndex(clientOrderId);
-        Socket::SharedArrayEntry<Execution::OrderState>& orderStateEntry = _serverContext.GetOrderState(globalOrderIndex);
-        Execution::OrderState& orderState = orderStateEntry.GetRef();
+        Execution::OrderState& orderState = _serverContext.GetOrderState(clientOrderId).GetRef();
         if (orderState.OrderHeader.OrderId == clientOrderId)
         {
-            orderStateEntry.AcquireLock();
+            // Quick write, its atomic, do not lock, it would contend with OnOrderState
             orderState.QuantityAhead = quantityAhead;
-            orderStateEntry.ReleaseLock();
         }
     }
 
     Execution::OrderState OnOrderState(Execution::OrderState& orderState)
     {
-        int32_t globalOrderIndex = orderState.OrderHeader.OrderId.GlobalIndex();
-        Socket::SharedArrayEntry<Execution::OrderState>& orderStateEntry = _serverContext.GetOrderState(globalOrderIndex);
-        Socket::SharedArrayEntry<Execution::OrderTarget>& orderTargetEntry = _serverContext.GetOrderTarget(globalOrderIndex);
+        Socket::SharedArrayEntry<Execution::OrderState>& orderStateEntry = _serverContext.GetOrderState(orderState.OrderHeader.OrderId);
+        Socket::SharedArrayEntry<Execution::OrderTarget>& orderTargetEntry = _serverContext.GetOrderTarget(orderState.OrderHeader.OrderId);
         Execution::OrderState& existingOrderState = orderStateEntry.GetRef();
         const Execution::OrderTarget& existingOrderTarget = orderTargetEntry.GetReadonlyRef();
         bool isSeqInOrder = existingOrderState.OrderStateStatus == Execution::OrderStateStatus::Active && (orderState.OrderHeader.Seq >= existingOrderState.OrderHeader.Seq || orderState.OrderStateStatus == Execution::OrderStateStatus::Done);
@@ -439,17 +406,19 @@ public:
         
         if (isSafeToOverwrite)
         {
+            int32_t beforeAckedOrderQuantity = existingOrderState.OrderProfile.Quantity;
+            int32_t quantityFilled = std::abs(existingOrderState.QuantityFilled) > std::abs(orderState.QuantityFilled) ? existingOrderState.QuantityFilled : orderState.QuantityFilled;
             orderStateEntry.AcquireLock();
             existingOrderState.OrderHeader.Seq = orderState.OrderHeader.Seq;
             existingOrderState.ExchangeOrderId = orderState.ExchangeOrderId;
             existingOrderState.OrderProfile = orderState.OrderProfile;
             existingOrderState.OrderStateStatus = orderState.OrderStateStatus;
             existingOrderState.OrderStateReason = orderState.OrderStateReason;
-            existingOrderState.QuantityFilled = orderState.QuantityFilled;
+            existingOrderState.QuantityFilled = quantityFilled;
             existingOrderState.OrderHeader.ExchangeTimestamp = orderState.OrderHeader.ExchangeTimestamp;
             existingOrderState.OrderHeader.NicTimestamp = Tools::Timestamp::UtcNow();
             orderStateEntry.ReleaseLock();
-            _riskLayer.OnOrderState(existingOrderState);
+            _riskLayer.OnOrderState(existingOrderState, beforeAckedOrderQuantity);
         }
         WriteToExecution(existingOrderState);
             if (OrderState)
@@ -457,18 +426,17 @@ public:
         return existingOrderState;
     }
 
-    static constexpr uint64_t OrderNotFoundOnly = 1ULL << static_cast<int32_t>(Execution::OrderRejectedReason::OrderNotFound);
+    static constexpr uint64_t _orderNotFound = 1ULL << static_cast<int32_t>(Execution::OrderRejectedReason::OrderNotFound);
 
     Execution::OrderRejected OnOrderRejected(Execution::OrderRejected& orderRejected, const std::string& message)
     {
-        int32_t globalOrderIndex = Execution::OrderIdAllocator::GetGlobalIndex(orderRejected.OrderHeader.OrderId);
-        Socket::SharedArrayEntry<Execution::OrderState>& orderStateEntry = _serverContext.GetOrderState(globalOrderIndex);
+        Socket::SharedArrayEntry<Execution::OrderState>& orderStateEntry = _serverContext.GetOrderState(orderRejected.OrderHeader.OrderId);
         Execution::OrderState& orderState = orderStateEntry.GetRef();
 
         // The exchange saying "no such order" for a slot we already know is finished is not news, and
         // it must not pause the algo. Restate it as StateIsDone, which OrderDiscarded covers.
         if (orderState.OrderStateStatus == Execution::OrderStateStatus::Done
-            && orderRejected.OrderRejectedReasons.Raw() == OrderNotFoundOnly)
+            && orderRejected.OrderRejectedReasons.Raw() == _orderNotFound)
         {
             orderRejected.OrderRejectedReasons = Tools::Bitset64(1ULL << static_cast<int32_t>(Execution::OrderRejectedReason::StateIsDone));
         }
@@ -499,8 +467,7 @@ public:
     // comes from client so parameter is consistent with framework
     void OnOrderTarget(const Execution::OrderTarget& orderTarget)
     {
-        int32_t globalOrderIndex = orderTarget.OrderHeader.OrderId.GlobalIndex();
-        Socket::SharedArrayEntry<Execution::OrderState>& orderStateEntry = _serverContext.GetOrderState(globalOrderIndex);
+        Socket::SharedArrayEntry<Execution::OrderState>& orderStateEntry = _serverContext.GetOrderState(orderTarget.OrderHeader.OrderId);
         Execution::OrderState& orderState = orderStateEntry.GetRef();
 
         Tools::Bitset64 orderRejectedReasons{};
@@ -560,19 +527,16 @@ public:
         int32_t instrumentId = _serverContext.AllocateInstrument(allocateInstrument.InstrumentHeaderId);
         allocateInstrument.InstrumentId = instrumentId;
 
-        if (_instrumentData[static_cast<size_t>(instrumentId)])
-            return instrumentId; // already attached + seeded
-
         Data::InstrumentHeader128& header128 = _serverContext.GetInstrumentHeader(allocateInstrument.InstrumentHeaderId).GetRef();
         allocateInstrument.Symbol = header128.Symbology()->ToString();
         allocateInstrument.ExchangeInstrumentId = header128.AsInstrumentHeader().ExchangeInstrumentId;
 
+        if (_instrumentData[static_cast<size_t>(instrumentId)])
+            return instrumentId; // already attached + seeded
+
         OpenInstrumentData(instrumentId, allocateInstrument.Symbol.ToString());
 
         WriteToAudit(Socket::SocketChannel::Admin, allocateInstrument);
-
-        if (AllocateInstrument)
-            AllocateInstrument(allocateInstrument);
 
         return instrumentId;
     }
@@ -600,12 +564,17 @@ public:
         _clientIdsByCoreGroupId[static_cast<size_t>(coreGroupId)].AtomicSet(clientId);
 
         WriteToAdmin(clientId, allocateInstrument);
+
+        // After the work, not before: on entry InstrumentId is still -1 and Symbol is empty.
+        std::cout << ServerName.string() << "::OnAllocateInstrument()\n" << allocateInstrument.ToString() << std::endl;
+
+        if (AllocateInstrument)
+            AllocateInstrument(allocateInstrument);
     }
 
     Execution::Fill OnFill(Execution::Fill& fill)
     {
-        int32_t globalOrderIndex = Execution::OrderIdAllocator::GetGlobalIndex(fill.OrderHeader.OrderId);
-        Socket::SharedArrayEntry<Execution::OrderState>& orderStateEntry = _serverContext.GetOrderState(globalOrderIndex);
+        Socket::SharedArrayEntry<Execution::OrderState>& orderStateEntry = _serverContext.GetOrderState(fill.OrderHeader.OrderId);
         const Execution::OrderState& orderState = orderStateEntry.GetReadonlyRef();
         
         if (orderState.OrderHeader.OrderId != fill.OrderHeader.OrderId)
@@ -828,7 +797,7 @@ public:
                           << allocateInstrument.ExchangeInstrumentId << ") is no longer listed; not restored." << std::endl;
                 continue;
             }
-            OnAllocateInstrument(allocateInstrument);
+            OnAllocateInstrument(allocateInstrument.ClientId, allocateInstrument);
         }
     }
 
@@ -880,6 +849,8 @@ private:
 
     void OnClientAllocated(const Socket::SocketHeader& socketHeader)
     {
+        std::cout << ServerName.string() << "::OnClientAllocated()\n" << socketHeader.ToString() << std::endl;
+
         // this is the open signal for the logger
         _loggingServer.Write(socketHeader);
         if(AllocateClient)
@@ -889,6 +860,13 @@ private:
     void OnClientClosed(int32_t clientId)
     {
         CancelAllOrders(clientId);
+
+        int32_t coreGroupsIdsCount = static_cast<int32_t>(_clientIdsByCoreGroupId.size());
+        for(int32_t coreGroupId = 0; coreGroupId < coreGroupsIdsCount; coreGroupId++)
+        {
+            _clientIdsByCoreGroupId[static_cast<size_t>(coreGroupId)].AtomicClear(clientId);
+        }
+
         if(ClientClosed)
             ClientClosed(clientId);
     }

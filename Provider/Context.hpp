@@ -230,26 +230,36 @@ protected:
 public:
 	virtual ~Context() = default;
 
-	// Abstract interface enforcing Local vs Global indexing mapping rules
-	virtual Socket::SharedArrayEntry<Execution::OrderState>& GetOrderState(int32_t orderIndex) = 0;
-	virtual Socket::SharedArrayEntry<Execution::OrderTarget>& GetOrderTarget(int32_t orderIndex) = 0;
 	virtual Socket::SharedArrayEntry<Execution::PositionHeader>& GetPositionHeader(int32_t instrumentId) = 0;
     virtual bool TryGetInstrumentId(int32_t instrumentIndex, int32_t& instrumentId) = 0;
 	virtual Tools::Bitset64 InstrumentIds() = 0;
 
+	// Order rows are ONE server-wide array (all three keyed by serverName), so every context is a
+	// view over the same storage. These used to be virtual, with ClientContext reading the argument
+	// as a local index and ServerContext as a global one - same signature, two meanings, so a caller
+	// holding a base Context could not know which to pass. Keyed by the id there is only one
+	// meaning: OrderId already carries clientId and localIndex, so GlobalIndex is exact and no
+	// caller needs to know whose order it is. Matches C#.
+	Socket::SharedArrayEntry<Execution::OrderState>& GetOrderState(Execution::OrderId orderId)
+	{
+		return _orderStates[orderId.GlobalIndex()];
+	}
+
+	Socket::SharedArrayEntry<Execution::OrderTarget>& GetOrderTarget(Execution::OrderId orderId)
+	{
+		return _orderTargets[orderId.GlobalIndex()];
+	}
+
+	Socket::SharedArrayEntry<Execution::OrderRisk>& GetOrderRisk(Execution::OrderId orderId)
+	{
+		return _orderRisks[orderId.GlobalIndex()];
+	}
 
 	// server level - shared over all clients
 	Socket::SharedArrayEntry<Execution::RiskLimit>& GetRiskLimit(int32_t instrumentId)
 	{
 		ThrowIfInstrumentIdOutOfRange(instrumentId);
 		return _riskLimits[instrumentId];
-	}
-
-	// Keyed by GlobalIndex, not the virtual local/global split GetOrderState uses: the ledger is
-	// server-owned and every writer of it already holds the full OrderId.
-	Socket::SharedArrayEntry<Execution::OrderRisk>& GetOrderRisk(Execution::OrderId orderId)
-	{
-		return _orderRisks[orderId.GlobalIndex()];
 	}
 
 	Socket::SharedArrayEntry<Data::MarketByPrice64>& GetMarketByPrice64(int32_t instrumentId)
@@ -341,10 +351,10 @@ protected:
 		}
 	}
 
-    std::atomic<uint64_t> _lock = 0;
+    std::atomic<bool> _lock{false};
 	void CreateInstrument(int32_t instrumentId)
 	{
-        Tools::RAIILock<Tools::MultiSeqLockWriter> lock(&_lock);
+        Tools::RAIISpinLock lock(_lock);
         if (_instruments[static_cast<size_t>(instrumentId)])
             return;
 
@@ -378,13 +388,9 @@ protected:
 		_instruments[static_cast<size_t>(instrumentId)] = std::move(instrument);
 	}
 
-	void CreatePosition(Data::Instrument& instrument)
-	{
-        Tools::RAIILock<Tools::MultiSeqLockWriter> lock(&_lock);
-        if (_positions[static_cast<size_t>(instrument.InstrumentId)])
-            return;
-		_positions[static_cast<size_t>(instrument.InstrumentId)] = std::make_unique<Position>(instrument, GetPositionHeader(instrument.InstrumentId), *this);
-	}
+	// Defined after ClientContext (bottom of this file): the owner id needs the complete type for
+	// the cast, mirroring C#'s `(this as ClientContext)?.ClientId ?? ServerStrategyId`.
+	void CreatePosition(Data::Instrument& instrument);
 
     int32_t GetInstrumentId(int32_t instrumentHeaderId) 
     {
@@ -491,16 +497,6 @@ public:
 	}
 
 	// --- Global Implementations ---
-	Socket::SharedArrayEntry<Execution::OrderState>& GetOrderState(int32_t globalOrderIndex) override
-	{
-		return _orderStates[globalOrderIndex];
-	}
-
-	Socket::SharedArrayEntry<Execution::OrderTarget>& GetOrderTarget(int32_t globalOrderIndex) override
-	{
-		return _orderTargets[globalOrderIndex];
-	}
-
 	Socket::SharedArrayEntry<Execution::PositionHeader>& GetPositionHeader(int32_t instrumentId) override
 	{
 		return _serverPositionHeaders[instrumentId];
@@ -635,6 +631,11 @@ public:
         }
 		Execution::RiskLimit riskLimit = riskLimitLine ? Tools::Json::Deserialize<Execution::RiskLimit>(riskLimitLine.value()) : (Clock::Mode == ClockMode::Simulation ? Execution::RiskLimit::GetMaxLimits(instrumentId) : Execution::RiskLimit::GetMinLimits(instrumentId));
 		riskLimit.InstrumentId = instrumentId;
+		// The working quantities are live state, not configuration: they mirror this SESSION's
+		// in-flight reservations, and a fresh session has none. Restoring yesterday's values would
+		// hand the ledger phantom exposure no retire path can ever release. Matches C#.
+		riskLimit.WorstLongWorkingQuantity = 0;
+		riskLimit.WorstShortWorkingQuantity = 0;
         _riskLimits.GetEntry(instrumentId).Write(riskLimit);
 
 		std::string positionPath = GetPositionFilePath(DirectoryPath, symbology->Symbol()).string();
@@ -747,18 +748,6 @@ public:
 	}
 
 	// --- Local Implementations ---
-	Socket::SharedArrayEntry<Execution::OrderState>& GetOrderState(int32_t localOrderIndex) override
-	{
-		int32_t globalIndex = Execution::OrderIdAllocator::ToGlobalIndex(ClientId, localOrderIndex);
-		return _orderStates[globalIndex];
-	}
-
-	Socket::SharedArrayEntry<Execution::OrderTarget>& GetOrderTarget(int32_t localOrderIndex) override
-	{
-		int32_t globalIndex = Execution::OrderIdAllocator::ToGlobalIndex(ClientId, localOrderIndex);
-		return _orderTargets[globalIndex];
-	}
-
 	Socket::SharedArrayEntry<Execution::PositionHeader>& GetPositionHeader(int32_t instrumentId) override
 	{
 		int32_t localPositionIndex = GetLocalPositionIndex(ClientId, instrumentId);
@@ -839,6 +828,18 @@ public:
 
 // --- Inline definitions that need complete Context class definition ---
 
+// A ServerContext's positions are the server-wide rows; no client owns their order slots (only
+// Client.Create ever sets one), so the house id is the correct inert owner. Matches C#.
+inline void Context::CreatePosition(Data::Instrument& instrument)
+{
+	Tools::RAIISpinLock lock(_lock);
+	if (_positions[static_cast<size_t>(instrument.InstrumentId)])
+		return;
+	ClientContext* clientContext = dynamic_cast<ClientContext*>(this);
+	int32_t clientId = clientContext ? clientContext->ClientId : Execution::OrderIdAllocator::ServerStrategyId;
+	_positions[static_cast<size_t>(instrument.InstrumentId)] = std::make_unique<Position>(instrument, GetPositionHeader(instrument.InstrumentId), *this, clientId);
+}
+
 inline bool Position::TryGetQuote(Data::Quote& quote)
 {
 	Data::MarketByPrice64 mbp = Instrument.MarketByPriceCopy();
@@ -849,7 +850,7 @@ inline bool Position::TryGetQuote(Data::Quote& quote)
 		int32_t localOrderIndex = 0;
 		isOrderActive.TryPopLowest(localOrderIndex);
 
-		Socket::SharedArrayEntry<Execution::OrderState>& stateEntry = _context.GetOrderState(localOrderIndex);
+		Socket::SharedArrayEntry<Execution::OrderState>& stateEntry = _context.GetOrderState(GetOrderId(localOrderIndex));
 
 		int32_t ticks = 0;
 		int32_t working = 0;

@@ -20,14 +20,19 @@ private:
     // GetRef() below would throw "Readonly" straight into the ExceptionThrownByRiskLayer catch,
     // rejecting every order. A client passes a read-only one; its reservation block is gated off.
     Provider::ServerContext& _serverContext;
-    std::vector<uint64_t> _maxClientOrderIds;
+    // CLIENT-side only: the high-water mark of this client's own allocations. Valid there because
+    // validation runs at send time on one thread, so validation order IS allocation order. The
+    // server must NOT run this check: ids come from one per-client counter but travel on per-core-
+    // group rings read by different threads, so two same-instant creates on different instruments
+    // can legitimately arrive out of allocation order — the old per-client vector rejected the
+    // slower one (ClientOrderIdOutOfOrder) and paused the algo, nondeterministically.
+    Execution::OrderId _maxClientOrderId;
     Execution::OrderRejectedSource _orderRejectedSource;
 
 public:
     RiskLayer(Provider::ServerContext& serverContext, Execution::OrderRejectedSource orderRejectedSource)
     : _serverContext(serverContext), _orderRejectedSource(orderRejectedSource)
     {
-        _maxClientOrderIds.resize(static_cast<size_t>(_serverContext.ServerHeader().GetReadonlyRef().ClientIds.Length()), 0ULL);
     }
 
     ALWAYS_INLINE Tools::Bitset64 ValidateClient(int32_t clientId, int32_t strategyId)
@@ -88,21 +93,27 @@ public:
 
     ALWAYS_INLINE Tools::Bitset64 ValidateCreate(const Execution::OrderTarget& orderTarget, const Execution::OrderState& orderState)
     {
-        int clientId = orderTarget.OrderHeader.OrderId.ClientId();
         Tools::Bitset64 orderRejectedReasons;
         if (orderTarget.OrderHeader.Seq != 1)
         {
             orderRejectedReasons.Set(static_cast<int32_t>(Execution::OrderRejectedReason::SeqOutOfOrder));
         }
 
-        if (orderTarget.OrderHeader.OrderId <= _maxClientOrderIds[static_cast<size_t>(clientId)])
+        // Client side only - see _maxClientOrderId. The server keeps OrderIndexIsBusy and the
+        // amend/cancel header checks; a duplicate create cannot reach it anyway (the ring is
+        // read-once, Recover() skips the backlog, a restarted client seeds higher generations).
+        if (_orderRejectedSource == Execution::OrderRejectedSource::Client)
         {
-            orderRejectedReasons.Set(static_cast<int32_t>(Execution::OrderRejectedReason::ClientOrderIdOutOfOrder));
+            if (orderTarget.OrderHeader.OrderId <= _maxClientOrderId)
+            {
+                orderRejectedReasons.Set(static_cast<int32_t>(Execution::OrderRejectedReason::ClientOrderIdOutOfOrder));
+            }
+            else
+            {
+                _maxClientOrderId = orderTarget.OrderHeader.OrderId;
+            }
         }
-        else
-        {
-            _maxClientOrderIds[static_cast<size_t>(clientId)] = orderTarget.OrderHeader.OrderId;
-        }
+
         if (orderState.OrderStateStatus == Execution::OrderStateStatus::Active)
         {
             orderRejectedReasons.Set(static_cast<int32_t>(Execution::OrderRejectedReason::OrderIndexIsBusy));
@@ -140,7 +151,7 @@ public:
 
     // An ack retires the target that produced it. The slot's worst case drops to the highest quantity
     // still unacked, so the instrument aggregate releases the difference.
-    ALWAYS_INLINE void OnOrderState(const Execution::OrderState& orderState)
+    ALWAYS_INLINE void OnOrderState(const Execution::OrderState& orderState, int32_t beforeAckedOrderQuantity)
     {
         if (_orderRejectedSource != Execution::OrderRejectedSource::Server)
             return;
@@ -150,7 +161,7 @@ public:
             Execution::OrderRisk& orderRisk = _serverContext.GetOrderRisk(orderState.OrderHeader.OrderId).GetRef();
             Data::Side side = orderState.OrderProfile.Side();
 
-            int32_t worstOrderQuantityBefore = orderRisk.GetAbsWorstOrderQuantity(orderState.OrderProfile.Quantity);
+            int32_t worstOrderQuantityBefore = orderRisk.GetAbsWorstOrderQuantity(beforeAckedOrderQuantity);
             orderRisk.Ack(orderState.OrderProfile.Quantity);
             int32_t worstOrderQuantityAfter = orderRisk.GetAbsWorstOrderQuantity(orderState.OrderProfile.Quantity);
             int32_t worstOrderQuantityDelta = worstOrderQuantityAfter - worstOrderQuantityBefore;
@@ -207,7 +218,7 @@ public:
         if (orderRejected.OrderRejectedSource == Execution::OrderRejectedSource::Server)
             return;
 
-        const Execution::OrderState& orderState = _serverContext.GetOrderState(orderRejected.OrderHeader.OrderId.GlobalIndex()).GetReadonlyRef();
+        const Execution::OrderState& orderState = _serverContext.GetOrderState(orderRejected.OrderHeader.OrderId).GetReadonlyRef();
         Execution::OrderRisk& orderRisk = _serverContext.GetOrderRisk(orderRejected.OrderHeader.OrderId).GetRef();
         Data::Side side = orderRejected.OrderProfile.Side();
 
@@ -237,9 +248,8 @@ public:
             int32_t strategyId = orderTarget.OrderHeader.OrderId.StrategyId();
             int32_t clientId = orderTarget.OrderHeader.OrderId.ClientId();
 
-            int32_t globalOrderIndex = orderTarget.OrderHeader.OrderId.GlobalIndex();
-            const Execution::OrderTarget& existingTarget = _serverContext.GetOrderTarget(globalOrderIndex).GetReadonlyRef();
-            const Execution::OrderState& orderState = _serverContext.GetOrderState(globalOrderIndex).GetReadonlyRef();
+            const Execution::OrderTarget& existingTarget = _serverContext.GetOrderTarget(orderTarget.OrderHeader.OrderId).GetReadonlyRef();
+            const Execution::OrderState& orderState = _serverContext.GetOrderState(orderTarget.OrderHeader.OrderId).GetReadonlyRef();
 
             // 3. Validate Creation Logic
             if (orderTarget.OrderTargetAction == Execution::OrderTargetAction::Create) // check slot is vacant
@@ -387,8 +397,9 @@ public:
                 int32_t quantity = serverPosition.Header().Quantity;
                 int32_t worstLongQuantity = quantity + worstLongWorkingQuantity;
                 int32_t worstShortQuantity = quantity + worstShortWorkingQuantity;
-
-                if (worstLongQuantity > riskLimit.MaxPositionQuantity || worstShortQuantity < -riskLimit.MaxPositionQuantity)
+                    
+                bool isRiskLimitExceeded = sign > 0 ? worstLongQuantity > riskLimit.MaxPositionQuantity : worstShortQuantity < -riskLimit.MaxPositionQuantity;
+                if (isRiskLimitExceeded)
                 {
                     orderRisk.Reject(orderTarget.OrderProfile.Quantity);
                     orderRejectedReasons.Set(static_cast<int32_t>(Execution::OrderRejectedReason::PositionExceedsRiskLimit));

@@ -81,10 +81,13 @@ public:
 
     void Target(Execution::OrderProfile buy, Execution::OrderProfile sell)
     {
-        const Execution::OrderState& buyState = _client.ClientContext.GetOrderState(0).GetReadonlyRef();
-        const Execution::OrderState& sellState = _client.ClientContext.GetOrderState(1).GetReadonlyRef();
-        const Execution::OrderTarget& buyTarget = _client.ClientContext.GetOrderTarget(0).GetReadonlyRef();
-        const Execution::OrderTarget& sellTarget = _client.ClientContext.GetOrderTarget(1).GetReadonlyRef();
+        // Context keys order rows by OrderId; probe this client's local slots 0 and 1.
+        Execution::OrderId buyId = Execution::OrderId().ClientId(_client.ClientContext.ClientId).LocalIndex(0);
+        Execution::OrderId sellId = Execution::OrderId().ClientId(_client.ClientContext.ClientId).LocalIndex(1);
+        const Execution::OrderState& buyState = _client.ClientContext.GetOrderState(buyId).GetReadonlyRef();
+        const Execution::OrderState& sellState = _client.ClientContext.GetOrderState(sellId).GetReadonlyRef();
+        const Execution::OrderTarget& buyTarget = _client.ClientContext.GetOrderTarget(buyId).GetReadonlyRef();
+        const Execution::OrderTarget& sellTarget = _client.ClientContext.GetOrderTarget(sellId).GetReadonlyRef();
 
         Execution::OrderProfile buyStateProfile = buyState.OrderHeader.OrderId == buyTarget.OrderHeader.OrderId ? buyState.OrderProfile : buyTarget.OrderProfile;
         Execution::OrderProfile sellStateProfile = sellState.OrderHeader.OrderId == sellTarget.OrderHeader.OrderId ? sellState.OrderProfile : sellTarget.OrderProfile;

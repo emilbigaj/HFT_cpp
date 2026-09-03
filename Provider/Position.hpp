@@ -32,14 +32,24 @@ namespace Provider
         Context& _context;
         Socket::SharedArrayEntry<Execution::PositionHeader> _headerEntry;
         Tools::Bitset64 _isOrderActive;
+        // Who owns this book's order slots: the client's id, or strategy 0 for server-wide rows.
+        // The header's OrderId is not a sound source of identity (template rows carry ids before
+        // any allocation), so the owner is fixed at construction, matching C#.
+        const int32_t _clientId;
 
     public:
         Data::Instrument& Instrument;
         bool IsTradingSuspended;
 
-        Position(Data::Instrument& instrument, Socket::SharedArrayEntry<Execution::PositionHeader> headerEntry, Context& context)
-            : _context(context), _headerEntry(headerEntry), _isOrderActive(0), Instrument(instrument), IsTradingSuspended(true)
+        Position(Data::Instrument& instrument, Socket::SharedArrayEntry<Execution::PositionHeader> headerEntry, Context& context, int32_t clientId)
+            : _context(context), _headerEntry(headerEntry), _isOrderActive(0), _clientId(clientId), Instrument(instrument), IsTradingSuspended(true)
         {
+        }
+
+        // Context keys order rows by OrderId; build one whose GlobalIndex is (clientId, localIndex).
+        ALWAYS_INLINE Execution::OrderId GetOrderId(int32_t localOrderIndex) const
+        {
+            return Execution::OrderId().ClientId(_clientId).LocalIndex(localOrderIndex);
         }
 
         const Execution::PositionHeader& Header() { return _headerEntry.GetReadonlyRef(); }

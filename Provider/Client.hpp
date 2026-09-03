@@ -312,8 +312,7 @@ public:
         Tools::Bitset64 orderRejectedReasons;
         if (Validate(orderTarget, orderRejectedReasons))
         {
-            int localOrderIndex = orderTarget.OrderHeader.OrderId.LocalIndex();
-            ClientContext.GetOrderTarget(localOrderIndex).Write(orderTarget);
+            ClientContext.GetOrderTarget(orderTarget.OrderHeader.OrderId).Write(orderTarget);
             _socket.Write(ClientContext.GetInstrument(orderTarget.OrderHeader.OrderId.InstrumentId()).Header().CoreGroupId, orderTarget);
             return true;
         }
@@ -326,8 +325,7 @@ public:
 
     virtual bool Amend(Execution::OrderTarget& orderTarget)
     {
-        int localOrderIndex = orderTarget.OrderHeader.OrderId.LocalIndex();
-        const Execution::OrderTarget existingOrderTarget = ClientContext.GetOrderTarget(localOrderIndex).GetReadonlyRef();
+        const Execution::OrderTarget existingOrderTarget = ClientContext.GetOrderTarget(orderTarget.OrderHeader.OrderId).GetReadonlyRef();
 
         if (existingOrderTarget.OrderHeader.OrderId != orderTarget.OrderHeader.OrderId) // ensure that orderTarget has not been re-allocated already
         {
@@ -364,8 +362,7 @@ private:
 
     void OnOrderRejected(const Execution::OrderRejected& orderRejected)
     {
-        int32_t localOrderIndex = orderRejected.OrderHeader.OrderId.LocalIndex();
-        Execution::OrderTarget& orderTarget = ClientContext.GetOrderTarget(localOrderIndex).GetRef();
+        Execution::OrderTarget& orderTarget = ClientContext.GetOrderTarget(orderRejected.OrderHeader.OrderId).GetRef();
         bool isTargetDone = orderRejected.OrderHeader.OrderId == orderTarget.OrderHeader.OrderId && orderTarget.OrderHeader.Seq == orderRejected.OrderHeader.Seq;
         if (isTargetDone)
             orderTarget.OrderTargetStatus = Execution::OrderStateStatus::Done;
@@ -373,14 +370,13 @@ private:
 
     void OnOrderState(const Execution::OrderState& orderState)
     {
-        int32_t localOrderIndex = orderState.OrderHeader.OrderId.LocalIndex();
-        Execution::OrderTarget& orderTarget = ClientContext.GetOrderTarget(localOrderIndex).GetRef();
+        Execution::OrderTarget& orderTarget = ClientContext.GetOrderTarget(orderState.OrderHeader.OrderId).GetRef();
         if (orderState.OrderHeader.OrderId == orderTarget.OrderHeader.OrderId)
         {
             if (orderState.OrderStateStatus == Execution::OrderStateStatus::Done)
             {
                 orderTarget.OrderTargetStatus = Execution::OrderStateStatus::Done;
-                ClientContext.GetPosition(orderState.OrderHeader.OrderId.InstrumentId()).OnOrderDone(localOrderIndex);
+                ClientContext.GetPosition(orderState.OrderHeader.OrderId.InstrumentId()).OnOrderDone(orderState.OrderHeader.OrderId.LocalIndex());
                 Execution::OrderIdAllocator::Free(_isOrderActive, orderState.OrderHeader.OrderId);
             }
             else if (orderState.OrderHeader.Seq >= orderTarget.OrderHeader.Seq)
