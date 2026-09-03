@@ -26,6 +26,7 @@
 #include "String.hpp"
 #include "Timestamp.hpp"
 #include "Application.hpp"
+#include "AtomicEnum.hpp"
 #include "Tools.hpp"
 #include "Json.hpp"
 
@@ -99,8 +100,10 @@ namespace Socket
 		int32_t ClientProcessId = 0;
 		int32_t ClientToServerChannelCount = 0;
 		int32_t ServerToClientChannelCount = 0;
-		std::array<int32_t, 8> ClientToServerLengths;
-		std::array<int32_t, 8> ServerToClientLengths;
+		// Zeroed: the ctor fills only the first ChannelCount entries, and this header goes on the wire
+		// and into the logs. Uninitialised tails are stack garbage that C#'s zero-init never matches.
+		std::array<int32_t, 8> ClientToServerLengths{};
+		std::array<int32_t, 8> ServerToClientLengths{};
 
 		SocketHeader() = default;
 
@@ -161,7 +164,7 @@ namespace Socket
 
 		std::string ToString() const
 		{
-			return Tools::Json::Serialize(this);
+			return Tools::Json::Serialize(*this);
 		}
 	};
 #pragma pack(pop)
@@ -171,7 +174,8 @@ namespace Socket
 		Disposed = 0,
 		Detached = 1,
 		Open = 2,
-		Closed = 3
+		Closing = 3,
+		Closed = 4
 	};
 
 	// Forward declaration of Socket to satisfy C++ scope for static constants
@@ -450,7 +454,7 @@ namespace Socket
 		{
 			if (_isDisposed)
 				throw std::runtime_error("ObjectDisposedException");
-			
+
 			_isClosed = false;
 
 			for (auto& writer : _writeOnlySockets)
@@ -464,6 +468,29 @@ namespace Socket
 					reader->Reset();
 			}
 			_sharedMemory.Clear();
+		}
+
+		// Re-attach to a socket whose peer has restarted, keeping the ring. Same work the constructor
+		// does, minus the Clear(): park every cursor at the head and drop the closed latch, so the
+		// dead incarnation's close message cannot terminate the new one. Reset() cannot serve here -
+		// it wipes shared memory an audit reader is still walking.
+		inline void Recover()
+		{
+			if (_isDisposed)
+				throw std::runtime_error("ObjectDisposedException");
+
+			_isClosed = false;
+
+			for (auto& writer : _writeOnlySockets)
+			{
+				if (writer)
+					writer->Recover();
+			}
+			for (auto& reader : _readOnlySockets)
+			{
+				if (reader)
+					reader->Recover();
+			}
 		}
 
 		inline void Close()
@@ -951,7 +978,10 @@ namespace Socket
 	private:
 		struct alignas(64) ClientHeader
 		{
-			std::atomic<ClientStatus> Status{ClientStatus::Disposed};
+			// {status, epoch} in one word: readers request Open -> Closing with a CAS against the
+			// snapshot they read the close under, so a reader that slept through a close+reconnect
+			// cannot mark the NEW session Closing off the OLD session's evidence.
+			Tools::AtomicEnum<ClientStatus> Status{ClientStatus::Disposed};
 			std::atomic<int64_t> _closedTimestamp{Tools::Timestamp::MaxValue.NanosSinceEpoch};
 
 			inline Tools::Timestamp GetClosedTimestamp() const
@@ -1036,7 +1066,7 @@ namespace Socket
 			CreateClient(socketHeader);
 
 			ClientHeader& clientHeader = _clientHeaders[static_cast<size_t>(socketHeader.ClientId)];
-			clientHeader.Status.store(ClientStatus::Detached, std::memory_order_release);
+			clientHeader.Status.Store(ClientStatus::Detached);
 		}
 
 	private:
@@ -1069,7 +1099,7 @@ namespace Socket
 		{
 			ClientHeader& clientHeader = _clientHeaders[static_cast<size_t>(clientId)];
 
-			if (clientHeader.Status.load(std::memory_order_acquire) != ClientStatus::Disposed)
+			if (clientHeader.Status.State() != ClientStatus::Disposed)
 			{
 				SocketHeader socketHeader = DeallocateClient(clientId);
 
@@ -1078,7 +1108,7 @@ namespace Socket
 
 				std::cout << ServerName << ": " << socketHeader.ClientName.ToString() << " Disconnected id " << clientId << std::endl;
 
-				clientHeader.Status.store(ClientStatus::Disposed, std::memory_order_release);
+				clientHeader.Status.Store(ClientStatus::Disposed);
 
 				if (clientHeader.ClientSocket)
 					clientHeader.ClientSocket->Dispose();
@@ -1125,7 +1155,15 @@ namespace Socket
 		{
 			ClientHeader& clientHeader = _clientHeaders[static_cast<size_t>(socketHeader.ClientId)];
 
-			if (!Persistance)
+			// A reconnect re-enters here from Detached holding the PREVIOUS incarnation's cursors and
+			// closed latch: the client wrote a close message into the ring on its way out, and that
+			// byte outlives it. Unhandled, the server either reads it again and tears the new session
+			// down, or - if it already consumed it - short-circuits every read on the latch and can
+			// never accept this client again. The client side gets this for free by building a fresh
+			// Socket, whose constructor recovers; the server reuses the object, so it must ask.
+			if (Persistance)
+				clientHeader.ClientSocket->Recover();
+			else
 				clientHeader.ClientSocket->Reset();
 
 			clientHeader.SetClosedTimestamp(Tools::Timestamp::MaxValue);
@@ -1138,7 +1176,7 @@ namespace Socket
 				std::this_thread::sleep_for(std::chrono::milliseconds(1));
 			}
 
-			clientHeader.Status.store(ClientStatus::Open, std::memory_order_release);
+			clientHeader.Status.Store(ClientStatus::Open);
 			_clientIds.AtomicSet(socketHeader.ClientId);
 
 			if (ClientOpened)
@@ -1153,15 +1191,17 @@ namespace Socket
 			ClientHeader& clientHeader = _clientHeaders[static_cast<size_t>(clientId)];
 			if (Persistance)
 			{
-				clientHeader.Status.store(ClientStatus::Detached, std::memory_order_release);
+				clientHeader.Status.Store(ClientStatus::Detached);
 			}
 			else
 			{
 				clientHeader.SetClosedTimestamp(Tools::Timestamp::UtcNow());
-				clientHeader.Status.store(ClientStatus::Closed, std::memory_order_release);
+				clientHeader.Status.Store(ClientStatus::Closed);
 			}
 			if (ClientClosed)
 				ClientClosed(clientId);
+			
+			std::cout << ServerName << ": " << " Closed id " << clientId << std::endl;
 		}
 
 		void PollLetterBox()
@@ -1181,16 +1221,16 @@ namespace Socket
 					std::cout << "ServerSocket::" << ServerName << ": Client " << clientName << " failed to allocate clientId." << std::endl;
 					return;
 				}
-				ClientStatus status = _clientHeaders[static_cast<size_t>(clientId)].Status.load(std::memory_order_acquire);
+				ClientStatus status = _clientHeaders[static_cast<size_t>(clientId)].Status.State();
 
 				if (status == ClientStatus::Open)
 				{
 					std::cout << "ServerSocket::" << ServerName << ": Client " << clientName << " is already connected." << std::endl;
 					return;
 				}
-				else if (status == ClientStatus::Closed)
+				else if (status == ClientStatus::Closing || status == ClientStatus::Closed)
 				{
-					std::cout << "ServerSocket::" << ServerName << ": Client " << clientName << " is in the process of disposing. Try again in a moment." << std::endl;
+					std::cout << "ServerSocket::" << ServerName << ": Client " << clientName << " is in the process of closing. Try again in a moment." << std::endl;
 					return;
 				}
 				else if (status == ClientStatus::Detached)
@@ -1215,9 +1255,13 @@ namespace Socket
 			for (int32_t clientId = 0; clientId < Capacity; ++clientId)
 			{
 				ClientHeader& clientHeader = _clientHeaders[static_cast<size_t>(clientId)];
-				ClientStatus status = clientHeader.Status.load(std::memory_order_acquire);
+				ClientStatus status = clientHeader.Status.State();
 
-				if (status == ClientStatus::Open)
+				if (status == ClientStatus::Closing)
+				{
+					CloseClient(clientId);
+				}
+				else if (status == ClientStatus::Open)
 				{
 					if (!Tools::IsProcessAlive(clientHeader.ClientProcessId))
 					{
@@ -1261,22 +1305,24 @@ namespace Socket
 			if (clientId < 0 || clientId >= Capacity)
 				return ReadStatus::Empty;
 
-			ClientHeader& client = _clientHeaders[static_cast<size_t>(clientId)];
+			ClientHeader& clientHeader = _clientHeaders[static_cast<size_t>(clientId)];
 
-			ClientStatus status = client.Status.load(std::memory_order_acquire);
+			// The snapshot the close is read under is the snapshot the CAS must use: a fresh Load()
+			// here or below would adopt a newer epoch and let stale evidence close a new session.
+			Tools::AtomicEnum<ClientStatus>::Snapshot snapshot = clientHeader.Status.Load();
 
-			if (status != ClientStatus::Open)
+			if (snapshot.State() != ClientStatus::Open)
 				return ReadStatus::Closed;
 
 			try
 			{
-				if (client.ClientSocket && client.ClientSocket->HasReader(channelId))
+				if (clientHeader.ClientSocket && clientHeader.ClientSocket->HasReader(channelId))
 				{
-					ReadStatus result = client.ClientSocket->GetReadStatus(channelId);
+					ReadStatus result = clientHeader.ClientSocket->GetReadStatus(channelId);
 
 					if (result == ReadStatus::Closed)
 					{
-						CloseClient(clientId);
+						clientHeader.Status.TryTransition(snapshot, ClientStatus::Closing);
 					}
 
 					return result;
@@ -1300,7 +1346,11 @@ namespace Socket
 
 			ClientHeader& clientHeader = _clientHeaders[static_cast<size_t>(clientId)];
 
-			if (clientHeader.Status.load(std::memory_order_acquire) != ClientStatus::Open || !clientHeader.ClientSocket)
+			// Same snapshot discipline as GetReadStatus; TryTransition replaces the old
+			// recheck-then-store, which two threads could interleave into a double close.
+			Tools::AtomicEnum<ClientStatus>::Snapshot snapshot = clientHeader.Status.Load();
+
+			if (snapshot.State() != ClientStatus::Open || !clientHeader.ClientSocket)
 				return ReadStatus::Closed;
 
 			try
@@ -1312,10 +1362,7 @@ namespace Socket
 
 				if (result == ReadStatus::Closed)
 				{
-					if (clientHeader.Status.load(std::memory_order_acquire) == ClientStatus::Open)
-					{
-						CloseClient(clientId);
-					}
+					clientHeader.Status.TryTransition(snapshot, ClientStatus::Closing);
 				}
 
 				return result;
@@ -1341,8 +1388,8 @@ namespace Socket
 				return;
 
 			ClientHeader& client = _clientHeaders[static_cast<size_t>(clientId)];
-			ClientStatus status = client.Status.load(std::memory_order_acquire);
-			bool canWrite = status == ClientStatus::Open || status == ClientStatus::Detached;
+			ClientStatus status = client.Status.State();
+			bool canWrite = status == ClientStatus::Open || status == ClientStatus::Detached || (Persistance && (status == ClientStatus::Closing));
 
 			if (!canWrite)
 				return;
@@ -1368,8 +1415,8 @@ namespace Socket
 
 			ClientHeader& client = _clientHeaders[static_cast<size_t>(clientId)];
 
-			ClientStatus status = client.Status.load(std::memory_order_acquire);
-			bool canWrite = status == ClientStatus::Open || status == ClientStatus::Detached;
+			ClientStatus status = client.Status.State();
+			bool canWrite = status == ClientStatus::Open || status == ClientStatus::Detached || (Persistance && (status == ClientStatus::Closing));
 
 			if (!canWrite)
 				return;
