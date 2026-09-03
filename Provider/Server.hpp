@@ -396,6 +396,18 @@ public:
 
     Execution::OrderState OnOrderState(Execution::OrderState& orderState)
     {
+        Execution::OrderState& existingOrderState = WriteOrderState(orderState);
+        WriteToExecution(existingOrderState);
+        if (OrderState)
+            OrderState(existingOrderState);
+        return existingOrderState;
+    }
+
+    // Row write + risk ledger ONLY - safe inside OnFill's position-lock envelope. The forward and
+    // callback live in the public OnOrderState/OnFill, after every lock is released; calling the
+    // public method from OnFill would send the state twice, from inside the lock.
+    Execution::OrderState& WriteOrderState(Execution::OrderState& orderState)
+    {
         Socket::SharedArrayEntry<Execution::OrderState>& orderStateEntry = _serverContext.GetOrderState(orderState.OrderHeader.OrderId);
         Socket::SharedArrayEntry<Execution::OrderTarget>& orderTargetEntry = _serverContext.GetOrderTarget(orderState.OrderHeader.OrderId);
         Execution::OrderState& existingOrderState = orderStateEntry.GetRef();
@@ -420,9 +432,6 @@ public:
             orderStateEntry.ReleaseLock();
             _riskLayer.OnOrderState(existingOrderState, beforeAckedOrderQuantity);
         }
-        WriteToExecution(existingOrderState);
-            if (OrderState)
-                OrderState(existingOrderState);
         return existingOrderState;
     }
 
@@ -572,12 +581,15 @@ public:
             AllocateInstrument(allocateInstrument);
     }
 
-    Execution::Fill OnFill(Execution::Fill& fill)
+    // The fill arrives PAIRED with the order state it produced (one ExecutionReport carries both):
+    // routing them through two independent calls let a strategy tick read a fresh position but a
+    // stale QuantityFilled, size an amend to the wrong total, and cancel its own order. The vendor
+    // session must hand this method the pair.
+    Execution::Fill OnFill(Execution::OrderState& orderState, Execution::Fill& fill)
     {
-        Socket::SharedArrayEntry<Execution::OrderState>& orderStateEntry = _serverContext.GetOrderState(fill.OrderHeader.OrderId);
-        const Execution::OrderState& orderState = orderStateEntry.GetReadonlyRef();
-        
-        if (orderState.OrderHeader.OrderId != fill.OrderHeader.OrderId)
+        const Execution::OrderState& existingOrderState = _serverContext.GetOrderState(fill.OrderHeader.OrderId).GetReadonlyRef();
+
+        if (existingOrderState.OrderHeader.OrderId != fill.OrderHeader.OrderId)
         {
             throw std::out_of_range("Server::OnFill: unknown clientOrderId");
         }
@@ -592,31 +604,38 @@ public:
 
         double multiplier = instrument.Multiplier();
         double tickSize = instrument.TickSize();
-        
-        // Global Update
+
         Socket::SharedArrayEntry<Execution::PositionHeader>& serverPositionHeaderEntry = _serverContext.GetPositionHeader(instrumentId);
         Execution::PositionHeader& serverPosition = serverPositionHeaderEntry.GetRef();
-        serverPositionHeaderEntry.AcquireLock();
-        serverPosition.OnFill(fill, tickSize, multiplier);
-        serverPositionHeaderEntry.ReleaseLock();
-    
-        // Local Update
+
         Socket::SharedArrayEntry<Execution::PositionHeader>& localPositionHeaderEntry = _serverContext.GetPositionHeader(strategyId, instrumentId);
         Execution::PositionHeader& localPosition = localPositionHeaderEntry.GetRef();
-        localPositionHeaderEntry.AcquireLock();
-        localPosition.OnFill(fill, tickSize, multiplier);
-        localPositionHeaderEntry.ReleaseLock();
 
-        // After both positions move: the fill converts reservation into position, and OnFill shrinks
-        // the reservation by exactly the fill quantity.
+        // The fill is atomic: order state, both position rows and the risk ledger move under ONE
+        // envelope (server row acquired first, then local; released in reverse), so no reader can
+        // see the position with a stale filled count. WriteOrderState, not OnOrderState - the
+        // forward and callbacks run after release below.
+        serverPositionHeaderEntry.AcquireLock();
+        localPositionHeaderEntry.AcquireLock();
+
+        WriteOrderState(orderState);
+        serverPosition.OnFill(fill, tickSize, multiplier);
+        localPosition.OnFill(fill, tickSize, multiplier);
         _riskLayer.OnFill(fill);
 
+        localPositionHeaderEntry.ReleaseLock();
+        serverPositionHeaderEntry.ReleaseLock();
+
         int32_t coreGroupId = instrument.Header().CoreGroupId;
+        WriteToExecution(existingOrderState);
         WriteToExecution(strategyId, coreGroupId, fill);
         WriteToExecution(strategyId, coreGroupId, localPosition);
+
         WriteToAudit(coreGroupId, fill);
         WriteToAudit(coreGroupId, serverPosition);
-        if(Fill)
+        if (OrderState)
+            OrderState(existingOrderState);
+        if (Fill)
             Fill(fill);
         return fill;
     }

@@ -51,11 +51,10 @@ namespace Execution
 		Unknown = 0,
 		PendingNew = 1,
 		Acked = 2,
-		PartialFill = 3,
-		Filled = 4, // here onwards -> Done
-		Canceled = 5,
-		Rejected = 6, // create rejected, not amend/cancel rejected
-		Eliminated = 7,
+		Fill = 3,       // partial vs complete lives in OrderStateStatus: Fill+Active / Fill+Done
+		Canceled = 4,   // here onwards -> Done unconditionally
+		Rejected = 5,   // create rejected, not amend/cancel rejected
+		Eliminated = 6,
 	};
 
 	enum class OrderRejectedReason : uint8_t

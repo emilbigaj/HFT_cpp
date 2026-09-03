@@ -320,7 +320,16 @@ public:
                     {
                         if (isAmend && existingTarget.OrderProfile == orderTarget.OrderProfile)
                             orderRejectedReasons.Set(static_cast<int32_t>(Execution::OrderRejectedReason::TargetIsActive));
-                        if (existingTarget.OrderTargetAction == Execution::OrderTargetAction::Cancel)
+
+                        // An in-flight amend whose total is at or below the reported fills leaves the
+                        // venue nothing to work (CME leaves-0 semantics): it will be CANCELLED, not
+                        // rejected, so follow-ups must bounce here instead of chasing a dead order.
+                        // The generation guard is essential - on a recycled slot with a create in
+                        // flight, the state row still holds the PREVIOUS order's fills, which must
+                        // not condemn the new order.
+                        bool existingTargetWillCancel = existingTarget.OrderHeader.OrderId == orderState.OrderHeader.OrderId
+                            && existingTarget.OrderProfile.Sign() * (existingTarget.OrderProfile.Quantity - orderState.QuantityFilled) <= 0;
+                        if (existingTarget.OrderTargetAction == Execution::OrderTargetAction::Cancel || existingTargetWillCancel)
                             orderRejectedReasons.Set(static_cast<int32_t>(Execution::OrderRejectedReason::CancelIsActive));
                     }
 
