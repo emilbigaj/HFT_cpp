@@ -8,6 +8,20 @@ ring protocol rule needs a matching entry there.
 
 ---
 
+## `OrderRisk::MaxOrderQuantity` is the limit, not the bound
+
+C# renamed and re-based this constant after the first port: `MaxOrderQuantity = 55`, the largest
+quantity a single order may carry, tested with `> MaxOrderQuantity`. C++ had it as `56`, an exclusive
+array bound tested with `>=`.
+
+Both accept exactly 1..55, so nothing was ever misjudged — but the constant is public on both sides
+and reads as a limit, so anyone using `OrderRisk::MaxOrderQuantity` as the answer to "how large may an
+order be" got 56 in C++ and 55 in C#. The counts array now sizes itself `MaxOrderQuantity + 1` to keep
+index 55 addressable and the struct on one cache line; `sizeof` stays 64 and the offsets are unchanged,
+so this is not a wire change. `Remove` is private, as in C#.
+
+---
+
 ## `3fa223d` — Adopt the C# risk model
 
 The C# side is ahead on risk and its structs are the reference. Six wire-visible changes taking C++

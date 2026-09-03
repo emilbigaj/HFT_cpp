@@ -222,11 +222,12 @@ namespace Execution
 	// A bitset of occupied quantities makes that worst case a single HighestSet.
 	struct OrderRisk
 	{
-		// Quantities are indexed 1..55; the counts array is sized to the field the bitset can address.
-		static constexpr int32_t MaxOrderQuantity = 56;
+		// Largest quantity a single order may carry. Quantities index 1..MaxOrderQuantity, so the counts
+		// array carries one extra slot for the unused zero — 8 + 56 keeps the struct on one cache line.
+		static constexpr int32_t MaxOrderQuantity = 55;
 
 		Tools::Bitset64 Quantities;
-		uint8_t Counts[MaxOrderQuantity] = {};
+		uint8_t Counts[MaxOrderQuantity + 1] = {};
 
 		// Branchless abs. Returns INT32_MIN for INT32_MIN (no throw); callers range-check unsigned.
 		ALWAYS_INLINE static int32_t Abs(int32_t value)
@@ -243,7 +244,7 @@ namespace Execution
 		bool TryAdd(int32_t orderQuantity, OrderRejectedReason& reason)
 		{
 			int32_t absQuantity = Abs(orderQuantity);
-			if (static_cast<uint32_t>(absQuantity) >= static_cast<uint32_t>(MaxOrderQuantity) || absQuantity == 0)
+			if (static_cast<uint32_t>(absQuantity) > static_cast<uint32_t>(MaxOrderQuantity) || absQuantity == 0)
 			{
 				reason = OrderRejectedReason::QuantityNotValid;
 				return false;
@@ -266,10 +267,11 @@ namespace Execution
 		void Ack(int32_t orderQuantity) { Remove(orderQuantity); }
 		void Reject(int32_t orderQuantity) { Remove(orderQuantity); }
 
+	private:
 		void Remove(int32_t orderQuantity)
 		{
 			int32_t absQuantity = Abs(orderQuantity);
-			if (static_cast<uint32_t>(absQuantity) >= static_cast<uint32_t>(MaxOrderQuantity))
+			if (static_cast<uint32_t>(absQuantity) > static_cast<uint32_t>(MaxOrderQuantity))
 				return;
 
 			uint8_t& count = Counts[absQuantity];
