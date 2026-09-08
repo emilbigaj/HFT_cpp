@@ -26,7 +26,8 @@ int main()
     CHECK(sizeof(Execution::OrderId) == 8);
     CHECK(sizeof(Execution::OrderHeader) == 28);
     CHECK(sizeof(Execution::OrderState) == 60);
-    CHECK(sizeof(Execution::Fill) == 52);
+    CHECK(sizeof(Execution::Fill) == 64);
+    CHECK(offsetof(Execution::Fill, Price) == 40);
     CHECK(sizeof(Execution::OrderRejected) == 52);
     CHECK(sizeof(Execution::OrderTarget) == 44);
     CHECK(sizeof(Execution::PositionHeader) == 57);

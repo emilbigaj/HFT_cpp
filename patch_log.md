@@ -8,6 +8,44 @@ ring protocol rule needs a matching entry there.
 
 ---
 
+## The spread vertical (C# `2e1ddfa` / report 2026-09-08)
+
+A spread is imaginary: risk, positions and P&L live on the outright legs; the spread instrument
+keeps its book, its order flow, and a volume-accounting row. Ported from C#, which is live in sim.
+
+**WIRE (lockstep deploy): `Fill` is 64 bytes with `double Price` at offset 40** — CME assigns leg
+fills at increments finer than the trading grid, so a fill is a terminal price fact, never ticks.
+`OrderProfile` left the struct; consumers use `fill.Quantity`/`fill.Price`/`fill.Sign()`. Old fill
+JSON no longer parses — rotate live `Fills/` and audit files at deploy.
+
+**`LeggedHeader` replaces `SpreadHeader`** in the 128-byte overlay: `LegCount` + six
+`{InstrumentHeaderId, Weight}` legs; `AsLegged()` (type-guarded, as are `AsFuture`/`AsForex` now).
+Spread symbology builds from the legs, signed-weight tokens, root once:
+`"Spread XCME ES +M2025-12-15 -M2026-03-15"` — this string names data rings and `.risklimit`
+files, so `LeggedSymbology` matches C# byte-for-byte (round-trip verified).
+
+**Per-leg risk**: `ApplyWorstWorkingQuantityDelta(orderId, sideSign, magnitudeDelta)` is the single
+home of aggregate arithmetic; every hook is a one-liner through it and the validator commits through
+the same code. Validation: max-order per leg in leg units before TryAdd; phase-1 pure per-leg
+position check routed by legDelta's own sign (a buy calendar reserves the back leg SHORT); phase-2
+commit. `OnFill` releases the raw fill quantity — per-fill releases + the Done remainder telescope
+to exactly the reserved worst, per leg.
+
+**`Server::OnFill(OrderState&, span<Fill>)`**: one atomic event — state + spread accounting fill +
+one fill per leg, all position rows locked in fills order (server row then local, released in
+reverse), risk released only for non-legged instruments (a spread's own fill is volume accounting;
+releasing it would double-release the legs). Vendor contract: one ExecutionReport = one call;
+fills[0] = the order's own instrument; leg fills copy the OrderId and rewrite only InstrumentId.
+
+**Allocation unions**: the server allocates a spread's legs first (full client path, no admin echo —
+the GetInstrument handshake is one-request-one-reply); the client onboards legs recursively through
+GetInstrument (exactly-once via the data-ring early-return); `Context::CreateInstrument`
+materializes legs BEFORE its non-reentrant spinlock (self-deadlock, shipped and caught in C#).
+`Spread` is not a `Future` any more — no multiplier, no maturity of its own; ±1 calendar weights
+only, anything wider throws at construction.
+
+---
+
 ## `OrderRisk::MaxOrderQuantity` is the limit, not the bound
 
 C# renamed and re-based this constant after the first port: `MaxOrderQuantity = 55`, the largest

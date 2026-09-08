@@ -135,12 +135,21 @@ public:
     Data::Instrument& GetInstrument(int32_t instrumentHeaderId)
     {
         int32_t instrumentId = -1;
-        if (ClientContext.TryGetInstrumentId(instrumentHeaderId, instrumentId))
+        if (ClientContext.TryGetInstrumentId(instrumentHeaderId, instrumentId) && _instrumentData[static_cast<size_t>(instrumentId)])
+            return ClientContext.GetInstrument(instrumentId); // already attached + seeded
+
+        // Legged header => onboard the legs first through this same entry (admin round-trip each,
+        // if needed). The early-return above makes it exactly-once: rolling with a spread whose
+        // leg is already traded onboards nothing twice. Header-based - the instrument may not
+        // exist yet - and runs on the allocated-but-not-onboarded path too.
+        if (ClientContext.GetInstrumentHeader(instrumentHeaderId).GetReadonlyRef().AsInstrumentHeader().InstrumentType == Data::InstrumentType::Spread)
         {
-            if (_instrumentData[static_cast<size_t>(instrumentId)])
-                return ClientContext.GetInstrument(instrumentId); // already attached + seeded
+            Data::LeggedHeader leggedHeader = ClientContext.GetInstrumentHeader(instrumentHeaderId).GetReadonlyRef().AsLegged();
+            for (const Data::LegHeader& legHeader : leggedHeader.Legs())
+                GetInstrument(legHeader.InstrumentHeaderId);
         }
-        else
+
+        if (!ClientContext.TryGetInstrumentId(instrumentHeaderId, instrumentId))
         {
             const Data::InstrumentHeader128& header128 = ClientContext.GetInstrumentHeader(instrumentHeaderId).GetReadonlyRef();
             Provider::AllocateInstrument allocateInstrument

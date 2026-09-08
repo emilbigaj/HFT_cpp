@@ -208,6 +208,14 @@ protected:
 
 		_instruments.resize(static_cast<size_t>(ServerHeader().GetReadonlyRef().InstrumentIds.Length()));
 		_positions.resize(static_cast<size_t>(ServerHeader().GetReadonlyRef().InstrumentIds.Length()));
+
+		// A legged header's symbology resolves its legs through sibling headers; hook it up to this
+		// context's header array (matches C# LeggedHeader.GetLegHeader). Static: every context
+		// reads the same server-owned array, so last-writer-wins is harmless.
+		Data::LeggedHeader::GetLegHeader = [this](int32_t instrumentHeaderId)
+		{
+			return _instrumentHeaders[instrumentHeaderId].GetReadonlyRef();
+		};
 	}
 
 	void EnsureConnected()
@@ -354,11 +362,22 @@ protected:
     std::atomic<bool> _lock{false};
 	void CreateInstrument(int32_t instrumentId)
 	{
+		// Materialize a spread's legs BEFORE taking the non-reentrant lock: the Spread branch
+		// below resolves them via GetInstrument, which must hit the cache, not re-enter
+		// CreateInstrument (self-deadlock; shipped and caught on the C# side). Value copy via
+		// GetReadonlyRef - clients map headers read-only, GetRef would throw.
+		int32_t instrumentHeaderId = GetInstrumentHeaderIdByInstrumentId(instrumentId).Read();
+		if (GetInstrumentHeader(instrumentHeaderId).GetReadonlyRef().AsInstrumentHeader().InstrumentType == Data::InstrumentType::Spread)
+		{
+			Data::LeggedHeader leggedHeader = GetInstrumentHeader(instrumentHeaderId).GetReadonlyRef().AsLegged();
+			for (const Data::LegHeader& legHeader : leggedHeader.Legs())
+				GetInstrument(GetInstrumentId(legHeader.InstrumentHeaderId));
+		}
+
         Tools::RAIISpinLock lock(_lock);
         if (_instruments[static_cast<size_t>(instrumentId)])
             return;
 
-		int32_t instrumentHeaderId = GetInstrumentHeaderIdByInstrumentId(instrumentId).Read();
 		Socket::SharedArrayEntry<Data::InstrumentHeader128>& header128Entry = GetInstrumentHeader(instrumentHeaderId);
 		const Data::InstrumentHeader& instrHeader = header128Entry.GetReadonlyRef().AsInstrumentHeader();
 
@@ -371,10 +390,21 @@ protected:
 		}
 		else if (instrHeader.InstrumentType == Data::InstrumentType::Spread)
 		{
-			Data::SpreadHeader spreadHeader = header128Entry.GetReadonlyRef().AsSpread();
-			class Data::Future& longFuture = static_cast<class Data::Future&>(GetInstrument(spreadHeader.LongInstrumentId));
-			class Data::Future& shortFuture = static_cast<class Data::Future&>(GetInstrument(spreadHeader.ShortInstrumentId));   
-			instrument = std::make_unique<class Data::Spread>(instrumentId, header128Entry.Cast<Data::SpreadHeader>(), mbpEntry, longFuture, shortFuture);
+			// Legs reference sibling headers; long = the positive-weight leg (2-leg spreads for now).
+			Data::LeggedHeader leggedHeader = header128Entry.GetReadonlyRef().AsLegged();
+			class Data::Future* longLeg = nullptr;
+			class Data::Future* shortLeg = nullptr;
+			for (const Data::LegHeader& legHeader : leggedHeader.Legs())
+			{
+				class Data::Future& legFuture = static_cast<class Data::Future&>(GetInstrument(GetInstrumentId(legHeader.InstrumentHeaderId)));
+				if (legHeader.Weight > 0)
+					longLeg = &legFuture;
+				else if (legHeader.Weight < 0)
+					shortLeg = &legFuture;
+			}
+			if (!longLeg || !shortLeg)
+				throw std::runtime_error(std::string(typeid(*this).name()) + ".CreateInstrument(" + std::to_string(instrumentId) + "), spread header must carry one positive and one negative leg.");
+			instrument = std::make_unique<class Data::Spread>(instrumentId, header128Entry.Cast<Data::LeggedHeader>(), mbpEntry, *longLeg, *shortLeg);
 		}
 		else if (instrHeader.InstrumentType == Data::InstrumentType::Forex)
 		{

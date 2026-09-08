@@ -44,7 +44,7 @@ static bool IsStringNullOrWhiteSpace(const std::string& str)
 	return true;
 }
 
-static std::string TrimString(const std::string& text)
+[[maybe_unused]] static std::string TrimString(const std::string& text)
 {
 	std::size_t first = text.find_first_not_of(" \t\n\r");
 	
@@ -236,26 +236,86 @@ public:
 	}
 };
 
-class SpreadSymbology final : public FutureSymbology
+// Legged ticker: the root appears once, up front; leg tokens carry only sign+maturity, e.g.
+// "ES +M2025-12-15 -M2026-03-15". This string names shared-memory rings and .risklimit files,
+// so it must match the C# LeggedSymbology byte-for-byte.
+class LeggedSymbology : public Symbology
 {
-private:
-	std::unique_ptr<FutureSymbology> _longSymbology;
-	std::unique_ptr<FutureSymbology> _shortSymbology;
+protected:
+	std::vector<std::unique_ptr<Symbology>> _symbologies;
+	std::vector<int32_t> _weights;
+
+	struct SymbolLeg { std::string Symbol; int32_t Weight; };
+
+	// Weight rendered as the leg-token sign: "+", "-", "+2"; negative weights carry their own '-'.
+	static std::string GetSignedWeight(int32_t weight)
+	{
+		if (weight == 1) return "+";
+		if (weight == -1) return "-";
+		if (weight > 1) return "+" + std::to_string(weight);
+		return std::to_string(weight); // 0 renders as "0"
+	}
+
+	static std::string GetLegsTicker(const std::string& root, const std::vector<SymbolLeg>& legs)
+	{
+		std::string result = root + " ";
+		for (size_t i = 0; i < legs.size(); i++)
+		{
+			result += GetSignedWeight(legs[i].Weight) + legs[i].Symbol;
+			if (i + 1 < legs.size())
+				result += " ";
+		}
+		return result;
+	}
+
+	// C#'s l.Ticker.Replace(l.Root + " ", ""): strip the leg's own root prefix from a leg string.
+	static std::string StripRoot(const std::string& text, const std::string& root)
+	{
+		std::string prefix = root + " ";
+		std::string result = text;
+		size_t pos;
+		while ((pos = result.find(prefix)) != std::string::npos)
+			result.erase(pos, prefix.length());
+		return result;
+	}
+
+	static std::vector<SymbolLeg> TickerLegs(const std::vector<std::unique_ptr<Symbology>>& symbologies, const std::vector<int32_t>& weights)
+	{
+		std::vector<SymbolLeg> legs;
+		legs.reserve(symbologies.size());
+		for (size_t i = 0; i < symbologies.size(); i++)
+			legs.push_back({ StripRoot(symbologies[i]->Ticker(), symbologies[i]->Root()), weights[i] });
+		return legs;
+	}
+
+	static std::vector<SymbolLeg> ShortSymbolLegs(const std::vector<std::unique_ptr<Symbology>>& symbologies, const std::vector<int32_t>& weights)
+	{
+		std::vector<SymbolLeg> legs;
+		legs.reserve(symbologies.size());
+		for (size_t i = 0; i < symbologies.size(); i++)
+			legs.push_back({ StripRoot(symbologies[i]->ShortSymbol(), symbologies[i]->Root()), weights[i] });
+		return legs;
+	}
 
 public:
-	SpreadSymbology(const std::string& exchange, const std::string& root, Data::MaturityType longMaturityType, Tools::Timestamp longMaturityDate, Data::MaturityType shortMaturityType, Tools::Timestamp shortMaturityDate) : FutureSymbology(Data::InstrumentType::Spread, exchange, root, root + " " + static_cast<char>(longMaturityType) + longMaturityDate.ToDateString() + " - " + static_cast<char>(shortMaturityType) + shortMaturityDate.ToDateString(), (longMaturityDate <= shortMaturityDate) ? longMaturityType : shortMaturityType, (longMaturityDate <= shortMaturityDate) ? longMaturityDate : shortMaturityDate), _longSymbology(std::make_unique<FutureSymbology>(exchange, root, longMaturityType, longMaturityDate)), _shortSymbology(std::make_unique<FutureSymbology>(exchange, root, shortMaturityType, shortMaturityDate))
+	LeggedSymbology(Data::InstrumentType instrumentType, const std::string& exchange, const std::string& root, std::vector<std::unique_ptr<Symbology>> symbologies, std::vector<int32_t> weights)
+	: Symbology(instrumentType, exchange, root, GetLegsTicker(root, TickerLegs(symbologies, weights)))
 	{
-		_shortSymbol = root + " " + ShortMonthYear(longMaturityDate) + " - " + ShortMonthYear(shortMaturityDate);
+		_shortSymbol = GetLegsTicker(root, ShortSymbolLegs(symbologies, weights));
+		_symbologies = std::move(symbologies);
+		_weights = std::move(weights);
 	}
 
-	FutureSymbology& LongSymbology() const
-	{
-		return *_longSymbology;
-	}
+	const std::vector<std::unique_ptr<Symbology>>& Symbologies() const { return _symbologies; }
+	const std::vector<int32_t>& Weights() const { return _weights; }
+};
 
-	FutureSymbology& ShortSymbology() const
+class SpreadSymbology final : public LeggedSymbology
+{
+public:
+	SpreadSymbology(const std::string& exchange, const std::string& root, std::vector<std::unique_ptr<Symbology>> symbologies, std::vector<int32_t> weights)
+	: LeggedSymbology(Data::InstrumentType::Spread, exchange, root, std::move(symbologies), std::move(weights))
 	{
-		return *_shortSymbology;
 	}
 };
 
@@ -295,25 +355,35 @@ inline std::unique_ptr<Symbology> Symbology::FromString(const std::string& symbo
 	}
 	else if (instrumentType == Data::InstrumentType::Spread)
 	{
-		std::size_t separatorPos = remainder.find(" - ");
-		
-		if (separatorPos == std::string::npos)
-			throw std::invalid_argument("Spread ticker must be in the form \"<E><Date> - <E><Date>\".");
+		// Signed leg tokens "±[n]<E><Date>": root appears once, legs maturity-ascending.
+		std::vector<std::unique_ptr<Symbology>> symbologies;
+		std::vector<int32_t> weights;
+		std::size_t tokenStart = 0;
+		while (tokenStart < remainder.length())
+		{
+			std::size_t tokenEnd = remainder.find(' ', tokenStart);
+			if (tokenEnd == std::string::npos) tokenEnd = remainder.length();
+			std::string legToken = remainder.substr(tokenStart, tokenEnd - tokenStart);
+			tokenStart = tokenEnd + 1;
+			if (legToken.empty()) continue;
 
-		std::string longLeg = TrimString(remainder.substr(0, separatorPos));
-		std::string shortLeg = TrimString(remainder.substr(separatorPos + 3));
+			int32_t sign = legToken[0] == '+' ? 1 : legToken[0] == '-' ? -1 : throw std::invalid_argument("Spread leg \"" + legToken + "\" must start with '+' or '-'.");
+			size_t index = 1;
+			int32_t magnitude = 0;
+			while (index < legToken.length() && legToken[index] >= '0' && legToken[index] <= '9')
+			{
+				magnitude = magnitude * 10 + (legToken[index] - '0');
+				index++;
+			}
 
-		Data::MaturityType longMaturityType;
-		Tools::Timestamp longMaturityDate;
-		
-		ParseMaturityToken(longLeg, longMaturityType, longMaturityDate);
+			Data::MaturityType maturityType;
+			Tools::Timestamp maturityDate;
+			ParseMaturityToken(legToken.substr(index), maturityType, maturityDate);
 
-		Data::MaturityType shortMaturityType;
-		Tools::Timestamp shortMaturityDate;
-		
-		ParseMaturityToken(shortLeg, shortMaturityType, shortMaturityDate);
-
-		return std::make_unique<SpreadSymbology>(exchange, root, longMaturityType, longMaturityDate, shortMaturityType, shortMaturityDate);
+			symbologies.push_back(std::make_unique<FutureSymbology>(exchange, root, maturityType, maturityDate));
+			weights.push_back(sign * std::max(magnitude, 1));
+		}
+		return std::make_unique<SpreadSymbology>(exchange, root, std::move(symbologies), std::move(weights));
 	}
 
 	throw std::logic_error("FromString does not yet support this InstrumentType.");

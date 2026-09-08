@@ -363,12 +363,20 @@ namespace Execution
 
 	struct Fill
 	{
+		// 64 bytes; Price sits at offset 40 (4+28+8), naturally 8-aligned. Price is a PRICE, not
+		// ticks: spread leg fills are assigned at increments finer than the leg's trading grid (CME
+		// leg pricing), so a fill is a terminal price fact - never quantize it back to a grid,
+		// never compare it for equality.
 		Data::Header<OrderType> Header = Data::Header<OrderType>(OrderType::Fill);
 		Execution::OrderHeader OrderHeader;
 		uint64_t FillId = 0;
-		Execution::OrderProfile OrderProfile;
+		double Price = 0.0;
+		int32_t Quantity = 0; // signed: sells negative
 		Execution::FillType FillType = Execution::FillType::Maker;
-		uint8_t Reserved[3] = { 0 };
+		uint8_t Reserved[11] = { 0 };
+
+		ALWAYS_INLINE int32_t Sign() const { return (Quantity > 0) - (Quantity < 0); }
+		ALWAYS_INLINE Data::Side Side() const { return static_cast<Data::Side>(Sign()); }
 
 		std::string ToString() const
 		{
@@ -381,14 +389,16 @@ namespace Execution
 			static constexpr auto value = glz::object(
 				"Header", &T::Header,
 				"OrderHeader", &T::OrderHeader,
-				"FillType", &T::FillType,
 				"FillId", &T::FillId,
-				"OrderProfile", &T::OrderProfile
+				"Price", &T::Price,
+				"Quantity", &T::Quantity,
+				"FillType", &T::FillType
 			);
 		};
 	};
 
-	static_assert(sizeof(Fill) == 52, "Fill must be 52 bytes");
+	static_assert(sizeof(Fill) == 64, "Fill must be 64 bytes");
+	static_assert(offsetof(Fill, Price) == 40, "Fill::Price must be 8-aligned at offset 40");
 
 	struct OrderRejected
     {
@@ -565,10 +575,12 @@ namespace Execution
         int32_t QuantityTraded = 0;
         Execution::AlgoStatus AlgoStatus = Execution::AlgoStatus::Paused;
 
-		void OnFill(const Fill& fill, double tickSize, double multiplier)
+		// The tickSize parameter is gone: fill.Price is already a price (leg fills arrive at
+		// increments finer than the trading grid, so ticks cannot represent them).
+		void OnFill(const Fill& fill, double multiplier)
 		{
-			int32_t quantity = fill.OrderProfile.Quantity;
-			double price = fill.OrderProfile.Ticks * tickSize;
+			int32_t quantity = fill.Quantity;
+			double price = fill.Price;
 			OrderHeader = fill.OrderHeader;
 
 			int32_t oldQty = Quantity;
@@ -638,7 +650,7 @@ namespace Execution
 		&& offsetof(RiskLimit, WorstShortWorkingQuantity) == 32);
 	static_assert(offsetof(OrderRisk, Quantities) == 0 && offsetof(OrderRisk, Counts) == 8);
 	static_assert(offsetof(Fill, OrderHeader) == 4 && offsetof(Fill, FillId) == 32
-		&& offsetof(Fill, OrderProfile) == 40 && offsetof(Fill, FillType) == 48);
+		&& offsetof(Fill, Price) == 40 && offsetof(Fill, Quantity) == 48 && offsetof(Fill, FillType) == 52);
 	static_assert(offsetof(OrderState, OrderHeader) == 4 && offsetof(OrderState, ExchangeOrderId) == 32
 		&& offsetof(OrderState, OrderProfile) == 40 && offsetof(OrderState, TimeInForce) == 48
 		&& offsetof(OrderState, OrderStateStatus) == 49 && offsetof(OrderState, OrderStateReason) == 50

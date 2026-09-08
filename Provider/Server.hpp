@@ -551,13 +551,35 @@ public:
     }
 
     void OnAllocateInstrument(int32_t clientId, Provider::AllocateInstrument& allocateInstrument)
-    {   
+    {
         ServerHeader& serverHeader = _serverContext.ServerHeader().GetRef();
         if (clientId >= serverHeader.ClientIds.Length())
         {
             throw std::out_of_range("Server::OnInstrumentAllocated: clientId out of range");
         }
 
+        // Spread => legs: a spread's legs must exist BEFORE the spread - CreateInstrument resolves
+        // them and throws otherwise. Each leg is fully client-allocated too (the client tracks leg
+        // positions and fills), but only the SPREAD - the instrument the client asked for - echoes
+        // an admin reply: the client's GetInstrument handshake reads exactly one. See Spec.md.
+        const Data::InstrumentHeader128& header128 = _serverContext.GetInstrumentHeader(allocateInstrument.InstrumentHeaderId).GetReadonlyRef();
+        if (header128.AsInstrumentHeader().InstrumentType == Data::InstrumentType::Spread)
+        {
+            Provider::AllocateInstrument allocateLegInstrument = allocateInstrument;
+            Data::LeggedHeader leggedHeader = header128.AsLegged();
+            for (const Data::LegHeader& legHeader : leggedHeader.Legs())
+            {
+                allocateLegInstrument.InstrumentHeaderId = legHeader.InstrumentHeaderId;
+                OnAllocateInstrument(clientId, allocateLegInstrument, /*writeAdminReply*/ false);
+            }
+        }
+
+        OnAllocateInstrument(clientId, allocateInstrument, /*writeAdminReply*/ true);
+    }
+
+private:
+    void OnAllocateInstrument(int32_t clientId, Provider::AllocateInstrument& allocateInstrument, bool writeAdminReply)
+    {
         int32_t instrumentId = OnAllocateInstrument(allocateInstrument);
 
         _serverContext.AllocateInstrument(clientId, instrumentId);
@@ -572,7 +594,8 @@ public:
         int32_t coreGroupId = _serverContext.GetInstrument(instrumentId).Header().CoreGroupId;
         _clientIdsByCoreGroupId[static_cast<size_t>(coreGroupId)].AtomicSet(clientId);
 
-        WriteToAdmin(clientId, allocateInstrument);
+        if (writeAdminReply)
+            WriteToAdmin(clientId, allocateInstrument);
 
         // After the work, not before: on entry InstrumentId is still -1 and Symbol is empty.
         std::cout << ServerName.string() << "::OnAllocateInstrument()\n" << allocateInstrument.ToString() << std::endl;
@@ -581,63 +604,89 @@ public:
             AllocateInstrument(allocateInstrument);
     }
 
-    // The fill arrives PAIRED with the order state it produced (one ExecutionReport carries both):
-    // routing them through two independent calls let a strategy tick read a fresh position but a
-    // stale QuantityFilled, size an amend to the wrong total, and cancel its own order. The vendor
-    // session must hand this method the pair.
-    Execution::Fill OnFill(Execution::OrderState& orderState, Execution::Fill& fill)
-    {
-        const Execution::OrderState& existingOrderState = _serverContext.GetOrderState(fill.OrderHeader.OrderId).GetReadonlyRef();
+public:
 
-        if (existingOrderState.OrderHeader.OrderId != fill.OrderHeader.OrderId)
+    // One fill event is ONE atomic call: the OrderState plus a span of fills, in this order -
+    // fills[0] = the order's own instrument (for a spread: spread id/units/price, volume
+    // accounting only), then one fill per leg (order's OrderId with only InstrumentId rewritten,
+    // quantity = spread qty x weight, Price = the leg price straight off the wire). An outright
+    // ER is the same call with a 1-element span. Never route the state and its fills as two
+    // independent calls - that split caused the live PositionExceedsRiskLimit incident.
+    void OnFill(Execution::OrderState& orderState, std::span<Execution::Fill> fills)
+    {
+        const Execution::OrderState& existingOrderState = _serverContext.GetOrderState(orderState.OrderHeader.OrderId).GetReadonlyRef();
+
+        if (existingOrderState.OrderHeader.OrderId != orderState.OrderHeader.OrderId)
         {
             throw std::out_of_range("Server::OnFill: unknown clientOrderId");
         }
-        // Identity (ClientId/StrategyId/InstrumentId) is packed inside ClientOrderId, and the equality
-        // check above guarantees it matches the state's - no re-stamping needed.
-        fill.OrderHeader.NicTimestamp = Tools::Timestamp::UtcNow();
 
-        int32_t strategyId = fill.OrderHeader.OrderId.StrategyId();
-        int32_t instrumentId = fill.OrderHeader.OrderId.InstrumentId();
+        Tools::Timestamp now = Tools::Timestamp::UtcNow();
+        for (Execution::Fill& fill : fills)
+        {
+            // Leg ids differ from the order's only in the InstrumentId bits, so GlobalIndex (client +
+            // local slot) is the belongs-to-this-order check plain id equality can no longer be.
+            if (fill.OrderHeader.OrderId.GlobalIndex() != orderState.OrderHeader.OrderId.GlobalIndex())
+            {
+                throw std::out_of_range("Server::OnFill: fill does not belong to the order");
+            }
+            fill.OrderHeader.NicTimestamp = now;
+        }
 
-        Data::Instrument& instrument = _serverContext.GetInstrument(instrumentId);
+        int32_t strategyId = orderState.OrderHeader.OrderId.StrategyId();
 
-        double multiplier = instrument.Multiplier();
-        double tickSize = instrument.TickSize();
-
-        Socket::SharedArrayEntry<Execution::PositionHeader>& serverPositionHeaderEntry = _serverContext.GetPositionHeader(instrumentId);
-        Execution::PositionHeader& serverPosition = serverPositionHeaderEntry.GetRef();
-
-        Socket::SharedArrayEntry<Execution::PositionHeader>& localPositionHeaderEntry = _serverContext.GetPositionHeader(strategyId, instrumentId);
-        Execution::PositionHeader& localPosition = localPositionHeaderEntry.GetRef();
-
-        // The fill is atomic: order state, both position rows and the risk ledger move under ONE
-        // envelope (server row acquired first, then local; released in reverse), so no reader can
-        // see the position with a stale filled count. WriteOrderState, not OnOrderState - the
-        // forward and callbacks run after release below.
-        serverPositionHeaderEntry.AcquireLock();
-        localPositionHeaderEntry.AcquireLock();
+        // The fill is atomic - no torn orderstate/position reads by clients. Acquire in fills
+        // order, server row before local row per instrument: single-writer makes this a mirror
+        // convention, not deadlock avoidance. WriteOrderState, not OnOrderState: row write +
+        // ledger only - the forwards and callbacks run after release below.
+        for (const Execution::Fill& fill : fills)
+        {
+            int32_t instrumentId = fill.OrderHeader.OrderId.InstrumentId();
+            _serverContext.GetPositionHeader(instrumentId).AcquireLock();
+            _serverContext.GetPositionHeader(strategyId, instrumentId).AcquireLock();
+        }
 
         WriteOrderState(orderState);
-        serverPosition.OnFill(fill, tickSize, multiplier);
-        localPosition.OnFill(fill, tickSize, multiplier);
-        _riskLayer.OnFill(fill);
 
-        localPositionHeaderEntry.ReleaseLock();
-        serverPositionHeaderEntry.ReleaseLock();
+        for (const Execution::Fill& fill : fills)
+        {
+            int32_t instrumentId = fill.OrderHeader.OrderId.InstrumentId();
+            Data::Instrument& instrument = _serverContext.GetInstrument(instrumentId);
+            _serverContext.GetPositionHeader(instrumentId).GetRef().OnFill(fill, instrument.Multiplier());
+            _serverContext.GetPositionHeader(strategyId, instrumentId).GetRef().OnFill(fill, instrument.Multiplier());
+            // A legged instrument's own fill is accounting only (volume/position view on the spread
+            // row); risk lives on the legs, so releasing it here would double-release the legs the
+            // leg fills already covered. Risk is an outright concept.
+            if (!instrument.IsLegged())
+                _riskLayer.OnFill(fill);
+        }
 
-        int32_t coreGroupId = instrument.Header().CoreGroupId;
+        for (size_t i = fills.size(); i-- > 0; )
+        {
+            int32_t instrumentId = fills[i].OrderHeader.OrderId.InstrumentId();
+            _serverContext.GetPositionHeader(strategyId, instrumentId).ReleaseLock();
+            _serverContext.GetPositionHeader(instrumentId).ReleaseLock();
+        }
+
+        int32_t coreGroupId = _serverContext.GetInstrument(orderState.OrderHeader.OrderId.InstrumentId()).Header().CoreGroupId;
         WriteToExecution(existingOrderState);
-        WriteToExecution(strategyId, coreGroupId, fill);
-        WriteToExecution(strategyId, coreGroupId, localPosition);
+        for (const Execution::Fill& fill : fills)
+        {
+            WriteToExecution(strategyId, coreGroupId, fill);
+            WriteToExecution(strategyId, coreGroupId, _serverContext.GetPositionHeader(strategyId, fill.OrderHeader.OrderId.InstrumentId()).GetRef());
+        }
 
-        WriteToAudit(coreGroupId, fill);
-        WriteToAudit(coreGroupId, serverPosition);
+        for (const Execution::Fill& fill : fills)
+        {
+            WriteToAudit(coreGroupId, fill);
+            WriteToAudit(coreGroupId, _serverContext.GetPositionHeader(fill.OrderHeader.OrderId.InstrumentId()).GetRef());
+        }
+
         if (OrderState)
             OrderState(existingOrderState);
         if (Fill)
-            Fill(fill);
-        return fill;
+            for (const Execution::Fill& fill : fills)
+                Fill(fill);
     }
 
     void OnTrade(const Data::Trade& trade)

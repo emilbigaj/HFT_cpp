@@ -149,8 +149,28 @@ public:
     // ---- retire paths. Server-side only: the client has no authority over the ledger and its
     // ---- RiskLayer maps the arrays read-only, so touching them there would throw.
 
+    // The single home of aggregate arithmetic - every hook and the validator commit go through it.
+    // Aggregates are per LEG (an outright is its own single leg, weight +1). Applies an ORDER-unit
+    // magnitude delta (negative = release) to each leg's side of exposure. legSide = orderSide *
+    // sign(weight) - the sign is applied exactly ONCE, here; signing anywhere else squares it away
+    // and drives the short aggregate positive (see Spec.md).
+    ALWAYS_INLINE void ApplyWorstWorkingQuantityDelta(Execution::OrderId orderId, int32_t orderSideSign, int32_t magnitudeDelta)
+    {
+        if (magnitudeDelta == 0)
+            return;
+
+        for (const Data::InstrumentLeg& leg : _serverContext.GetInstrument(orderId.InstrumentId()).Legs())
+        {
+            int32_t legSide = orderSideSign * ((leg.Weight > 0) - (leg.Weight < 0));
+            int32_t legMagnitudeDelta = magnitudeDelta * std::abs(leg.Weight);
+            Execution::RiskLimit& riskLimit = _serverContext.GetRiskLimit(leg.InstrumentId).GetRef();
+            riskLimit.WorstLongWorkingQuantity += legSide > 0 ? legMagnitudeDelta : 0;
+            riskLimit.WorstShortWorkingQuantity -= legSide < 0 ? legMagnitudeDelta : 0;
+        }
+    }
+
     // An ack retires the target that produced it. The slot's worst case drops to the highest quantity
-    // still unacked, so the instrument aggregate releases the difference.
+    // still unacked, so the leg aggregates release the difference.
     ALWAYS_INLINE void OnOrderState(const Execution::OrderState& orderState, int32_t beforeAckedOrderQuantity)
     {
         if (_orderRejectedSource != Execution::OrderRejectedSource::Server)
@@ -166,15 +186,7 @@ public:
             int32_t worstOrderQuantityAfter = orderRisk.GetAbsWorstOrderQuantity(orderState.OrderProfile.Quantity);
             int32_t worstOrderQuantityDelta = worstOrderQuantityAfter - worstOrderQuantityBefore;
 
-            if (worstOrderQuantityDelta == 0)
-                return;
-
-            // The delta is a magnitude; the SIDE SELECTOR carries the sign, because the short aggregate
-            // is signed negative. Signing the delta as well squares the sign away to +1 and drives the
-            // short aggregate positive — after which the short position check can never trip.
-            Execution::RiskLimit& riskLimit = _serverContext.GetRiskLimit(orderState.OrderHeader.OrderId.InstrumentId()).GetRef();
-            riskLimit.WorstLongWorkingQuantity += worstOrderQuantityDelta * (side == Data::Side::Buy ? 1 : 0);
-            riskLimit.WorstShortWorkingQuantity += worstOrderQuantityDelta * (side == Data::Side::Sell ? -1 : 0);
+            ApplyWorstWorkingQuantityDelta(orderState.OrderHeader.OrderId, side == Data::Side::Buy ? 1 : -1, worstOrderQuantityDelta);
         }
         else if (orderState.OrderStateStatus == Execution::OrderStateStatus::Done)
         {
@@ -188,25 +200,20 @@ public:
 
             orderRisk = Execution::OrderRisk{};
 
-            if (released == 0)
-                return;
-
-            Execution::RiskLimit& riskLimit = _serverContext.GetRiskLimit(orderState.OrderHeader.OrderId.InstrumentId()).GetRef();
-            riskLimit.WorstLongWorkingQuantity -= released * (side == Data::Side::Buy ? 1 : 0);
-            riskLimit.WorstShortWorkingQuantity -= released * (side == Data::Side::Sell ? -1 : 0);
+            ApplyWorstWorkingQuantityDelta(orderState.OrderHeader.OrderId, side == Data::Side::Buy ? 1 : -1, -released);
         }
     }
 
     // A fill converts reservation into position, so the reservation shrinks by exactly the fill.
+    // Raw fill quantity, NOT a state delta: per-fill releases + the Done remainder telescope to
+    // exactly the reserved worst, per leg. A leg fill IS an outright fill - its OrderId carries the
+    // leg's InstrumentId, whose single self-leg releases the leg's own reservation directly.
     ALWAYS_INLINE void OnFill(const Execution::Fill& fill)
     {
         if (_orderRejectedSource != Execution::OrderRejectedSource::Server)
             return;
 
-        Data::Side side = fill.OrderProfile.Side();
-        Execution::RiskLimit& riskLimit = _serverContext.GetRiskLimit(fill.OrderHeader.OrderId.InstrumentId()).GetRef();
-        riskLimit.WorstLongWorkingQuantity -= fill.OrderProfile.Quantity * (side == Data::Side::Buy ? 1 : 0);
-        riskLimit.WorstShortWorkingQuantity -= fill.OrderProfile.Quantity * (side == Data::Side::Sell ? 1 : 0);
+        ApplyWorstWorkingQuantityDelta(fill.OrderHeader.OrderId, fill.Sign(), -std::abs(fill.Quantity));
     }
 
     // An exchange reject retires exactly the target it names; a server reject never reserved anything.
@@ -227,15 +234,7 @@ public:
         int32_t worstOrderQuantityAfter = orderRisk.GetAbsWorstOrderQuantity(orderState.OrderProfile.Quantity);
         int32_t worstOrderQuantityDelta = worstOrderQuantityAfter - worstOrderQuantityBefore;
 
-        if (worstOrderQuantityDelta == 0)
-            return;
-
-        // Same magnitude-space shape as the Ack path, so the sell selector is -1 for the same reason:
-        // rejecting a sell amend from acked -10 to -12 gives delta 10-12 = -2, and with +1 the short
-        // aggregate would move -2 instead of +2 — a permanent error in the wrong direction.
-        Execution::RiskLimit& riskLimit = _serverContext.GetRiskLimit(orderRejected.OrderHeader.OrderId.InstrumentId()).GetRef();
-        riskLimit.WorstLongWorkingQuantity += worstOrderQuantityDelta * (side == Data::Side::Buy ? 1 : 0);
-        riskLimit.WorstShortWorkingQuantity += worstOrderQuantityDelta * (side == Data::Side::Sell ? -1 : 0);
+        ApplyWorstWorkingQuantityDelta(orderRejected.OrderHeader.OrderId, side == Data::Side::Buy ? 1 : -1, worstOrderQuantityDelta);
     }
 
     ALWAYS_INLINE bool ValidateOrder(const Execution::OrderTarget& orderTarget, Tools::Bitset64& orderRejectedReasons)
@@ -356,21 +355,23 @@ public:
             if (!orderRejectedReasons.IsEmpty())
                 return false;
 
-            // 10. RISK LIMITS
+            // 10. RISK LIMITS - per LEG (an outright is the 1-leg degenerate case).
             // Only check risk on New or Amend (increasing size)
             if (!isCancel)
             {
-                Execution::RiskLimit& riskLimit = _serverContext.GetRiskLimit(instrumentId).GetRef();
+                Data::Instrument& instrument = _serverContext.GetInstrument(instrumentId);
 
                 int32_t quantityFilled = orderState.OrderHeader.OrderId == orderTarget.OrderHeader.OrderId ? orderState.QuantityFilled : 0;
                 int32_t workingQuantity = orderTarget.OrderProfile.Quantity - quantityFilled;
-                int32_t absWorkingQuantity = std::abs(workingQuantity);
 
-                // Max Order Quantity
-                if (absWorkingQuantity > riskLimit.MaxOrderQuantity)
+                // Max order quantity per leg, in LEG units - before TryAdd, so rejects need no back-out.
+                for (const Data::InstrumentLeg& leg : instrument.Legs())
                 {
-                    orderRejectedReasons.Set(static_cast<int32_t>(Execution::OrderRejectedReason::QuantityExceedsRiskLimit));
-                    return false;
+                    if (std::abs(workingQuantity * leg.Weight) > _serverContext.GetRiskLimit(leg.InstrumentId).GetReadonlyRef().MaxOrderQuantity)
+                    {
+                        orderRejectedReasons.Set(static_cast<int32_t>(Execution::OrderRejectedReason::QuantityExceedsRiskLimit));
+                        return false;
+                    }
                 }
 
                 int32_t ackedOrderQuantity = orderTarget.OrderTargetAction == Execution::OrderTargetAction::Create ? 0 : orderState.OrderProfile.Quantity;
@@ -380,6 +381,7 @@ public:
                 if (orderTarget.OrderTargetAction == Execution::OrderTargetAction::Create)
                     orderRisk = Execution::OrderRisk{};
 
+                // The ONE pre-verdict mutation, with its first-class inverse (Reject) on any breach.
                 int32_t sign = orderTarget.OrderProfile.Sign();
                 int32_t worstQuantityFilledBefore = orderRisk.GetAbsWorstOrderQuantity(ackedOrderQuantity);
 
@@ -389,35 +391,32 @@ public:
                     orderRejectedReasons.Set(static_cast<int32_t>(reason));
                     return false;
                 }
+                int32_t worstMagnitudeDelta = orderRisk.GetAbsWorstOrderQuantity(ackedOrderQuantity) - worstQuantityFilledBefore;
 
-                int32_t worstQuantityFilledAfter = orderRisk.GetAbsWorstOrderQuantity(ackedOrderQuantity);
-                // GetAbsWorstOrderQuantity is a magnitude and both aggregates are signed — long positive,
-                // short negative — so the order's sign is applied exactly ONCE, here on the delta.
-                // Applying it to the before/after operands as well multiplies the delta by sign twice,
-                // which squares away to +1: the delta degrades to an unsigned magnitude, the short
-                // aggregate goes positive, and the short position check can never trip.
-                int32_t worstWorkingQuantityDelta = (worstQuantityFilledAfter - worstQuantityFilledBefore) * sign;
-
-                // branchless
-                int32_t worstLongWorkingQuantity = riskLimit.WorstLongWorkingQuantity + worstWorkingQuantityDelta * (sign == 1 ? 1 : 0);
-                int32_t worstShortWorkingQuantity = riskLimit.WorstShortWorkingQuantity + worstWorkingQuantityDelta * (sign == -1 ? 1 : 0);
-
-                Position& serverPosition = _serverContext.GetPosition(instrumentId);
-                int32_t quantity = serverPosition.Header().Quantity;
-                int32_t worstLongQuantity = quantity + worstLongWorkingQuantity;
-                int32_t worstShortQuantity = quantity + worstShortWorkingQuantity;
-                    
-                bool isRiskLimitExceeded = sign > 0 ? worstLongQuantity > riskLimit.MaxPositionQuantity : worstShortQuantity < -riskLimit.MaxPositionQuantity;
-                if (isRiskLimitExceeded)
+                // Phase 1 - PURE: check every leg, write nothing. The magnitude delta is >= 0, so
+                // legDelta's own sign IS the leg's side - routing by the ORDER's sign corrupts every
+                // negative-weight leg (a buy calendar reserves the back leg SHORT, not long).
+                for (const Data::InstrumentLeg& leg : instrument.Legs())
                 {
-                    orderRisk.Reject(orderTarget.OrderProfile.Quantity);
-                    orderRejectedReasons.Set(static_cast<int32_t>(Execution::OrderRejectedReason::PositionExceedsRiskLimit));
+                    int32_t legDelta = worstMagnitudeDelta * sign * leg.Weight;
+                    const Execution::RiskLimit& riskLimit = _serverContext.GetRiskLimit(leg.InstrumentId).GetReadonlyRef();
+                    int32_t quantity = _serverContext.GetPosition(leg.InstrumentId).Header().Quantity;
+
+                    bool isRiskLimitExceeded = legDelta >= 0
+                        ? quantity + riskLimit.WorstLongWorkingQuantity + legDelta > riskLimit.MaxPositionQuantity
+                        : quantity + riskLimit.WorstShortWorkingQuantity + legDelta < -riskLimit.MaxPositionQuantity;
+
+                    if (isRiskLimitExceeded)
+                    {
+                        orderRisk.Reject(orderTarget.OrderProfile.Quantity);
+                        orderRejectedReasons.Set(static_cast<int32_t>(Execution::OrderRejectedReason::PositionExceedsRiskLimit));
+                        return false;
+                    }
                 }
-                else
-                {
-                    riskLimit.WorstLongWorkingQuantity = worstLongWorkingQuantity;
-                    riskLimit.WorstShortWorkingQuantity = worstShortWorkingQuantity;
-                }
+
+                // Phase 2 - commit through the SAME arithmetic the release hooks use. Single-writer:
+                // nothing can change between the phases, so check-then-apply is atomic by ownership.
+                ApplyWorstWorkingQuantityDelta(orderTarget.OrderHeader.OrderId, sign, worstMagnitudeDelta);
             }
         }
         catch (const std::exception& ex)

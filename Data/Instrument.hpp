@@ -143,40 +143,64 @@ namespace Data
 		};
 	};
 
-	struct SpreadHeader
+	struct InstrumentHeader128;
+
+	struct LegHeader
 	{
-		Data::InstrumentHeader InstrumentHeader;
-		double Multiplier;
-		Tools::Timestamp LongMaturityDate;
-		Tools::Timestamp ShortMaturityDate;
-		int32_t LongInstrumentId;
-		int32_t ShortInstrumentId;
-		Data::MaturityType LongMaturityType;
-		Data::MaturityType ShortMaturityType;
+		int32_t InstrumentHeaderId = -1; // sibling header id, NOT instrument id
+		int32_t Weight = 0;              // signed: calendar = +1 front, -1 back
 
-
-		std::unique_ptr<Data::SpreadSymbology> Symbology() const
+		struct glaze
 		{
-			return std::make_unique<Data::SpreadSymbology>(InstrumentHeader.Exchange.ToString(), InstrumentHeader.Root.ToString(), LongMaturityType, LongMaturityDate, ShortMaturityType, ShortMaturityDate);
+			using T = LegHeader;
+			static constexpr auto value = glz::object(
+				"InstrumentHeaderId", &T::InstrumentHeaderId,
+				"Weight", &T::Weight
+			);
+		};
+	};
+	static_assert(sizeof(LegHeader) == 8, "LegHeader must be 8 bytes");
+
+	struct LeggedHeader
+	{
+		// 128-byte overlay budget: InstrumentHeader 64 + Multiplier 8 + LegCount 4 + reserved 4 + 6*8 legs = 124.
+		Data::InstrumentHeader InstrumentHeader;
+		double Multiplier;   // VESTIGIAL: spreads have no multiplier (legs carry them);
+		                     // field kept for byte parity until a coordinated layout trim
+		int32_t LegCount;
+		uint8_t Reserved[4];
+		LegHeader Leg0, Leg1, Leg2, Leg3, Leg4, Leg5;
+
+		// Live legs, maturity-ascending - same invariant as the ticker. Clamped: LegCount comes
+		// from shared memory and a span constructor does no validation.
+		std::span<const LegHeader> Legs() const
+		{
+			return { &Leg0, static_cast<size_t>(std::clamp(LegCount, 0, 6)) };
 		}
+
+		// Legs reference sibling headers by id; the context hooks this, like InstrumentDetails.GetLeg.
+		static inline std::function<InstrumentHeader128(int32_t)> GetLegHeader;
+
+		std::unique_ptr<Data::SpreadSymbology> Symbology() const;
 
 		std::string ToString() const
 		{
-			return Tools::Json::Serialize(this);
+			return Tools::Json::Serialize(*this);
 		}
 
 		struct glaze
 		{
-			using T = SpreadHeader;
+			using T = LeggedHeader;
 			static constexpr auto value = glz::object(
 				"InstrumentHeader", &T::InstrumentHeader,
 				"Multiplier", &T::Multiplier,
-				"LongMaturityDate", &T::LongMaturityDate,
-				"LongMaturityType", &T::LongMaturityType,
-				"ShortMaturityDate", &T::ShortMaturityDate,
-				"ShortMaturityType", &T::ShortMaturityType,
-				"LongInstrumentId", &T::LongInstrumentId,
-				"ShortInstrumentId", &T::ShortInstrumentId
+				"LegCount", &T::LegCount,
+				"Leg0", &T::Leg0,
+				"Leg1", &T::Leg1,
+				"Leg2", &T::Leg2,
+				"Leg3", &T::Leg3,
+				"Leg4", &T::Leg4,
+				"Leg5", &T::Leg5
 			);
 		};
 	};
@@ -191,7 +215,7 @@ namespace Data
 			InstrumentHeader Base;
 			ForexHeader Forex;
 			FutureHeader Future;
-			SpreadHeader Spread;
+			LeggedHeader Legged;
 			uint8_t Raw[128];
 		};
 
@@ -205,34 +229,42 @@ namespace Data
 			return Base;
 		}
 		
+		// Overlay accessors are TYPE-GUARDED: a realtime context holds spreads and unfilled slots
+		// too, and reading the wrong overlay is silent garbage, not an error, without the check.
 		FutureHeader& AsFuture()
 		{
+			ThrowIfNot(Data::InstrumentType::Future);
 			return Future;
 		}
 
 		const FutureHeader& AsFuture() const
 		{
+			ThrowIfNot(Data::InstrumentType::Future);
 			return Future;
 		}
 
 		ForexHeader& AsForex()
 		{
+			ThrowIfNot(Data::InstrumentType::Forex);
 			return Forex;
 		}
 
 		const ForexHeader& AsForex() const
 		{
+			ThrowIfNot(Data::InstrumentType::Forex);
 			return Forex;
 		}
 
-		SpreadHeader& AsSpread()
+		LeggedHeader& AsLegged()
 		{
-			return Spread;
+			ThrowIfNot(Data::InstrumentType::Spread);
+			return Legged;
 		}
 
-		const SpreadHeader& AsSpread() const
+		const LeggedHeader& AsLegged() const
 		{
-			return Spread;
+			ThrowIfNot(Data::InstrumentType::Spread);
+			return Legged;
 		}
 
 		std::unique_ptr<Data::Symbology> Symbology() const
@@ -244,17 +276,50 @@ namespace Data
 				case Data::InstrumentType::Forex:
 					return AsForex().Symbology();
 				case Data::InstrumentType::Spread:
-					return AsSpread().Symbology();
+					return AsLegged().Symbology();
 				default:
 					throw std::invalid_argument("Instrument type is not supported.");
 			}
+		}
+
+	private:
+		void ThrowIfNot(Data::InstrumentType instrumentType) const
+		{
+			if (Base.InstrumentType != instrumentType)
+				throw std::logic_error("InstrumentHeader128: overlay read as the wrong instrument type.");
 		}
 	};
 
 	static_assert(sizeof(InstrumentHeader128) == 128, "InstrumentHeader128 size must be 128 bytes");
 	static_assert(Tools::PlainOldData<InstrumentHeader128>, "InstrumentHeader128 must be POD");
+	static_assert(sizeof(LeggedHeader) <= sizeof(InstrumentHeader128), "LeggedHeader must fit within InstrumentHeader128");
+
+	// Symbology built from the legs (maturity-ascending, signed-weight tokens), resolved through
+	// the GetLegHeader hook the context installs.
+	inline std::unique_ptr<Data::SpreadSymbology> LeggedHeader::Symbology() const
+	{
+		if (!GetLegHeader)
+			throw std::logic_error("LeggedHeader::Symbology: GetLegHeader hook is not installed.");
+
+		std::vector<std::unique_ptr<Data::Symbology>> symbologies;
+		std::vector<int32_t> weights;
+		for (const LegHeader& legHeader : Legs())
+		{
+			symbologies.push_back(GetLegHeader(legHeader.InstrumentHeaderId).Symbology());
+			weights.push_back(legHeader.Weight);
+		}
+		return std::make_unique<Data::SpreadSymbology>(InstrumentHeader.Exchange.ToString(), InstrumentHeader.Root.ToString(), std::move(symbologies), std::move(weights));
+	}
 
 	#pragma pack(pop)
+
+	// A resolved leg for risk decomposition: instrument id + signed weight. 8 bytes, so a full
+	// 6-leg view fits in one cache line; ids not Instrument refs - the risk loops only need the id.
+	struct InstrumentLeg
+	{
+		int32_t InstrumentId = -1;
+		int32_t Weight = 0;
+	};
 
 	class Instrument
 	{
@@ -270,9 +335,19 @@ namespace Data
           InstrumentId(id),
           TickDecimals(Tools::GetNumberOfDecimalPlaces(TickSize()))
 		{
+			_legs = { InstrumentLeg{ id, 1 } };
 		}
 
+		// Legs view for risk decomposition: an outright is its own single leg (weight +1); a
+		// Spread overwrites with its resolved legs. Frozen at construction - header identity is
+		// immutable, same invariant as the symbology.
+		std::vector<InstrumentLeg> _legs;
+
 	public:
+		std::span<const InstrumentLeg> Legs() const { return _legs; }
+		// > 1: every instrument is its own single leg (base ctor); legged means legs BEYOND itself.
+		bool IsLegged() const { return _legs.size() > 1; }
+
 		const int32_t InstrumentId;
 		const int32_t TickDecimals;
 
@@ -488,17 +563,25 @@ namespace Data
 		}
 	};
 
-	class Spread final : public Future
+	// A spread is imaginary: economically the position IS its outright legs, so risk, positions
+	// and P&L live on the legs - the spread keeps only its book, its order flow, and a volume
+	// row. NOT a Future: no multiplier of its own (legs carry them), no maturity of its own.
+	class Spread final : public Instrument
 	{
 	private:
 		const Future& _long;
 		const Future& _short;
 
 	public:
-		Spread(int32_t id, Socket::SharedArrayEntry<Data::SpreadHeader> headerEntry, Socket::SharedArrayEntry<MarketByPrice64> mbpEntry, const Future& longFuture, const Future& shortFuture) : Future(id, headerEntry.Cast<Data::FutureHeader>(), mbpEntry), _long(longFuture), _short(shortFuture)
+		Spread(int32_t id, Socket::SharedArrayEntry<Data::LeggedHeader> headerEntry, Socket::SharedArrayEntry<MarketByPrice64> mbpEntry, const Future& longFuture, const Future& shortFuture) : Instrument(id, headerEntry.Cast<Data::InstrumentHeader128>(), mbpEntry), _long(longFuture), _short(shortFuture)
 		{
-			_symbology = SpreadHeader().Symbology();
-			_multiplier = SpreadHeader().Multiplier;
+			_symbology = Legged().Symbology();
+			// Current runtime scope is 2-leg ±1 calendars; wider weights are out of scope and
+			// must fail loudly at construction, not misprice risk quietly.
+			for (const Data::LegHeader& legHeader : Legged().Legs())
+				if (legHeader.Weight != 1 && legHeader.Weight != -1)
+					throw std::invalid_argument("Spread: only ±1 leg weights are supported.");
+			_legs = { Data::InstrumentLeg{ longFuture.InstrumentId, 1 }, Data::InstrumentLeg{ shortFuture.InstrumentId, -1 } };
 		}
 
 		Data::MaturityType LongMaturityType() const
@@ -531,9 +614,9 @@ namespace Data
 			return _short;
 		}
 
-		const Data::SpreadHeader& SpreadHeader() const
+		const Data::LeggedHeader& Legged() const
 		{
-			return _headerEntry.GetReadonlyRef().AsSpread();
+			return _headerEntry.GetReadonlyRef().AsLegged();
 		}
 	};
 }
