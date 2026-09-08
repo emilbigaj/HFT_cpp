@@ -12,3 +12,6 @@ Telegram.json
 # Stray runtime artifacts
 _clientId
 _sharedArrays.Count
+
+# Core dumps
+core-*
