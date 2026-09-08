@@ -39,18 +39,6 @@ static bool IsStringNullOrWhiteSpace(const std::string& str)
 	return true;
 }
 
-[[maybe_unused]] static std::string TrimString(const std::string& text)
-{
-	std::size_t first = text.find_first_not_of(" \t\n\r");
-	
-	if (first == std::string::npos)
-		return "";
-
-	std::size_t last = text.find_last_not_of(" \t\n\r");
-	
-	return text.substr(first, (last - first + 1));
-}
-
 static std::string InstrumentTypeToString(InstrumentType type)
 {
 	switch (type)
@@ -180,13 +168,6 @@ public:
 		return _symbol;
 	}
 
-protected:
-	// Token is a bare date, "2025-12-15", parsed blindly: anything else - a legacy maturity-type
-	// letter included - fails the date parse loudly on its own. No tolerance, migrate the catalog.
-	static Tools::Timestamp ParseMaturityToken(const std::string& token)
-	{
-		return Tools::Timestamp::FromString(token, "%Y-%m-%d");
-	}
 };
 
 class FutureSymbology : public Symbology
@@ -227,58 +208,35 @@ protected:
 	// Weight rendered as the leg-token sign: "+", "-", "+2"; negative weights carry their own '-'.
 	static std::string GetSignedWeight(int32_t weight)
 	{
-		if (weight == 1) return "+";
-		if (weight == -1) return "-";
-		if (weight > 1) return "+" + std::to_string(weight);
-		return std::to_string(weight); // 0 renders as "0"
+		return weight == 1 ? "+" : weight == -1 ? "-" : weight > 1 ? "+" + std::to_string(weight) : std::to_string(weight);
 	}
 
 	static std::string GetLegsTicker(const std::string& root, const std::vector<SymbolLeg>& legs)
 	{
 		std::string result = root + " ";
 		for (size_t i = 0; i < legs.size(); i++)
+			result += GetSignedWeight(legs[i].Weight) + legs[i].Symbol + (i + 1 < legs.size() ? " " : "");
+		return result;
+	}
+
+	// C#'s l.Ticker.Replace(l.Root + " ", ""): leg tokens carry only sign+maturity.
+	static std::vector<SymbolLeg> ToLegs(const std::vector<std::unique_ptr<Symbology>>& symbologies, const std::vector<int32_t>& weights, bool shortForm)
+	{
+		std::vector<SymbolLeg> legs;
+		for (size_t i = 0; i < symbologies.size(); i++)
 		{
-			result += GetSignedWeight(legs[i].Weight) + legs[i].Symbol;
-			if (i + 1 < legs.size())
-				result += " ";
+			std::string text = shortForm ? symbologies[i]->ShortSymbol() : symbologies[i]->Ticker();
+			text.erase(text.find(symbologies[i]->Root() + " "), symbologies[i]->Root().length() + 1);
+			legs.push_back({ text, weights[i] });
 		}
-		return result;
-	}
-
-	// C#'s l.Ticker.Replace(l.Root + " ", ""): strip the leg's own root prefix from a leg string.
-	static std::string StripRoot(const std::string& text, const std::string& root)
-	{
-		std::string prefix = root + " ";
-		std::string result = text;
-		size_t pos;
-		while ((pos = result.find(prefix)) != std::string::npos)
-			result.erase(pos, prefix.length());
-		return result;
-	}
-
-	static std::vector<SymbolLeg> TickerLegs(const std::vector<std::unique_ptr<Symbology>>& symbologies, const std::vector<int32_t>& weights)
-	{
-		std::vector<SymbolLeg> legs;
-		legs.reserve(symbologies.size());
-		for (size_t i = 0; i < symbologies.size(); i++)
-			legs.push_back({ StripRoot(symbologies[i]->Ticker(), symbologies[i]->Root()), weights[i] });
-		return legs;
-	}
-
-	static std::vector<SymbolLeg> ShortSymbolLegs(const std::vector<std::unique_ptr<Symbology>>& symbologies, const std::vector<int32_t>& weights)
-	{
-		std::vector<SymbolLeg> legs;
-		legs.reserve(symbologies.size());
-		for (size_t i = 0; i < symbologies.size(); i++)
-			legs.push_back({ StripRoot(symbologies[i]->ShortSymbol(), symbologies[i]->Root()), weights[i] });
 		return legs;
 	}
 
 public:
 	LeggedSymbology(Data::InstrumentType instrumentType, const std::string& exchange, const std::string& root, std::vector<std::unique_ptr<Symbology>> symbologies, std::vector<int32_t> weights)
-	: Symbology(instrumentType, exchange, root, GetLegsTicker(root, TickerLegs(symbologies, weights)))
+	: Symbology(instrumentType, exchange, root, GetLegsTicker(root, ToLegs(symbologies, weights, false)))
 	{
-		_shortSymbol = GetLegsTicker(root, ShortSymbolLegs(symbologies, weights));
+		_shortSymbol = GetLegsTicker(root, ToLegs(symbologies, weights, true));
 		_symbologies = std::move(symbologies);
 		_weights = std::move(weights);
 	}
@@ -323,40 +281,30 @@ inline std::unique_ptr<Symbology> Symbology::FromString(const std::string& symbo
 
 	if (instrumentType == Data::InstrumentType::Future)
 	{
-		return std::make_unique<FutureSymbology>(exchange, root, ParseMaturityToken(remainder));
+		return std::make_unique<FutureSymbology>(exchange, root, Tools::Timestamp::FromString(remainder, "%Y-%m-%d"));
 	}
 	else if (instrumentType == Data::InstrumentType::Spread)
 	{
-		// Signed leg tokens "±[n]<Date>": root appears once, legs maturity-ascending.
+		// Signed leg tokens "±[n]<Date>": root appears once, legs maturity-ascending. Parsed
+		// blindly assuming the format is correct - the ISO date is the fixed-width (10) END of
+		// the token, the digits between the sign and the date are the optional weight magnitude
+		// ("+22026-07-31" = weight 2); anything malformed throws on its own.
 		std::vector<std::unique_ptr<Symbology>> symbologies;
 		std::vector<int32_t> weights;
 		std::size_t tokenStart = 0;
 		while (tokenStart < remainder.length())
 		{
-			std::size_t tokenEnd = remainder.find(' ', tokenStart);
-			if (tokenEnd == std::string::npos) tokenEnd = remainder.length();
+			std::size_t tokenEnd = std::min(remainder.find(' ', tokenStart), remainder.length());
 			std::string legToken = remainder.substr(tokenStart, tokenEnd - tokenStart);
 			tokenStart = tokenEnd + 1;
 			if (legToken.empty()) continue;
 
-			int32_t sign = legToken[0] == '+' ? 1 : legToken[0] == '-' ? -1 : throw std::invalid_argument("Spread leg \"" + legToken + "\" must start with '+' or '-'.");
-
-			// The ISO date is fixed-width (10) at the token's END; the digits between the sign
-			// and the date are the optional weight magnitude ("+22026-07-31" = weight 2).
-			// Fixed-width is what keeps the grammar unambiguous with no maturity letter
-			// separating magnitude from date - a left-to-right digit scan eats the year as the
-			// weight (this bug shipped in C# and was caught).
-			if (legToken.length() < 11)
-				throw std::invalid_argument("Spread leg \"" + legToken + "\" must end with a yyyy-MM-dd date.");
-			std::string dateText = legToken.substr(legToken.length() - 10);
+			int32_t sign = legToken[0] == '-' ? -1 : 1;
 			int32_t magnitude = 0;
-			for (size_t index = 1; index < legToken.length() - 10; index++)
-			{
-				if (legToken[index] >= '0' && legToken[index] <= '9')
-					magnitude = magnitude * 10 + (legToken[index] - '0');
-			}
+			for (int32_t index = 1; index < static_cast<int32_t>(legToken.length()) - 10; index++)
+				magnitude = magnitude * 10 + (legToken[static_cast<size_t>(index)] - '0');
 
-			symbologies.push_back(std::make_unique<FutureSymbology>(exchange, root, ParseMaturityToken(dateText)));
+			symbologies.push_back(std::make_unique<FutureSymbology>(exchange, root, Tools::Timestamp::FromString(legToken.substr(legToken.length() - 10), "%Y-%m-%d")));
 			weights.push_back(sign * std::max(magnitude, 1));
 		}
 		return std::make_unique<SpreadSymbology>(exchange, root, std::move(symbologies), std::move(weights));
