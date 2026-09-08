@@ -10,14 +10,9 @@
 namespace Data
 {
 
-enum MaturityType : char
-{
-	Day = 'D',
-	Week = 'W',
-	Month = 'M',
-	Quarter = 'Q',
-	Year = 'Y'
-};
+// MaturityType is DELETED (C# 2026-09-08): the type letter in symbols broke lexical-order ==
+// maturity-order (every M-file sorted before any Q-file), and MaturityDate alone identifies a
+// contract - verified against all 187,087 catalog files with zero collisions.
 
 enum class InstrumentType : uint8_t
 {
@@ -103,8 +98,8 @@ static InstrumentType ParseInstrumentType(const std::string& text)
 	throw std::invalid_argument("Invalid InstrumentType");
 }
 
-// Abbreviated "<Mon> <Year>" for a contract maturity, e.g. "Jun 2025". Locale-free (fixed table)
-// so it matches the C# ShortSymbol exactly (CultureInfo.InvariantCulture abbreviated month).
+// Abbreviated "<Mon><yy>" for a contract maturity, e.g. "Jun25". Locale-free (fixed table) so it
+// matches the C# ShortSymbol exactly (InvariantCulture abbreviated month + Year % 100).
 static std::string ShortMonthYear(Tools::Timestamp date)
 {
 	using namespace std::chrono;
@@ -112,7 +107,7 @@ static std::string ShortMonthYear(Tools::Timestamp date)
 	static constexpr const char* kMonths[] = { "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
 	unsigned month = static_cast<unsigned>(ymd.month());
 	int year = static_cast<int>(ymd.year());
-	return std::string(kMonths[month - 1]) + " " + std::to_string(year);
+	return std::string(kMonths[month - 1]) + std::to_string(year % 100);
 }
 
 class Symbology
@@ -186,21 +181,20 @@ public:
 	}
 
 protected:
-	static void ParseMaturityToken(const std::string& token, MaturityType& maturityType, Tools::Timestamp& maturityDate)
+	// Token is a bare date, "2025-12-15". A leading legacy maturity-type letter ("M2025-12-15")
+	// is tolerated and ignored until every catalog is migrated to letterless names.
+	static Tools::Timestamp ParseMaturityToken(const std::string& token)
 	{
-		if (IsStringNullOrWhiteSpace(token) || token.length() < 2)
-			throw std::invalid_argument("Maturity token must start with a letter and include a date, e.g., M20251215.");
+		if (IsStringNullOrWhiteSpace(token))
+			throw std::invalid_argument("Maturity token must be a date, e.g., 2025-12-15.");
 
-		char typeChar = token[0];
-		maturityType = static_cast<MaturityType>(typeChar);
-
-		std::string dateText = token.substr(1);
+		std::string dateText = (token[0] >= '0' && token[0] <= '9') ? token : token.substr(1);
 
 		try
 		{
-			maturityDate = Tools::Timestamp::FromString(dateText, "%Y-%m-%d");
+			return Tools::Timestamp::FromString(dateText, "%Y-%m-%d");
 		}
-		catch (const std::exception& ex)
+		catch (const std::exception&)
 		{
 			throw std::invalid_argument("Invalid maturity date: \"" + dateText + "\".");
 		}
@@ -210,26 +204,21 @@ protected:
 class FutureSymbology : public Symbology
 {
 protected:
-	Data::MaturityType _maturityType;
 	Tools::Timestamp _maturityDate;
 
 public:
-	FutureSymbology(const std::string& exchange, const std::string& root, MaturityType maturityType, Tools::Timestamp maturityDate) : FutureSymbology(Data::InstrumentType::Future, exchange, root, root + " " + static_cast<char>(maturityType) + maturityDate.ToDateString(), maturityType, maturityDate)
+	// The ticker leads with the bare ISO date so names sort lexically == chronologically.
+	FutureSymbology(const std::string& exchange, const std::string& root, Tools::Timestamp maturityDate) : FutureSymbology(Data::InstrumentType::Future, exchange, root, root + " " + maturityDate.ToDateString(), maturityDate)
 	{
 	}
 
 protected:
-	FutureSymbology(Data::InstrumentType instrumentType, const std::string& exchange, const std::string& root, const std::string& ticker, MaturityType maturityType, Tools::Timestamp maturityDate) : Symbology(instrumentType, exchange, root, ticker), _maturityType(maturityType), _maturityDate(maturityDate)
+	FutureSymbology(Data::InstrumentType instrumentType, const std::string& exchange, const std::string& root, const std::string& ticker, Tools::Timestamp maturityDate) : Symbology(instrumentType, exchange, root, ticker), _maturityDate(maturityDate)
 	{
 		_shortSymbol = root + " " + ShortMonthYear(maturityDate);
 	}
 
 public:
-	Data::MaturityType MaturityType() const
-	{
-		return _maturityType;
-	}
-
 	Tools::Timestamp MaturityDate() const
 	{
 		return _maturityDate;
@@ -346,16 +335,11 @@ inline std::unique_ptr<Symbology> Symbology::FromString(const std::string& symbo
 
 	if (instrumentType == Data::InstrumentType::Future)
 	{
-		Data::MaturityType maturityType;
-		Tools::Timestamp maturityDate;
-		
-		ParseMaturityToken(remainder, maturityType, maturityDate);
-
-		return std::make_unique<FutureSymbology>(exchange, root, maturityType, maturityDate);
+		return std::make_unique<FutureSymbology>(exchange, root, ParseMaturityToken(remainder));
 	}
 	else if (instrumentType == Data::InstrumentType::Spread)
 	{
-		// Signed leg tokens "±[n]<E><Date>": root appears once, legs maturity-ascending.
+		// Signed leg tokens "±[n]<Date>": root appears once, legs maturity-ascending.
 		std::vector<std::unique_ptr<Symbology>> symbologies;
 		std::vector<int32_t> weights;
 		std::size_t tokenStart = 0;
@@ -368,19 +352,23 @@ inline std::unique_ptr<Symbology> Symbology::FromString(const std::string& symbo
 			if (legToken.empty()) continue;
 
 			int32_t sign = legToken[0] == '+' ? 1 : legToken[0] == '-' ? -1 : throw std::invalid_argument("Spread leg \"" + legToken + "\" must start with '+' or '-'.");
-			size_t index = 1;
+
+			// The ISO date is fixed-width (10) at the token's END; the digits between the sign
+			// and the date are the optional weight magnitude ("+22026-07-31" = weight 2).
+			// Fixed-width is what keeps the grammar unambiguous with no maturity letter
+			// separating magnitude from date - a left-to-right digit scan eats the year as the
+			// weight (this bug shipped in C# and was caught).
+			if (legToken.length() < 11)
+				throw std::invalid_argument("Spread leg \"" + legToken + "\" must end with a yyyy-MM-dd date.");
+			std::string dateText = legToken.substr(legToken.length() - 10);
 			int32_t magnitude = 0;
-			while (index < legToken.length() && legToken[index] >= '0' && legToken[index] <= '9')
+			for (size_t index = 1; index < legToken.length() - 10; index++)
 			{
-				magnitude = magnitude * 10 + (legToken[index] - '0');
-				index++;
+				if (legToken[index] >= '0' && legToken[index] <= '9')
+					magnitude = magnitude * 10 + (legToken[index] - '0');
 			}
 
-			Data::MaturityType maturityType;
-			Tools::Timestamp maturityDate;
-			ParseMaturityToken(legToken.substr(index), maturityType, maturityDate);
-
-			symbologies.push_back(std::make_unique<FutureSymbology>(exchange, root, maturityType, maturityDate));
+			symbologies.push_back(std::make_unique<FutureSymbology>(exchange, root, ParseMaturityToken(dateText)));
 			weights.push_back(sign * std::max(magnitude, 1));
 		}
 		return std::make_unique<SpreadSymbology>(exchange, root, std::move(symbologies), std::move(weights));

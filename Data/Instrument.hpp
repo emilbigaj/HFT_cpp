@@ -119,11 +119,12 @@ namespace Data
 		Data::InstrumentHeader InstrumentHeader;
 		double Multiplier;
 		Tools::Timestamp MaturityDate;
-		Data::MaturityType MaturityType;
+		// MaturityType deleted (was the tail byte after MaturityDate; no other offsets moved):
+		// the date alone identifies a contract, and bare-ISO-date symbols sort chronologically.
 
 		std::unique_ptr<Data::FutureSymbology> Symbology() const
 		{
-			return std::make_unique<Data::FutureSymbology>(InstrumentHeader.Exchange.ToString(), InstrumentHeader.Root.ToString(), MaturityType, MaturityDate);
+			return std::make_unique<Data::FutureSymbology>(InstrumentHeader.Exchange.ToString(), InstrumentHeader.Root.ToString(), MaturityDate);
 		}
 
 		std::string ToString() const
@@ -137,8 +138,7 @@ namespace Data
 			static constexpr auto value = glz::object(
 				"InstrumentHeader", &T::InstrumentHeader,
 				"Multiplier", &T::Multiplier,
-				"MaturityDate", &T::MaturityDate,
-				"MaturityType", &T::MaturityType
+				"MaturityDate", &T::MaturityDate
 			);
 		};
 	};
@@ -522,11 +522,6 @@ namespace Data
 			_multiplier = FutureHeader().Multiplier;
 		}
 
-		Data::MaturityType MaturityType() const
-		{
-			return FutureHeader().MaturityType;
-		}
-
 		Tools::Timestamp MaturityDate() const
 		{
 			return FutureHeader().MaturityDate;
@@ -584,19 +579,9 @@ namespace Data
 			_legs = { Data::InstrumentLeg{ longFuture.InstrumentId, 1 }, Data::InstrumentLeg{ shortFuture.InstrumentId, -1 } };
 		}
 
-		Data::MaturityType LongMaturityType() const
-		{
-			return _long.MaturityType();
-		}
-
 		Tools::Timestamp LongMaturityDate() const
 		{
 			return _long.MaturityDate();
-		}
-
-		Data::MaturityType ShortMaturityType() const
-		{
-			return _short.MaturityType();
 		}
 
 		Tools::Timestamp ShortMaturityDate() const

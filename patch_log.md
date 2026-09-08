@@ -8,6 +8,30 @@ ring protocol rule needs a matching entry there.
 
 ---
 
+## MaturityType is deleted (C# `6d5ef46`, amendment 2026-09-08)
+
+The type letter in symbols broke lexical-order == maturity-order: every `M`-file sorted before any
+`Q`-file, so first-match selectors returned an August monthly when a June quarterly existed.
+`MaturityDate` alone identifies a contract (verified across all 187,087 catalog files, zero
+collisions), so the concept is gone, not worked around.
+
+New formats: future ticker `"ES 2025-12-15"`; spread legs `"+2025-12-15"`, weight magnitude
+between sign and date (`"+22026-07-31"` = weight 2). **Leg-token grammar: the date is the
+fixed-width LAST 10 chars; digits between sign and date are the magnitude** - a left-to-right scan
+eats the year as the weight now that no letter delimits them (shipped in C#, caught). A leading
+legacy letter on a maturity token is skipped, so unmigrated catalogs still load. ShortSymbol is
+now `"ES Dec25"` (month abbreviation + 2-digit year).
+
+Deleted: the enum, `FutureHeader.MaturityType` (tail byte after MaturityDate - no other offsets
+moved; glaze drops the key), `Future::MaturityType()`, `Spread::Long/ShortMaturityType()`.
+Round-trips verified: future, calendar, weighted butterfly, legacy-letter input.
+
+**Deploy note:** symbol-named state on the live server (`.position`/`.risklimit`/`.fill` files)
+must be renamed at deploy with the C# migration regexes: token `[DWMQY](?=\d{4}-\d{2}-\d{2})` -> ""
+in names and contents, and the JSON line `"MaturityType": ...` removed. Collision-check first.
+
+---
+
 ## The spread vertical (C# `2e1ddfa` / report 2026-09-08)
 
 A spread is imaginary: risk, positions and P&L live on the outright legs; the spread instrument
