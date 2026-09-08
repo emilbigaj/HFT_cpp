@@ -181,23 +181,11 @@ public:
 	}
 
 protected:
-	// Token is a bare date, "2025-12-15". A leading legacy maturity-type letter ("M2025-12-15")
-	// is tolerated and ignored until every catalog is migrated to letterless names.
+	// Token is a bare date, "2025-12-15", parsed blindly: anything else - a legacy maturity-type
+	// letter included - fails the date parse loudly on its own. No tolerance, migrate the catalog.
 	static Tools::Timestamp ParseMaturityToken(const std::string& token)
 	{
-		if (IsStringNullOrWhiteSpace(token))
-			throw std::invalid_argument("Maturity token must be a date, e.g., 2025-12-15.");
-
-		std::string dateText = (token[0] >= '0' && token[0] <= '9') ? token : token.substr(1);
-
-		try
-		{
-			return Tools::Timestamp::FromString(dateText, "%Y-%m-%d");
-		}
-		catch (const std::exception&)
-		{
-			throw std::invalid_argument("Invalid maturity date: \"" + dateText + "\".");
-		}
+		return Tools::Timestamp::FromString(token, "%Y-%m-%d");
 	}
 };
 

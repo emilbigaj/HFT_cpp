@@ -18,9 +18,11 @@ collisions), so the concept is gone, not worked around.
 New formats: future ticker `"ES 2025-12-15"`; spread legs `"+2025-12-15"`, weight magnitude
 between sign and date (`"+22026-07-31"` = weight 2). **Leg-token grammar: the date is the
 fixed-width LAST 10 chars; digits between sign and date are the magnitude** - a left-to-right scan
-eats the year as the weight now that no letter delimits them (shipped in C#, caught). A leading
-legacy letter on a maturity token is skipped, so unmigrated catalogs still load. ShortSymbol is
-now `"ES Dec25"` (month abbreviation + 2-digit year).
+eats the year as the weight now that no letter delimits them (shipped in C#, caught). NO legacy
+tolerance here (divergence from C#, deliberate): a maturity token is parsed blindly as a date, so
+a lettered future token fails loudly in Timestamp::FromString - migrate the catalog, don't limp.
+(A lettered SPREAD leg still parses on both sides: the fixed-width grammar drops the letter into
+the ignored magnitude zone - structural, identical to C#.) ShortSymbol is now `"ES Dec25"`.
 
 Deleted: the enum, `FutureHeader.MaturityType` (tail byte after MaturityDate - no other offsets
 moved; glaze drops the key), `Future::MaturityType()`, `Spread::Long/ShortMaturityType()`.
