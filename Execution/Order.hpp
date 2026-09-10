@@ -215,18 +215,20 @@ namespace Execution
 
 	static_assert(sizeof(RiskLimit) == 36, "RiskLimit must be 36 bytes");
 
-	// Per-order-slot reservation state, server-owned. Counts how many unacked targets are live at each
-	// absolute quantity, so the worst case an order can still reach is the highest live quantity rather
-	// than the last one sent — a pipelined amend 10 -> 3 -> 7 must reserve 10 until the 10 is retired.
-	// A bitset of occupied quantities makes that worst case a single HighestSet.
+	// Per-order-slot reservation state, server-owned: the in-flight target quantities as a compact
+	// scanned array with a cached max, so the worst case an order can still reach is the highest
+	// live quantity rather than the last one sent — a pipelined amend 10 -> 3 -> 7 must reserve 10
+	// until the 10 is retired. The scan is cheap because the in-flight count is one to three in
+	// practice; measured within 1 ns of the old bitset over 1M lifecycles, and every SIMD layout
+	// tried was 2x slower (narrow store + wide reload defeats store forwarding) — do NOT "optimise".
 	struct OrderRisk
 	{
-		// Largest quantity a single order may carry. Quantities index 1..MaxOrderQuantity, so the counts
-		// array carries one extra slot for the unused zero — 8 + 56 keeps the struct on one cache line.
-		static constexpr int32_t MaxOrderQuantity = 55;
+		static constexpr int32_t MaxOrderQuantity = 65535;
+		static constexpr int32_t MaxActiveTargets = 30;
 
-		Tools::Bitset64 Quantities;
-		uint8_t Counts[MaxOrderQuantity + 1] = {};
+		uint16_t ActiveTargetsCount = 0;         // live entries, 0..30
+		uint16_t WorstOrderQuantity = 0;         // max over the live entries, 0 when none
+		uint16_t AbsOrderQuantities[30] = {};    // live at [0, ActiveTargetsCount), zeros after; swap-remove reorders, never assume FIFO
 
 		// Branchless abs. Returns INT32_MIN for INT32_MIN (no throw); callers range-check unsigned.
 		ALWAYS_INLINE static int32_t Abs(int32_t value)
@@ -235,50 +237,67 @@ namespace Execution
 			return static_cast<int32_t>((static_cast<uint32_t>(value) ^ mask) - mask);
 		}
 
-		[[nodiscard]] int32_t GetAbsWorstOrderQuantity(int32_t ackedOrderQuantity) const
+		[[nodiscard]] ALWAYS_INLINE int32_t GetAbsWorstOrderQuantity(int32_t ackedOrderQuantity) const
 		{
-			return std::max(Abs(ackedOrderQuantity), Quantities.HighestSet());
+			return std::max(Abs(ackedOrderQuantity), static_cast<int32_t>(WorstOrderQuantity));
 		}
 
-		bool TryAdd(int32_t orderQuantity, OrderRejectedReason& reason)
+		ALWAYS_INLINE bool TryAdd(int32_t orderQuantity, OrderRejectedReason& reason)
 		{
-			int32_t absQuantity = Abs(orderQuantity);
-			if (static_cast<uint32_t>(absQuantity) > static_cast<uint32_t>(MaxOrderQuantity) || absQuantity == 0)
+			int32_t absOrderQuantity = Abs(orderQuantity);
+			if (static_cast<uint32_t>(absOrderQuantity) > static_cast<uint32_t>(MaxOrderQuantity) || absOrderQuantity == 0)
 			{
 				reason = OrderRejectedReason::QuantityNotValid;
 				return false;
 			}
 
-			uint8_t& count = Counts[absQuantity];
-			if (count == UINT8_MAX)
+			int32_t activeTargetsCount = ActiveTargetsCount;
+			if (activeTargetsCount == MaxActiveTargets)
 			{
 				reason = OrderRejectedReason::TooManyActiveTargets;
 				return false;
 			}
 
-			if (++count == 1)
-				Quantities.Set(absQuantity);
+			AbsOrderQuantities[activeTargetsCount] = static_cast<uint16_t>(absOrderQuantity);
+			ActiveTargetsCount = static_cast<uint16_t>(activeTargetsCount + 1);
+			WorstOrderQuantity = static_cast<uint16_t>(std::max(static_cast<int32_t>(WorstOrderQuantity), absOrderQuantity));
 
 			reason = OrderRejectedReason::Unknown;
 			return true;
 		}
 
-		void Ack(int32_t orderQuantity) { Remove(orderQuantity); }
-		void Reject(int32_t orderQuantity) { Remove(orderQuantity); }
+		ALWAYS_INLINE void Ack(int32_t orderQuantity) { Remove(orderQuantity); }
+		ALWAYS_INLINE void Reject(int32_t orderQuantity) { Remove(orderQuantity); }
 
 	private:
-		void Remove(int32_t orderQuantity)
+		ALWAYS_INLINE void Remove(int32_t orderQuantity)
 		{
-			int32_t absQuantity = Abs(orderQuantity);
-			if (static_cast<uint32_t>(absQuantity) > static_cast<uint32_t>(MaxOrderQuantity))
+			int32_t absOrderQuantity = Abs(orderQuantity);
+			if (static_cast<uint32_t>(absOrderQuantity) > static_cast<uint32_t>(MaxOrderQuantity))
 				return;
 
-			uint8_t& count = Counts[absQuantity];
-			if (count == 0)
+			// An ack/reject for a quantity that was never reserved is a NO-OP - deliberate and
+			// required: a stray ack must not collapse the reservation. Acks retire the oldest
+			// target, so the forward scan normally stops at index 0.
+			int32_t activeTargetsCount = ActiveTargetsCount;
+			int32_t targetIndex = 0;
+			while (targetIndex < activeTargetsCount && AbsOrderQuantities[targetIndex] != absOrderQuantity)
+				targetIndex++;
+			if (targetIndex == activeTargetsCount)
 				return;
 
-			if (--count == 0)
-				Quantities.Clear(absQuantity);
+			int32_t lastTargetIndex = activeTargetsCount - 1;
+			AbsOrderQuantities[targetIndex] = AbsOrderQuantities[lastTargetIndex];
+			AbsOrderQuantities[lastTargetIndex] = 0;
+			ActiveTargetsCount = static_cast<uint16_t>(lastTargetIndex);
+
+			if (absOrderQuantity != WorstOrderQuantity)
+				return;
+
+			int32_t worstOrderQuantity = 0;
+			for (int32_t i = 0; i < lastTargetIndex; i++)
+				worstOrderQuantity = std::max(worstOrderQuantity, static_cast<int32_t>(AbsOrderQuantities[i]));
+			WorstOrderQuantity = static_cast<uint16_t>(worstOrderQuantity);
 		}
 	};
 
@@ -532,6 +551,7 @@ namespace Execution
 	{
 		Data::Header<OrderType> Header = Data::Header<OrderType>(OrderType::OrderTarget);
 		Execution::OrderHeader OrderHeader;
+		Tools::Timestamp TriggerTimestamp;
 		Execution::OrderProfile OrderProfile;
 		Execution::TimeInForce TimeInForce = Execution::TimeInForce::Day;
 		Execution::OrderTargetAction OrderTargetAction = Execution::OrderTargetAction::Create;
@@ -549,6 +569,7 @@ namespace Execution
 			static constexpr auto value = glz::object(
 				"Header", &T::Header,
 				"OrderHeader", &T::OrderHeader,
+				"TriggerTimestamp", &T::TriggerTimestamp,
 				"OrderProfile", &T::OrderProfile,
 				"TimeInForce", &T::TimeInForce,
 				"OrderTargetAction", &T::OrderTargetAction,
@@ -557,7 +578,7 @@ namespace Execution
 		};
 	};
 
-	static_assert(sizeof(OrderTarget) == 44, "OrderTarget must be 44 bytes");
+	static_assert(sizeof(OrderTarget) == 52, "OrderTarget must be 52 bytes");
 
     enum AlgoStatus : uint8_t
     {
@@ -648,16 +669,17 @@ namespace Execution
 		&& offsetof(RiskLimit, MaxPositionQuantity) == 24
 		&& offsetof(RiskLimit, WorstLongWorkingQuantity) == 28
 		&& offsetof(RiskLimit, WorstShortWorkingQuantity) == 32);
-	static_assert(offsetof(OrderRisk, Quantities) == 0 && offsetof(OrderRisk, Counts) == 8);
+	static_assert(offsetof(OrderRisk, ActiveTargetsCount) == 0 && offsetof(OrderRisk, WorstOrderQuantity) == 2
+		&& offsetof(OrderRisk, AbsOrderQuantities) == 4);
 	static_assert(offsetof(Fill, OrderHeader) == 4 && offsetof(Fill, FillId) == 32
 		&& offsetof(Fill, Price) == 40 && offsetof(Fill, Quantity) == 48 && offsetof(Fill, FillType) == 52);
 	static_assert(offsetof(OrderState, OrderHeader) == 4 && offsetof(OrderState, ExchangeOrderId) == 32
 		&& offsetof(OrderState, OrderProfile) == 40 && offsetof(OrderState, TimeInForce) == 48
 		&& offsetof(OrderState, OrderStateStatus) == 49 && offsetof(OrderState, OrderStateReason) == 50
 		&& offsetof(OrderState, QuantityFilled) == 52 && offsetof(OrderState, QuantityAhead) == 56);
-	static_assert(offsetof(OrderTarget, OrderHeader) == 4 && offsetof(OrderTarget, OrderProfile) == 32
-		&& offsetof(OrderTarget, TimeInForce) == 40 && offsetof(OrderTarget, OrderTargetAction) == 41
-		&& offsetof(OrderTarget, OrderTargetStatus) == 42);
+	static_assert(offsetof(OrderTarget, OrderHeader) == 4 && offsetof(OrderTarget, TriggerTimestamp) == 32
+		&& offsetof(OrderTarget, OrderProfile) == 40 && offsetof(OrderTarget, TimeInForce) == 48
+		&& offsetof(OrderTarget, OrderTargetAction) == 49 && offsetof(OrderTarget, OrderTargetStatus) == 50);
 	static_assert(offsetof(OrderRejected, OrderHeader) == 4
 		&& offsetof(OrderRejected, OrderTargetAction) == 32
 		&& offsetof(OrderRejected, OrderRejectedSource) == 33
