@@ -241,6 +241,12 @@ public:
                     Trade(trade);
                 break;
             }
+            case static_cast<uint8_t>(Data::TickType::TradingStatus):
+            {
+                const Data::TradingStatusUpdate& tradingStatusUpdate = *reinterpret_cast<const Data::TradingStatusUpdate*>(bytes.data());
+                ClientContext.GetInstrument(instrumentId).OnTradingStatusUpdate(tradingStatusUpdate);
+                break;
+            }
             default:
                 break; // ignore market-data frames this client doesn't consume (e.g. settlements)
         }

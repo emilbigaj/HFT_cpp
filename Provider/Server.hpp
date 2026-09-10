@@ -694,6 +694,18 @@ public:
         WriteToInstrumentData(trade);
     }
 
+    // The lib primitive for CME SecurityStatus / secdef tag 1682 / snapshot status: the vendor
+    // layer folds all three sources to this one call. The header byte store is the field's only
+    // writer after load (no seq bump needed); the ring write is NOT thread-safe - call this on
+    // the thread that already writes this instrument's ring, and emit on transitions only.
+    void OnTradingStatusUpdate(const Data::TradingStatusUpdate& tradingStatusUpdate)
+    {
+        int32_t instrumentHeaderId = _serverContext.GetInstrumentHeaderIdByInstrumentId(tradingStatusUpdate.TickHeader.InstrumentId).GetReadonlyRef();
+        Data::InstrumentHeader128& instrumentHeader = _serverContext.GetInstrumentHeader(instrumentHeaderId).GetRef();
+        instrumentHeader.AsInstrumentHeader().TradingStatus = tradingStatusUpdate.TradingStatus;
+        WriteToInstrumentData(tradingStatusUpdate);
+    }
+
     // Opens (once) the per-instrument broadcast ring this server writes market data to.
     void OpenInstrumentData(int32_t instrumentId, const std::string& symbol)
     {

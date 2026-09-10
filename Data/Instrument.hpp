@@ -36,17 +36,7 @@ namespace Data
 
 	static_assert(sizeof(Header<InstrumentType>) == 4);
 
-	// Coarse trading-session state, folded down from CME MDP 3.0 SecurityTradingStatus (tag 326).
-	// JSON/glaze reflection is automatic via the generic glz::meta<T> enum specialization in Json.hpp
-	// (serialized by name, e.g. "Open"), so no per-enum glaze block is required.
-	enum class TradingStatus : uint8_t
-	{
-		Unknown = 0,   // uninitialized, CME UnknownorInvalid(20) / NoValue(255)
-		Open,          // ReadyToTrade(17)
-		Closed,        // Close(4), NotAvailableForTrading(18), PostClose(26)
-		Auction,       // PreOpen(21), NewPriceIndication(15), PreCross(24), Cross(25)
-		Halted,        // TradingHalt(2)
-	};
+	// TradingStatus lives in Tick.hpp now (it rides the instrument data ring as a tick).
 
 	struct InstrumentHeader
 	{
@@ -86,6 +76,10 @@ namespace Data
 	};
 
 	static_assert(sizeof(InstrumentHeader) == 64, "InstrumentHeader size must be 64 bytes");
+	// TradingStatus is the runtime-updated byte at offset 6 (Header 4 | InstrumentType | CoreGroupId),
+	// verified against C# field order - the 09-10 report's "offset 7" counts from 1. The reserved
+	// byte at 7 is where HaltReason goes when it is carried, with no size change.
+	static_assert(offsetof(InstrumentHeader, TradingStatus) == 6);
 
 	struct ForexHeader
 	{
@@ -347,6 +341,26 @@ namespace Data
 		std::span<const InstrumentLeg> Legs() const { return _legs; }
 		// > 1: every instrument is its own single leg (base ctor); legged means legs BEYOND itself.
 		bool IsLegged() const { return _legs.size() > 1; }
+
+		// Raised on TRANSITIONS only. The duplicate filter compares against this private mirror,
+		// NOT the header row: the server writes the row before the tick reaches the ring, so a
+		// row-based guard never fires. Header().TradingStatus stays the any-time read.
+		std::function<void(const Data::TradingStatusUpdate&)> TradingStatusUpdateEvent;
+
+		void OnTradingStatusUpdate(const Data::TradingStatusUpdate& tradingStatusUpdate)
+		{
+			if (_tradingStatus != tradingStatusUpdate.TradingStatus)
+			{
+				_tradingStatus = tradingStatusUpdate.TradingStatus;
+				if (TradingStatusUpdateEvent)
+					TradingStatusUpdateEvent(tradingStatusUpdate);
+			}
+		}
+
+	private:
+		Data::TradingStatus _tradingStatus = Data::TradingStatus::Unknown;
+
+	public:
 
 		const int32_t InstrumentId;
 		const int32_t TickDecimals;

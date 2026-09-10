@@ -32,6 +32,21 @@ namespace Data
         MarketByPricePartialUpdate = 5,
         MarketByPriceDelta = 6,
         Settlement = 7,
+        // 20, not 13: the audit's first-byte switch spans OrderType 10..16, so a tick that is
+        // ever audited must not collide. (C# also holds 8..12 for MarketByOrder.)
+        TradingStatus = 20,
+	};
+
+	// Coarse trading-session state, folded down from CME MDP 3.0 SecurityTradingStatus (tag 326).
+	// JSON/glaze reflection is automatic via the generic glz::meta<T> enum specialization in
+	// Json.hpp (serialized by name, e.g. "Open"), so no per-enum glaze block is required.
+	enum class TradingStatus : uint8_t
+	{
+		Unknown = 0,   // uninitialized, CME UnknownorInvalid(20) / NoValue(255)
+		Open,          // ReadyToTrade(17)
+		Closed,        // Close(4), NotAvailableForTrading(18), PostClose(26)
+		Auction,       // PreOpen(21), NewPriceIndication(15), PreCross(24), Cross(25)
+		Halted,        // TradingHalt(2)
 	};
 #pragma pack(push, 1)
 
@@ -145,8 +160,48 @@ namespace Data
 	};
 	
 	static_assert(Tools::PlainOldData<Trade>);
-	
-	/// <summary>   
+
+	// Trading-status transition for one instrument, broadcast on its data ring. The convenience
+	// ctor stamps ONE timestamp into all three header clocks - that is the simulator's shortcut,
+	// not the contract: the live path fills exchange/sending/NIC from the SecurityStatus message.
+	struct TradingStatusUpdate
+	{
+		Data::TickHeader TickHeader;
+		Data::TradingStatus TradingStatus;
+		uint8_t _pad[64 - sizeof(Data::TickHeader) - sizeof(Data::TradingStatus)] = {};
+
+		TradingStatusUpdate() = default;
+
+		TradingStatusUpdate(int32_t instrumentId, Tools::Timestamp timestamp, Data::TradingStatus tradingStatus)
+		{
+			TickHeader.TickType = Data::TickType::TradingStatus;
+			TickHeader.InstrumentId = instrumentId;
+			TickHeader.ExchangeTimestamp = timestamp;
+			TickHeader.SendingTimestamp = timestamp;
+			TickHeader.NicTimestamp = timestamp;
+			TradingStatus = tradingStatus;
+		}
+
+		std::string ToString() const
+		{
+			return Tools::Json::Serialize(*this);
+		}
+
+		struct glaze
+		{
+			using T = TradingStatusUpdate;
+			static constexpr auto value = glz::object(
+				"TickHeader", &T::TickHeader,
+				"TradingStatus", &T::TradingStatus
+			);
+		};
+	};
+
+	static_assert(Tools::PlainOldData<TradingStatusUpdate>);
+	static_assert(sizeof(TradingStatusUpdate) == 64, "TradingStatusUpdate must be 64 bytes");
+	static_assert(offsetof(TradingStatusUpdate, TradingStatus) == 32);
+
+	/// <summary>
 	/// Market-by-Price wire message: header + counts + trailing Level arrays (bids then asks).
 	/// Layout:
 	/// [ TickHeader | BidsCount:int32_t | AsksCount:int32_t | bids[0..BidsCount-1] | asks[0..AsksCount-1] ]

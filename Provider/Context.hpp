@@ -210,12 +210,18 @@ protected:
 		_positions.resize(static_cast<size_t>(ServerHeader().GetReadonlyRef().InstrumentIds.Length()));
 
 		// A legged header's symbology resolves its legs through sibling headers; hook it up to this
-		// context's header array (matches C# LeggedHeader.GetLegHeader). Static: every context
-		// reads the same server-owned array, so last-writer-wins is harmless.
-		Data::LeggedHeader::GetLegHeader = [this](int32_t instrumentHeaderId)
+		// context's header array (matches C# LeggedHeader.GetLegHeader). SET ONCE: std::function
+		// assignment is not atomic, so a context built at runtime (a GUI attaching mid-session)
+		// must not rebind the hook while another thread is calling it. Every context reads the
+		// same server-owned array, so first-writer-wins is as good - and it pins the capture to
+		// the longest-lived context (the first one built).
+		if (!Data::LeggedHeader::GetLegHeader)
 		{
-			return _instrumentHeaders[instrumentHeaderId].GetReadonlyRef();
-		};
+			Data::LeggedHeader::GetLegHeader = [this](int32_t instrumentHeaderId)
+			{
+				return _instrumentHeaders[instrumentHeaderId].GetReadonlyRef();
+			};
+		}
 	}
 
 	void EnsureConnected()
