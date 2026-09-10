@@ -693,6 +693,13 @@ public:
 			return;
 		}
 
+		// Already allocated: the live row is fresher than its file and may be mid-fill on the
+		// CoreGroup thread - initialise once. Without this, the strategy-0 union rule re-ran the
+		// whole body on every other client's allocation of the same instrument, re-reading the
+		// position file and rewriting a live row (forcing Paused) from the admin thread.
+		if (GetInstrumentIdsByClientId(clientId).GetReadonlyRef()[instrumentId])
+			return;
+
 		Data::InstrumentHeader128& header128 = GetInstrumentHeader(instrumentHeaderId).GetRef();
 		std::unique_ptr<Data::Symbology> symbology = header128.Symbology();
 

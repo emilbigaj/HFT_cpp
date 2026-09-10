@@ -18,8 +18,22 @@ namespace Provider
 
 	enum class ControlType : uint8_t
 	{
-		AlgoStatus = 200
+		AlgoStatus = 200,
+		RiskLimit = 201,
 	};
+}
+
+// ControlType's values (200, 201) sit outside magic_enum's default [-128, 128) reflection range;
+// without this the glaze enum meta sees an empty enumerator list and serialization fails to compile.
+template <>
+struct magic_enum::customize::enum_range<Provider::ControlType>
+{
+	static constexpr int min = 0;
+	static constexpr int max = 255;
+};
+
+namespace Provider
+{
 	
 #pragma pack(push, 1)
 	struct AllocateClient final
@@ -85,6 +99,38 @@ namespace Provider
 		Execution::AlgoStatus AlgoStatus = Execution::AlgoStatus::Paused;
 	};
 	static_assert(Tools::PlainOldData<ControlAlgoStatus>);
+	static_assert(sizeof(ControlAlgoStatus) == 17, "ControlAlgoStatus must be 17 bytes");
+
+	// Operator request to change an instrument's risk limits. Sent on the instrument's CoreGroup
+	// EXECUTION channel (not admin), so the CoreGroup thread - the RiskLimit row's sole writer -
+	// applies it. A client never sends a RiskLimit row; the request carries only the two maxima.
+	struct ControlRiskLimit final
+	{
+		Data::Header<ControlType> Header = Data::Header<ControlType>(ControlType::RiskLimit);
+		int32_t ClientId = -1;
+		int32_t InstrumentId = -1;
+		int32_t MaxOrderQuantity = 0;
+		int32_t MaxPositionQuantity = 0;
+
+		std::string ToString() const
+		{
+			return Tools::Json::Serialize(*this);
+		}
+
+		struct glaze
+		{
+			using T = ControlRiskLimit;
+			static constexpr auto value = glz::object(
+				"Header", &T::Header,
+				"ClientId", &T::ClientId,
+				"InstrumentId", &T::InstrumentId,
+				"MaxOrderQuantity", &T::MaxOrderQuantity,
+				"MaxPositionQuantity", &T::MaxPositionQuantity
+			);
+		};
+	};
+	static_assert(Tools::PlainOldData<ControlRiskLimit>);
+	static_assert(sizeof(ControlRiskLimit) == 20, "ControlRiskLimit must be 20 bytes");
 
 	struct ServerHeader final
 	{

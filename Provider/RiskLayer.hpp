@@ -273,6 +273,8 @@ public:
             }
             else
             {
+                bool isAmend = orderTarget.OrderTargetAction == Execution::OrderTargetAction::Amend;
+
                 if (_orderRejectedSource == Execution::OrderRejectedSource::Server)
                 {
                     orderRejectedReasons = ValidateOrderHeader(orderState.OrderHeader, orderTarget.OrderHeader);
@@ -284,7 +286,7 @@ public:
                     if (orderState.OrderStateStatus == Execution::OrderStateStatus::Done)
                         orderRejectedReasons.Set(static_cast<int32_t>(Execution::OrderRejectedReason::StateIsDone));
 
-                    if (orderState.OrderHeader.Seq + 1 == orderTarget.OrderHeader.Seq && orderState.OrderProfile == orderTarget.OrderProfile)
+                    if (isAmend && orderState.OrderHeader.Seq + 1 == orderTarget.OrderHeader.Seq && orderState.OrderProfile == orderTarget.OrderProfile)
                         orderRejectedReasons.Set(static_cast<int32_t>(Execution::OrderRejectedReason::TargetIsActive));
 
                     if (existingTarget.OrderHeader.Seq > orderTarget.OrderHeader.Seq)
@@ -301,8 +303,6 @@ public:
                     {
                         return false;
                     }
-
-                    bool isAmend = orderTarget.OrderTargetAction == Execution::OrderTargetAction::Amend;
 
                     if (orderState.OrderHeader.OrderId == orderTarget.OrderHeader.OrderId) // state == target ??
                     {

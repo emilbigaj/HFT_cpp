@@ -2,6 +2,30 @@
 
 Newest first. Each entry says what changed, why, and what it broke or unblocked.
 
+---
+
+## Single-writer server rows (C# `c7d97d3` / report 2026-09-10)
+
+Controls move to the CoreGroup EXECUTION channel: `ControlRiskLimit` (NEW, 20 B, `ControlType::
+RiskLimit = 201`) and `ControlAlgoStatus` are handled by `ReadExecution` - the thread that owns
+every row they touch - and `ReadAdmin` does allocation only. `OnRiskLimit`/`SaveRiskLimit` are
+DELETED: the server never writes `.risklimit` files (the logging server's audit writer appends the
+posted row), and `OnControlRiskLimit` sets only the two maxima + Timestamp in place, so an operator
+edit can no longer race a reservation or rewind the working quantities. WIRE: `RiskLimit` is 32 B
+(`StrategyId` removed - limits are server-wide); `OrderTarget` is 52 B with `TriggerTimestamp` at
+offset 32 (converged with our C++-first change; C# defined the semantics: TriggerTimestamp = NIC
+arrival of the message the target reacted to, `OrderHeader.NicTimestamp` = send time). Lockstep
+deploy for both arrays. The client now tracks its two clocks off every inbound message and stamps
+targets accordingly; fill events share ONE NicTimestamp across the state and its fills so the
+audit keeps ring order. `Context::AllocateInstrument(clientId, instrumentId)` is idempotent - a
+second allocation leaves the live local position row untouched (it used to re-read the file and
+force Paused from the admin thread against a row mid-fill). Server `TargetIsActive` is Amend-only:
+a Cancel always equals the acked profile, so the no-op check refused every first cancel (69/69 in
+the 2026-09-08 live run). The stale "vendor RX thread" comments are corrected: one thread per
+CoreGroup runs exchange reads + client reads; the seq bumps are single-writer correctness, not
+locks. Note: `ControlType`'s 200/201 sit outside magic_enum's default reflection range - the
+`enum_range` specialization in Allocate.hpp is load-bearing for serialization.
+
 Mirrors the convention in the C# repo's `patch_log.md`. The two libraries talk through shared memory
 as separate processes, so an entry here that changes a wire struct, an enum value, a region name or a
 ring protocol rule needs a matching entry there.

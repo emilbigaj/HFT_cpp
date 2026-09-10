@@ -131,6 +131,7 @@ public:
                 .ExchangeTimestamp = Tools::Timestamp(0),
                 .NicTimestamp = Tools::Timestamp(0),
             },
+            .TriggerTimestamp = Tools::Timestamp(0),
             .OrderProfile = orderProfile,
             .OrderTargetAction = Execution::OrderTargetAction::Create,
             .OrderTargetStatus = Execution::OrderStateStatus::Active,

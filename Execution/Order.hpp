@@ -149,12 +149,13 @@ namespace Execution
 	};
 
 #pragma pack(push, 1)
+	// Server-wide: one row per instrument, applied to every strategy. StrategyId was removed - it
+	// was never enforced or restored per strategy, it only chose where an echo went.
 	struct RiskLimit
 	{
         Data::Header<OrderType> Header = Data::Header<OrderType>(OrderType::RiskLimit);
 		int32_t InstrumentId = -1;
-		Tools::Timestamp Timestamp = Tools::Timestamp::MinValue;
-		int32_t StrategyId = -1;
+		Tools::Timestamp Timestamp = Tools::Timestamp::MinValue; // stamped by the server on apply
 		int32_t MaxOrderQuantity = 0;
 		int32_t MaxPositionQuantity = 0;
 		// The reserved exposure the RiskLayer is currently holding against this instrument, one
@@ -204,7 +205,6 @@ namespace Execution
                 "Header", &T::Header,
 				"InstrumentId", &T::InstrumentId,
 				"Timestamp", &T::Timestamp,
-				"StrategyId", &T::StrategyId,
 				"MaxOrderQuantity", &T::MaxOrderQuantity,
 				"MaxPositionQuantity", &T::MaxPositionQuantity,
 				"WorstLongWorkingQuantity", &T::WorstLongWorkingQuantity,
@@ -213,7 +213,7 @@ namespace Execution
 		};
 	};
 
-	static_assert(sizeof(RiskLimit) == 36, "RiskLimit must be 36 bytes");
+	static_assert(sizeof(RiskLimit) == 32, "RiskLimit must be 32 bytes");
 
 	// Per-order-slot reservation state, server-owned: the in-flight target quantities as a compact
 	// scanned array with a cached max, so the worst case an order can still reach is the highest
@@ -665,10 +665,10 @@ namespace Execution
 	static_assert(offsetof(OrderHeader, Seq) == 0 && offsetof(OrderHeader, OrderId) == 4
 		&& offsetof(OrderHeader, ExchangeTimestamp) == 12 && offsetof(OrderHeader, NicTimestamp) == 20);
 	static_assert(offsetof(RiskLimit, InstrumentId) == 4 && offsetof(RiskLimit, Timestamp) == 8
-		&& offsetof(RiskLimit, StrategyId) == 16 && offsetof(RiskLimit, MaxOrderQuantity) == 20
-		&& offsetof(RiskLimit, MaxPositionQuantity) == 24
-		&& offsetof(RiskLimit, WorstLongWorkingQuantity) == 28
-		&& offsetof(RiskLimit, WorstShortWorkingQuantity) == 32);
+		&& offsetof(RiskLimit, MaxOrderQuantity) == 16
+		&& offsetof(RiskLimit, MaxPositionQuantity) == 20
+		&& offsetof(RiskLimit, WorstLongWorkingQuantity) == 24
+		&& offsetof(RiskLimit, WorstShortWorkingQuantity) == 28);
 	static_assert(offsetof(OrderRisk, ActiveTargetsCount) == 0 && offsetof(OrderRisk, WorstOrderQuantity) == 2
 		&& offsetof(OrderRisk, AbsOrderQuantities) == 4);
 	static_assert(offsetof(Fill, OrderHeader) == 4 && offsetof(Fill, FillId) == 32

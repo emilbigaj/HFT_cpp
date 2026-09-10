@@ -51,15 +51,15 @@ private:
     // ExecutionLock holds a std::atomic, which is non-movable so it can't live in a resizable vector.
     struct alignas(64) ExecutionLock { std::atomic<bool> Flag{false}; };
 
-    // Guards WriteToExecution (return channel, S->C). Multi-writer per segment (RX fills/states +
-    // send create-acks) but same CCD, so the lock line stays CCD-resident.
+    // Guards WriteToExecution (return channel, S->C). One thread per CoreGroup runs both the
+    // exchange reads and the client reads, so this is uncontended insurance, not mutual exclusion.
     std::array<ExecutionLock, 8> _recvFromExchangeLocks;
 
-    // Guards the PRODUCER end of the injection queue below. Only writers contend (hub + vendor RX);
-    // the ReadExecution(cg) thread is the sole reader and takes no lock (ByteQueue SPSC read side).
+    // Guards the PRODUCER end of the injection queue below. Producers are the hub and the listen
+    // thread's client-close cancels; the ReadExecution(cg) thread is the sole reader (SPSC read side).
     std::array<ExecutionLock, 8> _sendToExchangeLocks;
 
-    // Per-CoreGroup OrderTarget injection queue: hub + vendor RX EnqueueOrderTarget() here, the
+    // Per-CoreGroup OrderTarget injection queue: hub + listen-thread cancels EnqueueOrderTarget() here, the
     // ReadExecution(cg) thread drains and sends, so it stays the sole order sender. unique_ptr: non-movable.
     std::array<std::unique_ptr<Tools::ByteQueue>, 8> _orderTargetQueues;
 
@@ -208,7 +208,7 @@ public:
     }
 
 
-    // Producer API for the injection queue (derives cg from the instrument). Hub + vendor RX call this
+    // Producer API for the injection queue (derives cg from the instrument). Hub + listen-thread cancels call this
     // instead of sending; writers serialise on _sendToExchangeLocks, full queue spins (never drops).
     void EnqueueOrderTarget(const Execution::OrderTarget& orderTarget)
     {
@@ -265,6 +265,18 @@ public:
                         OnControlAlgoStatus(orderRejected.OrderHeader.OrderId.StrategyId(), orderRejected.OrderHeader.OrderId.InstrumentId(), Execution::AlgoStatus::Paused);
                         break;
                     }
+                    case static_cast<uint8_t>(Provider::ControlType::RiskLimit):
+                    {
+                        const Provider::ControlRiskLimit& controlRiskLimit = *reinterpret_cast<const Provider::ControlRiskLimit*>(rdst.data());
+                        OnControlRiskLimit(controlRiskLimit);
+                        break;
+                    }
+                    case static_cast<uint8_t>(Provider::ControlType::AlgoStatus):
+                    {
+                        const Provider::ControlAlgoStatus& controlAlgoStatus = *reinterpret_cast<const Provider::ControlAlgoStatus*>(rdst.data());
+                        OnControlAlgoStatus(controlAlgoStatus.StrategyId, controlAlgoStatus.InstrumentId, controlAlgoStatus.AlgoStatus);
+                        break;
+                    }
                     default:
                         UnknownExecutionMessages++;
                         break;
@@ -273,30 +285,24 @@ public:
         }
     }
 
-    void OnRiskLimit(const Execution::RiskLimit& riskLimit)
+    // CoreGroup thread only - the row's sole writer. Config fields in place under the seq bump; the
+    // working quantities are never touched, so an edit cannot rewind a reservation. No echo to any
+    // client (nothing consumed it), and the REQUEST is not audited - the logging server taps every
+    // client socket in both directions, so it is already logged under the client. The server never
+    // writes .risklimit files: the logging server's audit writer appends the posted row.
+    void OnControlRiskLimit(const Provider::ControlRiskLimit& controlRiskLimit)
     {
-        // The sender read-modify-writes the whole struct, so the running working quantities in its
-        // copy are as stale as the moment it opened the edit dialog. They are server-owned state, not
-        // config — carry the live ones across or an operator editing a limit silently rewinds them.
-        Execution::RiskLimit riskLimitCopy = riskLimit;
-        const Execution::RiskLimit& existing = _serverContext.GetRiskLimit(riskLimit.InstrumentId).GetReadonlyRef();
-        riskLimitCopy.WorstLongWorkingQuantity = existing.WorstLongWorkingQuantity;
-        riskLimitCopy.WorstShortWorkingQuantity = existing.WorstShortWorkingQuantity;
+        Socket::SharedArrayEntry<Execution::RiskLimit>& riskLimitEntry = _serverContext.GetRiskLimit(controlRiskLimit.InstrumentId);
+        Execution::RiskLimit& riskLimit = riskLimitEntry.GetRef();
+        riskLimitEntry.AcquireLock();
+        riskLimit.MaxOrderQuantity = controlRiskLimit.MaxOrderQuantity;
+        riskLimit.MaxPositionQuantity = controlRiskLimit.MaxPositionQuantity;
+        riskLimit.Timestamp = Tools::Timestamp::UtcNow();
+        riskLimitEntry.ReleaseLock();
 
-        _serverContext.GetRiskLimit(riskLimit.InstrumentId).Write(riskLimitCopy);
-        if (riskLimitCopy.StrategyId >= 0)
-            WriteToExecution(riskLimitCopy.StrategyId, _serverContext.GetInstrument(riskLimit.InstrumentId).Header().CoreGroupId, riskLimitCopy);
-        SaveRiskLimit(riskLimit.InstrumentId, riskLimitCopy);
-    }
-
-    void SaveRiskLimit(int32_t instrumentId, const Execution::RiskLimit& riskLimit)
-    {
-        std::string symbol = _serverContext.GetInstrument(instrumentId).Symbol();
-        std::filesystem::path riskLimitFilePath = Context::GetRiskLimitsFilePath(_serverContext.DirectoryPath, symbol);
-        std::string riskLimitLine = Tools::Json::SerializeToLine(riskLimit);
-        std::cout << "ServerSimulator::SaveRiskLimit(" << riskLimitFilePath << "):" << std::endl << riskLimitLine << std::endl;
-        std::ofstream outFile(riskLimitFilePath, std::ios::app);
-        outFile << riskLimitLine << std::endl;
+        // Server-wide limit: the posted row is what the logging server appends to the server's .risklimit file.
+        int32_t coreGroupId = _serverContext.GetInstrument(controlRiskLimit.InstrumentId).Header().CoreGroupId;
+        WriteToAudit(coreGroupId, riskLimit);
     }
 
     
@@ -359,19 +365,10 @@ public:
                         OnAllocateInstrument(clientId, allocateInstrument);
                         break;
                     }
-                    case static_cast<uint8_t>(Provider::ControlType::AlgoStatus):
-                    {
-                        const Provider::ControlAlgoStatus& controlAlgoStatus = *reinterpret_cast<const Provider::ControlAlgoStatus*>(rdst.data());
-                        OnControlAlgoStatus(controlAlgoStatus.StrategyId, controlAlgoStatus.InstrumentId, controlAlgoStatus.AlgoStatus);
-                        break;
-                    }
-                    case static_cast<uint8_t>(Execution::OrderType::RiskLimit):
-                    {
-                        const Execution::RiskLimit& riskLimit = *reinterpret_cast<const Execution::RiskLimit*>(rdst.data());
-                        OnRiskLimit(riskLimit);
-                        break;
-                    }
                     default:
+                        // Controls (RiskLimit, AlgoStatus) travel on the CoreGroup EXECUTION channel
+                        // now, so the CoreGroup thread - the rows' sole writer - applies them. The
+                        // admin thread does allocation only.
                         UnknownAdminMessages++;
                         break;
                 }
@@ -396,6 +393,7 @@ public:
 
     Execution::OrderState OnOrderState(Execution::OrderState& orderState)
     {
+        orderState.OrderHeader.NicTimestamp = Tools::Timestamp::UtcNow();
         Execution::OrderState& existingOrderState = WriteOrderState(orderState);
         WriteToExecution(existingOrderState);
         if (OrderState)
@@ -428,7 +426,7 @@ public:
             existingOrderState.OrderStateReason = orderState.OrderStateReason;
             existingOrderState.QuantityFilled = quantityFilled;
             existingOrderState.OrderHeader.ExchangeTimestamp = orderState.OrderHeader.ExchangeTimestamp;
-            existingOrderState.OrderHeader.NicTimestamp = Tools::Timestamp::UtcNow();
+            existingOrderState.OrderHeader.NicTimestamp = orderState.OrderHeader.NicTimestamp;
             orderStateEntry.ReleaseLock();
             _riskLayer.OnOrderState(existingOrderState, beforeAckedOrderQuantity);
         }
@@ -521,6 +519,7 @@ public:
 				.OrderProfile = orderTarget.OrderProfile,
 				.OrderRejectedReasons = orderRejectedReasons,
 			};
+            orderRejected.OrderHeader.NicTimestamp = Tools::Timestamp::UtcNow();
 			Reject(orderRejected, "Rejected by Server Risk Layer");
 		}
     }
@@ -622,6 +621,7 @@ public:
         }
 
         Tools::Timestamp now = Tools::Timestamp::UtcNow();
+        orderState.OrderHeader.NicTimestamp = now;
         for (Execution::Fill& fill : fills)
         {
             // Leg ids differ from the order's only in the InstrumentId bits, so GlobalIndex (client +

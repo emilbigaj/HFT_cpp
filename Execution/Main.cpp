@@ -29,7 +29,7 @@ int main()
     CHECK(sizeof(Execution::Fill) == 64);
     CHECK(offsetof(Execution::Fill, Price) == 40);
     CHECK(sizeof(Execution::OrderRejected) == 52);
-    CHECK(sizeof(Execution::OrderTarget) == 44);
+    CHECK(sizeof(Execution::OrderTarget) == 52);
     CHECK(sizeof(Execution::PositionHeader) == 57);
 
     // ---------------------------------------------------------------------

@@ -226,13 +226,19 @@ public:
             case static_cast<uint8_t>(Data::TickType::MarketByPriceSnapshot):
             case static_cast<uint8_t>(Data::TickType::MarketByPriceUpdate):
             {
+                const Data::TickHeader& tickHeader = reinterpret_cast<const Data::MarketByPrice*>(bytes.data())->TickHeader;
+                NicTimestamp = tickHeader.NicTimestamp;
+                ExchangeTimestamp = tickHeader.ExchangeTimestamp;
                 ApplyMarketByPrice(instrumentId, bytes);
                 break;
             }
             case static_cast<uint8_t>(Data::TickType::Trade):
             {
+                const Data::Trade& trade = *reinterpret_cast<const Data::Trade*>(bytes.data());
+                NicTimestamp = trade.TickHeader.NicTimestamp;
+                ExchangeTimestamp = trade.TickHeader.ExchangeTimestamp;
                 if (Trade)
-                    Trade(*reinterpret_cast<const Data::Trade*>(bytes.data()));
+                    Trade(trade);
                 break;
             }
             default:
@@ -258,9 +264,17 @@ public:
         }
     }
 
+    // The client's view of "now" on each clock, advanced by every inbound message it reacts to.
+    // TriggerTimestamp on an outgoing target = NicTimestamp here (the NIC arrival time of the
+    // message the target reacted to); OrderHeader.NicTimestamp = the send time.
+    Tools::Timestamp ExchangeTimestamp = Tools::Timestamp(0);
+    Tools::Timestamp NicTimestamp = Tools::Timestamp(0);
+
     bool OnOrderTarget(Execution::OrderTarget& orderTarget)
     {
+        orderTarget.TriggerTimestamp = NicTimestamp;
         orderTarget.OrderHeader.NicTimestamp = Clock::GetUtcNow();
+        orderTarget.OrderHeader.ExchangeTimestamp = ExchangeTimestamp;
 
         if (orderTarget.OrderTargetAction == Execution::OrderTargetAction::Create)
         {
@@ -379,6 +393,8 @@ private:
 
     void OnOrderState(const Execution::OrderState& orderState)
     {
+        NicTimestamp = orderState.OrderHeader.NicTimestamp;
+        ExchangeTimestamp = orderState.OrderHeader.ExchangeTimestamp;
         Execution::OrderTarget& orderTarget = ClientContext.GetOrderTarget(orderState.OrderHeader.OrderId).GetRef();
         if (orderState.OrderHeader.OrderId == orderTarget.OrderHeader.OrderId)
         {
@@ -401,6 +417,8 @@ private:
     void OnFill(std::span<const uint8_t> rsrc)
     {
         const Execution::Fill& fill = *reinterpret_cast<const Execution::Fill*>(rsrc.data());
+        NicTimestamp = fill.OrderHeader.NicTimestamp;
+        ExchangeTimestamp = fill.OrderHeader.ExchangeTimestamp;
         if (Fill)
             Fill(fill);
     }
@@ -408,6 +426,8 @@ private:
     void OnPositionHeader(std::span<const uint8_t> rsrc)
     {
         const Execution::PositionHeader& positionHeader = *reinterpret_cast<const Execution::PositionHeader*>(rsrc.data());
+        NicTimestamp = positionHeader.OrderHeader.NicTimestamp;
+        ExchangeTimestamp = positionHeader.OrderHeader.ExchangeTimestamp;
         if (Position)
             Position(positionHeader);
     }
