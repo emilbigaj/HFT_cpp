@@ -330,6 +330,7 @@ namespace Data
           TickDecimals(Tools::GetNumberOfDecimalPlaces(TickSize()))
 		{
 			_legs = { InstrumentLeg{ id, 1 } };
+			_quote.TickSize = TickSize();
 		}
 
 		// Legs view for risk decomposition: an outright is its own single leg (weight +1); a
@@ -347,6 +348,42 @@ namespace Data
 		// row-based guard never fires. Header().TradingStatus stays the any-time read.
 		std::function<void(const Data::TradingStatusUpdate&)> TradingStatusUpdateEvent;
 
+		// --- One strategy run per ReadSocket pass (see Spec.md / 2026-09-14 report) ---
+		// Phase 2 events: QuoteChanged fires on a NET change against the START of the pass (a
+		// quote that moves and moves back within one pass is not a change); MarketByPriceChanged
+		// fires once per pass for any touched book. Per-delta consumers stay in phase 1
+		// (Client::MarketByPrice - the C++ rendering of C#'s Instrument.MarketByPriceDelta).
+		std::function<void()> QuoteChanged;
+		std::function<void()> MarketByPriceChanged;
+
+		// Phase 1, per folded delta: refresh the quote cache from the book image, remembering the
+		// quote as it was when this pass FIRST touched the book.
+		void ApplyMarketByPriceDelta(const Data::MarketByPrice64& mbp64)
+		{
+			if (!_isDirty)
+			{
+				_quoteAtPassStart = _quote;
+				_isDirty = true;
+			}
+			_quote.Bid = mbp64.BidsCount() > 0 ? mbp64.BestBid() : Level{};
+			_quote.Ask = mbp64.AsksCount() > 0 ? mbp64.BestAsk() : Level{};
+			_isQuoteValid = mbp64.BidsCount() > 0 && mbp64.AsksCount() > 0;
+		}
+
+		// Phase 2, once per pass.
+		void RaiseChanged()
+		{
+			_isDirty = false;
+			bool quoteChanged = _quote.Bid.Ticks != _quoteAtPassStart.Bid.Ticks
+				|| _quote.Bid.Quantity != _quoteAtPassStart.Bid.Quantity
+				|| _quote.Ask.Ticks != _quoteAtPassStart.Ask.Ticks
+				|| _quote.Ask.Quantity != _quoteAtPassStart.Ask.Quantity;
+			if (quoteChanged && QuoteChanged)
+				QuoteChanged();
+			if (MarketByPriceChanged)
+				MarketByPriceChanged();
+		}
+
 		void OnTradingStatusUpdate(const Data::TradingStatusUpdate& tradingStatusUpdate)
 		{
 			if (_tradingStatus != tradingStatusUpdate.TradingStatus)
@@ -359,6 +396,10 @@ namespace Data
 
 	private:
 		Data::TradingStatus _tradingStatus = Data::TradingStatus::Unknown;
+		Data::Quote _quote = {};
+		Data::Quote _quoteAtPassStart = {};
+		bool _isDirty = false;
+		bool _isQuoteValid = false;
 
 	public:
 

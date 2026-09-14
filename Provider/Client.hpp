@@ -43,6 +43,10 @@ private:
 
     // CoreGroupIds of the instruments this client has allocated => which execution channels ReadSocket drains.
     Tools::Bitset64 _coreGroupIds;
+    // Instruments touched in phase 1 of the current ReadSocket pass; phase 2 pops them (ascending
+    // id, books before positions) and raises once per changed object on the final state.
+    Tools::Bitset64 _dirtyBooks = Tools::Bitset64(0ULL);
+    Tools::Bitset64 _dirtyPositions = Tools::Bitset64(0ULL);
 
     // Blocking read of the admin channel (0) until a message arrives. Used for the connect handshake
     // (AllocateClient) and the instrument-allocation reply (AllocateInstrument).
@@ -111,10 +115,16 @@ public:
         _instrumentData.resize(static_cast<size_t>(ClientContext.ServerHeader().GetReadonlyRef().InstrumentIds.Length()));
     }
 
+    // One strategy run per pass (2026-09-14 report): phase 1 folds everything queued into the
+    // images and fires only per-message consumers; phase 2 raises once per changed object on the
+    // final state - three deltas on one ring mean ONE QuoteChanged, not three, and never on a
+    // state the next message in the same buffer had already superseded.
     void ReadSocket()
     {
+        // Phase 1: fold, mark, no strategy callbacks. Execution channels drain UNBOUNDED - they
+        // are low volume and are the truth for positions; a fill left behind would mean acting on
+        // a stale position, which is worse than acting late.
         std::span<const uint8_t> rdst;
-        // Drain each execution channel this client uses (channel index == CoreGroupId).
         Tools::Bitset64 coreGroupIds = _coreGroupIds;
         int32_t coreGroupId = 0;
         while (coreGroupIds.TryPopLowest(coreGroupId))
@@ -123,13 +133,19 @@ public:
                 OnSocketMessage(rdst);
         }
 
-        // Pump each subscribed instrument's broadcast ring (deltas + trades) into our own replica book.
         Tools::Bitset64 instrumentIds = ClientContext.InstrumentIds();
         int32_t instrumentId = 0;
         while (instrumentIds.TryPopLowest(instrumentId))
         {
             PumpInstrumentData(instrumentId);
         }
+
+        // Phase 2: once per changed object, books first then positions, ascending instrument id.
+        int32_t dirtyInstrumentId = 0;
+        while (_dirtyBooks.TryPopLowest(dirtyInstrumentId))
+            ClientContext.GetInstrument(dirtyInstrumentId).RaiseChanged();
+        while (_dirtyPositions.TryPopLowest(dirtyInstrumentId))
+            ClientContext.GetPosition(dirtyInstrumentId).RaiseChanged();
     }
 
     Data::Instrument& GetInstrument(int32_t instrumentHeaderId)
@@ -201,6 +217,10 @@ public:
         ClientContext.GetMarketByPrice64(instrumentId).Write(snapshot);
     }
 
+    // A saturated ring must not keep phase 1 busy forever and starve the strategy: at most this
+    // many records per ring per pass; what is left waits for the next pass, still coalesced.
+    static constexpr int32_t MaxReadsPerInstrumentPerPass = 64;
+
     void PumpInstrumentData(int32_t instrumentId)
     {
         Socket::ReadOnlySocket* reader = _instrumentData[static_cast<size_t>(instrumentId)].get();
@@ -208,7 +228,7 @@ public:
             return;
 
         std::span<const uint8_t> bytes;
-        while (reader->TryRead(bytes) == Socket::ReadStatus::New)
+        for (int32_t reads = 0; reads < MaxReadsPerInstrumentPerPass && reader->TryRead(bytes) == Socket::ReadStatus::New; reads++)
         {
             OnInstrumentData(instrumentId, bytes);
         }
@@ -260,6 +280,11 @@ public:
         entry.AcquireLock();
         entry.GetRef().TrySet(bytes);
         entry.ReleaseLock();
+
+        // Phase-1 mark: refresh the instrument's quote cache from our own replica (this thread is
+        // its only writer, so the direct read is race-free) and defer the Changed events to phase 2.
+        ClientContext.GetInstrument(instrumentId).ApplyMarketByPriceDelta(entry.GetReadonlyRef());
+        _dirtyBooks.Set(instrumentId);
 
         if (MarketByPrice)
         {
@@ -434,6 +459,13 @@ private:
         const Execution::PositionHeader& positionHeader = *reinterpret_cast<const Execution::PositionHeader*>(rsrc.data());
         NicTimestamp = positionHeader.OrderHeader.NicTimestamp;
         ExchangeTimestamp = positionHeader.OrderHeader.ExchangeTimestamp;
+
+        // Phase-1 apply: keep the latest row, raise once in phase 2. The client-level callback
+        // below stays per-message (alert manager, widgets).
+        int32_t instrumentId = positionHeader.OrderHeader.OrderId.InstrumentId();
+        ClientContext.GetPosition(instrumentId).ApplyPositionHeader(positionHeader);
+        _dirtyPositions.Set(instrumentId);
+
         if (Position)
             Position(positionHeader);
     }

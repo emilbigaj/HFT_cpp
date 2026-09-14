@@ -78,6 +78,27 @@ namespace Provider
             }
         }
 
+        // --- One strategy run per ReadSocket pass (2026-09-14 report, C3) ---
+        // Phase 1 keeps only the latest row; phase 2 raises once per pass with it. Two position
+        // rows for one instrument in one pass (a fill's row and a status echo) raise once, with
+        // the later row. Client-level Position (per message) and the fill path are unchanged.
+        std::function<void(const Execution::PositionHeader&)> PositionChanged;
+
+        void ApplyPositionHeader(const Execution::PositionHeader& positionHeader)
+        {
+            _lastPositionHeader = positionHeader;
+        }
+
+        void RaiseChanged()
+        {
+            if (PositionChanged)
+                PositionChanged(_lastPositionHeader);
+        }
+
+    private:
+        Execution::PositionHeader _lastPositionHeader = {};
+
+    public:
         void OnOrderDone(int32_t localOrderIndex)
         {
             _isOrderActive.Clear(localOrderIndex);
