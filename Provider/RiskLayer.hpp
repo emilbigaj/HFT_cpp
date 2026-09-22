@@ -355,11 +355,26 @@ public:
             if (!orderRejectedReasons.IsEmpty())
                 return false;
 
+            Data::Instrument& instrument = _serverContext.GetInstrument(instrumentId);
+
+            // Order-entry throttle, one rolling window per CoreGroup (a CoreGroup maps to an iLink
+            // session, which is the scope CME throttles). Cancels count too: one combined window
+            // sized at the tighter line can never breach either exchange line, and what it costs
+            // is cancel throughput. Plain ref, no seq bump - the CoreGroup thread owns the row.
+            if (_orderRejectedSource == Execution::OrderRejectedSource::Server)
+            {
+                Execution::RollingRateLimit& rollingRateLimit = _serverContext.GetRateLimit(instrument.Header().CoreGroupId).GetRef();
+                if (!rollingRateLimit.TrySendOrder(Clock::GetUtcNow()))
+                {
+                    orderRejectedReasons.Set(static_cast<int32_t>(Execution::OrderRejectedReason::TooManyOrdersPerSecond));
+                    return false;
+                }
+            }
+
             // 10. RISK LIMITS - per LEG (an outright is the 1-leg degenerate case).
             // Only check risk on New or Amend (increasing size)
             if (!isCancel)
             {
-                Data::Instrument& instrument = _serverContext.GetInstrument(instrumentId);
 
                 int32_t quantityFilled = orderState.OrderHeader.OrderId == orderTarget.OrderHeader.OrderId ? orderState.QuantityFilled : 0;
                 int32_t workingQuantity = orderTarget.OrderProfile.Quantity - quantityFilled;

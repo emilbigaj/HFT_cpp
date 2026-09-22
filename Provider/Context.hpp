@@ -155,6 +155,9 @@ protected:
 
 	// execution
 	Socket::SharedArray<Execution::RiskLimit> _riskLimits;
+	// One row per CoreGroup, server-written. RollingRateLimit today; another model would be a
+	// different 64-byte view of the same row, cast by the caller (see Spec.md "Order rate limit").
+	Socket::SharedArray<Execution::RollingRateLimit> _rateLimits;
 	Socket::SharedArray<Execution::OrderState> _orderStates;
 	Socket::SharedArray<Execution::OrderTarget> _orderTargets;
 	// Reserved exposure per order slot. Server-owned: the RiskLayer is the only writer, and it runs
@@ -190,6 +193,7 @@ protected:
     _clientIdsByInstrumentId(serverName / "ClientIdsByInstrumentId", ServerHeader().GetReadonlyRef().InstrumentIds.Length(), ServerAccess),
     _marketsByPrice(directoryPath / "MarketsByPrice", ServerHeader().GetReadonlyRef().InstrumentIds.Length(), (directoryPath == serverName) ? serverAccess : clientAccess),
     _riskLimits(serverName / "RiskLimits", ServerHeader().GetReadonlyRef().InstrumentIds.Length(), ServerAccess),
+    _rateLimits(serverName / "RateLimits", ServerHeader().GetReadonlyRef().CoreGroupIds.Length(), ServerAccess),
     _orderStates(serverName / "OrderStates", ServerHeader().GetReadonlyRef().OrdersCapacity(), ServerAccess, false),
     _orderTargets(serverName / "OrderTargets", ServerHeader().GetReadonlyRef().OrdersCapacity(), ClientAccess, false),
     _orderRisks(serverName / "OrderRisks", ServerHeader().GetReadonlyRef().OrdersCapacity(), ServerAccess, false),
@@ -274,6 +278,12 @@ public:
 	{
 		ThrowIfInstrumentIdOutOfRange(instrumentId);
 		return _riskLimits[instrumentId];
+	}
+
+	// One per CoreGroup, server-written (index == CoreGroupId).
+	Socket::SharedArrayEntry<Execution::RollingRateLimit>& GetRateLimit(int32_t coreGroupId)
+	{
+		return _rateLimits[coreGroupId];
 	}
 
 	Socket::SharedArrayEntry<Data::MarketByPrice64>& GetMarketByPrice64(int32_t instrumentId)

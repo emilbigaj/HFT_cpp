@@ -139,6 +139,12 @@ public:
             if (coreGroupId != Socket::SocketChannel::Admin)
                 _orderTargetQueues[static_cast<size_t>(coreGroupId)] = std::make_unique<Tools::ByteQueue>(Tools::Memory::SmallPageLength);
 
+        // One order-entry throttle row per CoreGroup, at the CME default until configured (see
+        // Spec.md "Order rate limit"): unlike every other limit, zero blocks everything and
+        // unlimited protects nothing, so the default is the real exchange number.
+        for (int32_t coreGroupId : serverHeader.CoreGroupIds)
+            _serverContext.GetRateLimit(coreGroupId).Write(Execution::RollingRateLimit(Execution::RateLimit::CMEOrderEntry(coreGroupId)));
+
         _serverSocket.AllocateClientId = [this](const Socket::SocketHeader& socketHeader) {
             return _serverContext.AllocateClientId(socketHeader); 
         };

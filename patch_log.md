@@ -4,6 +4,32 @@ Newest first. Each entry says what changed, why, and what it broke or unblocked.
 
 ---
 
+## Order rate limit (C# `b8b6252`, 2026-09-22)
+
+New shared array `<server>/RateLimits`: `CoreGroupIds.Length()` (64) rows of `RollingRateLimit`,
+64 bytes, index == CoreGroupId, server-written. `RateLimit` (16 B: Duration int64 nanos @0, Limit
+@8, RateLimitId @12) + 32 byte-buckets each `Duration/31` wide, so the 32 span one bucket MORE than
+the window and the count only ever over-states - the safe direction for a throttle. `Total` keeps
+the bucket sum so a send is one compare; a bucket refuses at 255 (the burst cap). The server writes
+the CME default - **3 s / 500, under the reject line on the stricter reading of CME's window** -
+into every CoreGroup row at construction: unlike every other limit, zero blocks everything and
+unlimited protects nothing, so the default is the exchange's own number and a live session is
+protected before anyone configures it. `RiskLayer::ValidateOrder` throttles server-side per
+CoreGroup (a CoreGroup maps to an iLink session, the scope CME throttles), cancels included - one
+combined window sized at the tighter line can never breach either exchange line - rejecting
+`TooManyOrdersPerSecond` (56, already aligned). Plain ref, no seq bump: the CoreGroup thread owns
+the row; readers derive Count at their own clock with `GetCount`, which mutates nothing (a
+published integer would freeze the moment the algo stops sending). `CoreGroupId` names enum added
+to Data (OS 0, Reserved 1, SandP500 2, Equity 3, Forex 4, Crypto 5).
+
+Verified with a 500k-op property test: no true window ever exceeds Limit, the bucketed count never
+under-states the exact window, Total == sum of buckets throughout, burst cap refuses at 255.
+Erratum for C#: Spec.md's "400 in 3 seconds" prose is stale - `RateLimit.CMEOrderEntry` is 500.
+A C++ server creates and owns the region, so a C# GUI's Rate Limits widget reads it directly.
+No EnumerateRateLimits on this side yet (its only consumer is the C# widget).
+
+---
+
 ## Single-writer server rows (C# `c7d97d3` / report 2026-09-10)
 
 Controls move to the CoreGroup EXECUTION channel: `ControlRiskLimit` (NEW, 20 B, `ControlType::
