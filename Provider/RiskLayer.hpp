@@ -169,13 +169,15 @@ public:
         }
     }
 
-    // An ack retires the target that produced it. The slot's worst case drops to the highest quantity
-    // still unacked, so the leg aggregates release the difference.
     ALWAYS_INLINE void OnOrderState(const Execution::OrderState& orderState, int32_t beforeAckedOrderQuantity)
     {
         if (_orderRejectedSource != Execution::OrderRejectedSource::Server)
             return;
 
+        // Expects the exchange to acknowledge before it trades: a marketable create or amend arrives as Acked,
+        // then its fills. The Acked branch releases the old-to-new quantity change, the Done branch releases
+        // the rest measured from the acked quantity; a fill that carried an unacked quantity would leak the
+        // difference for good. The simulator and CME both honour this (see Spec.md "Acceptance before trade").
         if (orderState.OrderStateReason == Execution::OrderStateReason::Acked)
         {
             Execution::OrderRisk& orderRisk = _serverContext.GetOrderRisk(orderState.OrderHeader.OrderId).GetRef();

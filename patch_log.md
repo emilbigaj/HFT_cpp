@@ -4,6 +4,35 @@ Newest first. Each entry says what changed, why, and what it broke or unblocked.
 
 ---
 
+## Session contracts the risk layer depends on (C# `1eef81a`+`91afdcf` / report 2026-09-22)
+
+No wire or shape changes; the C++ code was already conformant. C# shipped a
+reconcile-on-any-quantity-change `OnOrderState` (`1eef81a`) and reverted it the same day
+(`91afdcf`): correct, but it hid the sequence violation. Final form is the two-branch
+Acked / else-if Done we already have - byte-identical arithmetic verified against `91afdcf` -
+plus a comment stating the contract, now mirrored here. Their leak (12 of 1,316 amend-fills-
+on-arrival left 10 long / 20 short reserved forever) was a SIMULATOR bug: it matched first
+and acked only the remainder. `ServerSimulator.Enqueue` now acks before `Take` trades; C++
+has no simulator, nothing to port.
+
+Two contracts recorded for whoever writes the C++ CME session/adapter (no such code in this
+repo yet):
+- **Acceptance before trade**: deliver states in execution-report order; never coalesce an
+  ack into a fill/cancel/elimination, never reorder a fill ahead of the ack of the version it
+  references (sequence on tag 2422 `OrderRequestID`); on recovery replay acks before fills;
+  if a venue ever coalesces, synthesise the `Acked` in the adapter - do NOT add tolerance to
+  `RiskLayer`.
+- **In-Flight Mitigation always on**: log on with tag 9768 = 1 and assert it in the logon
+  response; `QuantityFilled` == CME `CumQty`, cumulative across every cancel/replace. Our
+  `WriteOrderState` keeps `max(stored, reported)` only as a stale-message guard (already so),
+  never to bridge a CumQty reset - a non-IFM reset passed through would over-release the Done
+  remainder and silently drop fills from the position ledger.
+
+Day-end audit check (both sides): every order's reserve/ack/fill/done ledger nets to zero,
+and no fill carries a quantity differing from the last acked quantity for that order.
+
+---
+
 ## Order rate limit (C# `b8b6252`, 2026-09-22)
 
 New shared array `<server>/RateLimits`: `CoreGroupIds.Length()` (64) rows of `RollingRateLimit`,
