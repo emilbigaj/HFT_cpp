@@ -132,6 +132,42 @@ namespace Provider
 	static_assert(Tools::PlainOldData<ControlRiskLimit>);
 	static_assert(sizeof(ControlRiskLimit) == 20, "ControlRiskLimit must be 20 bytes");
 
+	// One row per CoreGroup in the server-written CoreGroups shared array (index == CoreGroupId):
+	// the group's name and the cores its threads pin to. Loaded from <server>/CoreGroups/
+	// <name>.coregroup - one static whole-file JSON each, NOT the appended-line form of .risklimit:
+	// neither a CoreGroup nor a rate limit is amended at runtime.
+	struct CoreGroup final
+	{
+		Tools::String16 CoreGroupName;    //  0, 16
+		int32_t CoreGroupId = -1;         // 16, 4
+		int32_t ServerCoreId = -1;        // 20, 4
+		int32_t MarketDataCoreId = -1;    // 24, 4
+		int32_t StrategyCoreId = -1;      // 28, 4
+		int32_t ReservedCoreId = -1;      // 32, 4   could be a second server, strategy or market data core - depends on circumstances.
+
+		std::string ToString() const
+		{
+			return Tools::Json::Serialize(*this);
+		}
+
+		struct glaze
+		{
+			using T = CoreGroup;
+			static constexpr auto value = glz::object(
+				"CoreGroupName", &T::CoreGroupName,
+				"CoreGroupId", &T::CoreGroupId,
+				"ServerCoreId", &T::ServerCoreId,
+				"MarketDataCoreId", &T::MarketDataCoreId,
+				"StrategyCoreId", &T::StrategyCoreId,
+				"ReservedCoreId", &T::ReservedCoreId
+			);
+		};
+	};
+	static_assert(Tools::PlainOldData<CoreGroup>);
+	static_assert(sizeof(CoreGroup) == 36, "CoreGroup must be 36 bytes");
+	static_assert(offsetof(CoreGroup, CoreGroupId) == 16);
+	static_assert(offsetof(CoreGroup, ReservedCoreId) == 32);
+
 	struct ServerHeader final
 	{
 		Tools::String128 ServerName;

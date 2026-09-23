@@ -360,13 +360,20 @@ public:
             Data::Instrument& instrument = _serverContext.GetInstrument(instrumentId);
 
             // Order-entry throttle, one rolling window per CoreGroup (a CoreGroup maps to an iLink
-            // session, which is the scope CME throttles). Cancels count too: one combined window
-            // sized at the tighter line can never breach either exchange line, and what it costs
-            // is cancel throughput. Plain ref, no seq bump - the CoreGroup thread owns the row.
+            // session, which is the scope CME throttles). One combined window sized at the tighter
+            // line can never breach either exchange line, and what it costs is create and amend
+            // throughput while cancels are flying. Plain ref, no seq bump - the CoreGroup thread
+            // owns the row.
             if (_orderRejectedSource == Execution::OrderRejectedSource::Server)
             {
                 Execution::RollingRateLimit& rollingRateLimit = _serverContext.GetRateLimit(instrument.Header().CoreGroupId).GetRef();
-                if (!rollingRateLimit.TrySendOrder(Clock::GetUtcNow()))
+
+                // A cancel is counted but never refused: it is the message that reduces risk.
+                if (isCancel)
+                {
+                    rollingRateLimit.SendOrder(Clock::GetUtcNow());
+                }
+                else if (!rollingRateLimit.TrySendOrder(Clock::GetUtcNow()))
                 {
                     orderRejectedReasons.Set(static_cast<int32_t>(Execution::OrderRejectedReason::TooManyOrdersPerSecond));
                     return false;

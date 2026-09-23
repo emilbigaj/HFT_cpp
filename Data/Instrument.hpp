@@ -36,16 +36,9 @@ namespace Data
 
 	static_assert(sizeof(Header<InstrumentType>) == 4);
 
-	// Names for InstrumentHeader.CoreGroupId. Lives here, not in Strategy, so the GUI can show the name.
-	enum class CoreGroupId : uint8_t
-	{
-		OS = 0,
-		Reserved = 1,
-		SandP500 = 2,
-		Equity = 3,
-		Forex = 4,
-		Crypto = 5,
-	};
+	// CoreGroup NAMES are no longer an enum here: the server names its groups in .coregroup files,
+	// published in the CoreGroups shared array (see Provider::CoreGroup). InstrumentHeader.CoreGroupId
+	// stays the numeric key.
 
 	// TradingStatus lives in Tick.hpp now (it rides the instrument data ring as a tick).
 

@@ -9,6 +9,8 @@
 #include <string>
 #include <type_traits>
 #include <fstream>
+#include <sstream>
+#include <filesystem>
 #include <optional> // Required for std::optional in C++20
 #include <algorithm>
 
@@ -157,6 +159,18 @@ namespace Tools
 			number -= std::trunc(number);
 		}
 		return decimalPlaces;
+	}
+
+	// Whole file as one string, for the static-JSON configuration files (.coregroup, .ratelimit):
+	// one document per file, never appended to, unlike the .risklimit line log. Throws if unreadable.
+	ALWAYS_INLINE static std::string ReadAllText(const std::filesystem::path& filePath)
+	{
+		std::ifstream stream(filePath, std::ios::in | std::ios::binary);
+		if (!stream.is_open())
+			throw std::runtime_error("Tools::ReadAllText(" + filePath.string() + "), cannot open file");
+		std::ostringstream buffer;
+		buffer << stream.rdbuf();
+		return buffer.str();
 	}
 
 	ALWAYS_INLINE static std::optional<std::string> ReadLastLine(const std::string& filePath)

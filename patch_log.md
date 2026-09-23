@@ -4,6 +4,54 @@ Newest first. Each entry says what changed, why, and what it broke or unblocked.
 
 ---
 
+## CoreGroups from files, cancels never throttled, PendingNew queue seed (C# `a8fd70f`+`868467c`+`e5b8bfc`, 2026-09-23)
+
+Three C# commits in one alignment; the ladder-layout commit (`bdd921f`) is widget-only.
+
+**Cancels counted but never refused** (`a8fd70f`): `RollingRateLimit::SendOrder` rolls the ring
+and counts like `TrySendOrder` but skips the Limit check (bucket byte still stops at 255);
+`ValidateOrder` routes a Cancel through it and everything else through `TrySendOrder`. A cancel
+is the message that reduces risk - found when a pause could not cancel the algo's own orders with
+the limit set to 10. What the combined window now costs is create/amend throughput while cancels
+fly, not cancel throughput.
+
+**New shared array `CoreGroups`** (`868467c`): region `<server>/CoreGroups`, created directly
+after `RateLimits` (array-id order for the mirror), `CoreGroupIds.Length()` rows of
+`Provider::CoreGroup` - 36 B: `String16 CoreGroupName@0`, int32 `CoreGroupId@16`,
+`ServerCoreId@20`, `MarketDataCoreId@24`, `StrategyCoreId@28`, `ReservedCoreId@32`, all ids -1
+unset (offsets asserted). The `Data::CoreGroupId` naming enum is DELETED - each server names its
+groups in `<server>/CoreGroups/<name>.coregroup` files (static whole-file pretty JSON, NOT the
+appended-line `.risklimit` form; `Tools::ReadAllText` added for these). A ServerContext opened
+for WRITE loads every such file into the row at its id - out-of-set OR out-of-range id throws
+(C#'s indexer is bounds-checked; folding the range into the same throw keeps the loud fail
+without Bitset64's UB shift) - then that group's rate limit from `RateLimits/<name>.ratelimit`
+(whole-file JSON `RateLimit`, `Duration` in the canonical underscored string form both sides
+already share), else `GetMaxLimits` (1 s, int32 max) in simulation / `GetMinLimits` (1 s, 0) in
+realtime, id = CoreGroupId. `CMEOrderEntry` is DELETED and the Server-ctor seeding loop with it:
+New Release, Certification and Production publish different limits, so the number is per server
+directory. `Context::GetCoreGroup(id)` + `GetCoreGroupId(String16)` (scans set bits, throws when
+absent) added; a realtime strategy pins to the row's `StrategyCoreId` - our sim-only Scenario has
+no pinning path, so only the accessors port. `EnumerateCoreGroups` skipped like
+`EnumerateRateLimits` (C# widget-only). NOTE the flip: a realtime CoreGroup with no `.ratelimit`
+file now has Limit 0 - every non-cancel refused until configured - and a CoreGroup with no
+`.coregroup` file has an unwritten (all-zero) rate-limit row; the C++ CME server must ship its
+`.coregroup` files. C#'s Json resolver index-walk fix is System.Text.Json-specific, nothing to
+port.
+
+**PendingNew carries a provisional QuantityAhead** (`e5b8bfc` / report addendum): the Create
+branch seeds `QuantityAhead` with the server's own `MarketByPrice64` quantity at the order's
+price on its side (Bids for a buy, Asks for a sell), read before the order-row lock; 0 showed
+every fresh order at the front of the queue for the whole round trip. The ack overwrites it;
+`OnQuantityAhead` unchanged. The simulated-queue publish narrowing in the same commit is
+simulator-only.
+
+Verified: build clean, ExecutionTests + DataTests pass; property test (400k interleaved
+SendOrder/TrySendOrder ops): SendOrder never refused, window count includes cancels and tightens
+creates, Total == sum(Counts) throughout, burst cap holds at 255 without wrap; C#-canonical
+`.ratelimit`/`.coregroup` JSON parse and round-trip, absent fields keep -1.
+
+---
+
 ## Session contracts the risk layer depends on (C# `1eef81a`+`91afdcf` / report 2026-09-22)
 
 No wire or shape changes; the C++ code was already conformant. C# shipped a

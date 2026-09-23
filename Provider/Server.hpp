@@ -139,11 +139,9 @@ public:
             if (coreGroupId != Socket::SocketChannel::Admin)
                 _orderTargetQueues[static_cast<size_t>(coreGroupId)] = std::make_unique<Tools::ByteQueue>(Tools::Memory::SmallPageLength);
 
-        // One order-entry throttle row per CoreGroup, at the CME default until configured (see
-        // Spec.md "Order rate limit"): unlike every other limit, zero blocks everything and
-        // unlimited protects nothing, so the default is the real exchange number.
-        for (int32_t coreGroupId : serverHeader.CoreGroupIds)
-            _serverContext.GetRateLimit(coreGroupId).Write(Execution::RollingRateLimit(Execution::RateLimit::CMEOrderEntry(coreGroupId)));
+        // Rate-limit rows are no longer seeded here: ServerContext (write mode) loads each
+        // CoreGroup's .coregroup file and its .ratelimit by name - New Release, Certification and
+        // Production publish different limits, so the number is per server directory (see Spec.md).
 
         _serverSocket.AllocateClientId = [this](const Socket::SocketHeader& socketHeader) {
             return _serverContext.AllocateClientId(socketHeader); 
@@ -488,6 +486,11 @@ public:
         bool isValid = _riskLayer.ValidateOrder(orderTarget, orderRejectedReasons);
         if (orderTarget.OrderTargetAction == Execution::OrderTargetAction::Create)
         {
+            // PendingNew is visible for the whole round trip to the venue; 0 would show every fresh
+            // order at the front of the queue. Seed the best estimate the server has - its own book
+            // quantity at the order's price on its side - read before the row lock; the ack replaces it.
+            const Data::MarketByPrice64& mbp64 = _serverContext.GetMarketByPrice64(orderTarget.OrderHeader.OrderId.InstrumentId()).GetReadonlyRef();
+            int32_t quantityAhead = orderTarget.OrderProfile.Side() == Data::Side::Buy ? mbp64.Bids.GetQuantity(orderTarget.OrderProfile.Ticks) : mbp64.Asks.GetQuantity(orderTarget.OrderProfile.Ticks);
             orderStateEntry.AcquireLock();
             orderState = Execution::OrderState
             {
@@ -500,7 +503,7 @@ public:
                 // PendingNew from an ack without inferring it from the sequence.
                 .OrderStateReason = isValid ? Execution::OrderStateReason::PendingNew : Execution::OrderStateReason::Rejected,
                 .QuantityFilled = 0,
-                .QuantityAhead = 0,
+                .QuantityAhead = quantityAhead,
             };
             orderState.OrderHeader.Seq = 0; // indicates new Order but that ordertarget is not acked by exchange
             orderState.OrderHeader.NicTimestamp = Tools::Timestamp::UtcNow();

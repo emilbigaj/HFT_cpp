@@ -223,10 +223,15 @@ namespace Execution
 		int32_t Limit = 0;                                              //  8, 4
 		int32_t RateLimitId = -1;                                       // 12, 4
 
-		// CME Globex order entry, on the stricter reading of its window and under the reject line (see Spec.md).
-		static RateLimit CMEOrderEntry(int32_t rateLimitId)
+		// Unlimited in a 1 second window: only the 255-per-bucket burst cap remains (see Spec.md).
+		static RateLimit GetMaxLimits(int32_t rateLimitId)
 		{
-			return RateLimit{ Tools::Duration::FromSeconds(static_cast<int64_t>(3)), 500, rateLimitId };
+			return RateLimit{ Tools::Duration::FromSeconds(static_cast<int64_t>(1)), std::numeric_limits<int32_t>::max(), rateLimitId };
+		}
+
+		static RateLimit GetMinLimits(int32_t rateLimitId)
+		{
+			return RateLimit{ Tools::Duration::FromSeconds(static_cast<int64_t>(1)), 0, rateLimitId };
 		}
 
 		std::string ToString() const
@@ -333,6 +338,22 @@ namespace Execution
 			count++;
 			Total++;
 			return true;
+		}
+
+		// Counts a send that goes out regardless of the limit, a cancel; the bucket still stops at 255 rather than wrapping.
+		void SendOrder(Tools::Timestamp timestamp)
+		{
+			// Step 1: roll the ring up to now, so nothing in it is expired and Total is the count
+			Advance(timestamp);
+
+			// Step 2: the newest bucket is at its burst cap; leave the count rather than wrap
+			uint8_t& count = Counts[BucketIndex];
+			if (count == UINT8_MAX)
+				return;
+
+			// Step 3: record the send in the newest bucket and in the running total
+			count++;
+			Total++;
 		}
 
 		std::string ToString() const

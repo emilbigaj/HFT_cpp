@@ -117,6 +117,16 @@ public:
 		return directoryPath / "RiskLimits" / (symbol + ".risklimit");
 	}
 
+	static std::filesystem::path GetRateLimitFilePath(const std::filesystem::path& directoryPath, const std::string& coreGroupName)
+	{
+		return directoryPath / "RateLimits" / (coreGroupName + ".ratelimit");
+	}
+
+	static std::filesystem::path GetCoreGroupFilePath(const std::filesystem::path& directoryPath, const std::string& coreGroupName)
+	{
+		return directoryPath / "CoreGroups" / (coreGroupName + ".coregroup");
+	}
+
 	static std::filesystem::path GetLoggingServerDirectoryPath(const std::filesystem::path& directoryPath)
 	{
 		return directoryPath / "LoggingServer";
@@ -134,6 +144,8 @@ public:
 	const std::filesystem::path PositionsDirectoryPath;
 	const std::filesystem::path AlertsDirectoryPath;
 	const std::filesystem::path RiskLimitsDirectoryPath;
+	const std::filesystem::path RateLimitsDirectoryPath;
+	const std::filesystem::path CoreGroupsDirectoryPath;
 	const std::filesystem::path AuditDirectoryPath;
 	const std::filesystem::path SeriesDirectoryPath;
 	const std::filesystem::path WorkspaceDirectoryPath;
@@ -158,6 +170,8 @@ protected:
 	// One row per CoreGroup, server-written. RollingRateLimit today; another model would be a
 	// different 64-byte view of the same row, cast by the caller (see Spec.md "Order rate limit").
 	Socket::SharedArray<Execution::RollingRateLimit> _rateLimits;
+	// One row per CoreGroup, server-written from its .coregroup file: the name and the core ids.
+	Socket::SharedArray<Provider::CoreGroup> _coreGroups;
 	Socket::SharedArray<Execution::OrderState> _orderStates;
 	Socket::SharedArray<Execution::OrderTarget> _orderTargets;
 	// Reserved exposure per order slot. Server-owned: the RiskLayer is the only writer, and it runs
@@ -182,6 +196,8 @@ protected:
     PositionsDirectoryPath(directoryPath / "Positions"),
     AlertsDirectoryPath(directoryPath / "Alerts"),
     RiskLimitsDirectoryPath(directoryPath / "RiskLimits"),
+    RateLimitsDirectoryPath(directoryPath / "RateLimits"),
+    CoreGroupsDirectoryPath(directoryPath / "CoreGroups"),
     AuditDirectoryPath(GetAuditDirectoryPath(directoryPath)),
     SeriesDirectoryPath(directoryPath / "Series"),
     WorkspaceDirectoryPath(directoryPath / "Workspaces"),
@@ -194,6 +210,7 @@ protected:
     _marketsByPrice(directoryPath / "MarketsByPrice", ServerHeader().GetReadonlyRef().InstrumentIds.Length(), (directoryPath == serverName) ? serverAccess : clientAccess),
     _riskLimits(serverName / "RiskLimits", ServerHeader().GetReadonlyRef().InstrumentIds.Length(), ServerAccess),
     _rateLimits(serverName / "RateLimits", ServerHeader().GetReadonlyRef().CoreGroupIds.Length(), ServerAccess),
+    _coreGroups(serverName / "CoreGroups", ServerHeader().GetReadonlyRef().CoreGroupIds.Length(), ServerAccess),
     _orderStates(serverName / "OrderStates", ServerHeader().GetReadonlyRef().OrdersCapacity(), ServerAccess, false),
     _orderTargets(serverName / "OrderTargets", ServerHeader().GetReadonlyRef().OrdersCapacity(), ClientAccess, false),
     _orderRisks(serverName / "OrderRisks", ServerHeader().GetReadonlyRef().OrdersCapacity(), ServerAccess, false),
@@ -206,6 +223,8 @@ protected:
         std::filesystem::create_directories(PositionsDirectoryPath);
         std::filesystem::create_directories(AlertsDirectoryPath);
         std::filesystem::create_directories(RiskLimitsDirectoryPath);
+        std::filesystem::create_directories(RateLimitsDirectoryPath);
+        std::filesystem::create_directories(CoreGroupsDirectoryPath);
         std::filesystem::create_directories(AuditDirectoryPath);
         std::filesystem::create_directories(SeriesDirectoryPath);
         std::filesystem::create_directories(WorkspaceDirectoryPath);
@@ -284,6 +303,24 @@ public:
 	Socket::SharedArrayEntry<Execution::RollingRateLimit>& GetRateLimit(int32_t coreGroupId)
 	{
 		return _rateLimits[coreGroupId];
+	}
+
+	// One per CoreGroup, server-written when it loads the CoreGroup's file: the name and the cores its threads pin to.
+	Socket::SharedArrayEntry<Provider::CoreGroup>& GetCoreGroup(int32_t coreGroupId)
+	{
+		return _coreGroups[coreGroupId];
+	}
+
+	// Throws when no loaded CoreGroup has that name: a client asking for a group the server does not have is a setup error.
+	int32_t GetCoreGroupId(const Tools::String16& coreGroupName)
+	{
+		for (int32_t coreGroupId : ServerHeader().GetReadonlyRef().CoreGroupIds)
+		{
+			Socket::SharedArrayEntry<Provider::CoreGroup>& coreGroupEntry = _coreGroups[coreGroupId];
+			if (!coreGroupEntry.IsEmpty() && coreGroupEntry.GetReadonlyRef().CoreGroupName == coreGroupName)
+				return coreGroupId;
+		}
+		throw std::runtime_error(std::string(Tools::GetTypeName(typeid(*this))) + ".GetCoreGroupId(" + coreGroupName.ToString() + "), no CoreGroup with that name in " + CoreGroupsDirectoryPath.string());
 	}
 
 	Socket::SharedArrayEntry<Data::MarketByPrice64>& GetMarketByPrice64(int32_t instrumentId)
@@ -497,6 +534,33 @@ public:
 		int32_t cliCapacity = ServerHeader().GetReadonlyRef().ClientIds.Length();
 		if (cliCapacity > 64)
 			throw std::runtime_error(std::string(typeid(*this).name()) + ".ServerContext(), ClientsCapacity (" + std::to_string(cliCapacity) + ") must be less than or equal to 64.");
+
+		// Write mode: the server names its CoreGroups in files, one static JSON CoreGroup each, and each group's rate
+		// limit follows by name from its .ratelimit file, static JSON too; Max in simulation and Min in realtime without one, like .risklimit.
+		// The channel and thread for an id were built from ServerHeader.CoreGroupIds, so a file outside that set is fatal.
+		if (access == Tools::Access::Write)
+		{
+			const Provider::ServerHeader& serverHeader = ServerHeader().GetReadonlyRef();
+			for (const std::filesystem::directory_entry& entry : std::filesystem::directory_iterator(CoreGroupsDirectoryPath))
+			{
+				if (!entry.is_regular_file() || entry.path().extension() != ".coregroup")
+					continue;
+
+				Provider::CoreGroup coreGroup = Tools::Json::Deserialize<Provider::CoreGroup>(Tools::ReadAllText(entry.path()));
+				int32_t coreGroupId = coreGroup.CoreGroupId;
+				// Out-of-range folds into the same throw: C#'s indexer is bounds-checked, Bitset64's shift is not.
+				if (coreGroupId < 0 || coreGroupId >= serverHeader.CoreGroupIds.Length() || !serverHeader.CoreGroupIds[coreGroupId])
+					throw std::runtime_error(std::string(typeid(*this).name()) + "(" + ServerName.string() + "), " + entry.path().string() + ": CoreGroupId " + std::to_string(coreGroupId) + " is not set in ServerHeader.CoreGroupIds");
+				_coreGroups[coreGroupId].Write(coreGroup);
+
+				std::filesystem::path rateLimitPath = GetRateLimitFilePath(DirectoryPath, coreGroup.CoreGroupName.ToString());
+				Execution::RateLimit rateLimit = std::filesystem::exists(rateLimitPath)
+					? Tools::Json::Deserialize<Execution::RateLimit>(Tools::ReadAllText(rateLimitPath))
+					: (Clock::Mode == ClockMode::Simulation ? Execution::RateLimit::GetMaxLimits(coreGroupId) : Execution::RateLimit::GetMinLimits(coreGroupId));
+				rateLimit.RateLimitId = coreGroupId;
+				_rateLimits[coreGroupId].Write(Execution::RollingRateLimit(rateLimit));
+			}
+		}
 	}
 
 	static inline void ThrowIfInvalidServerName(const std::filesystem::path& serverName)
