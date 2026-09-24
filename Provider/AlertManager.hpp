@@ -40,6 +40,10 @@ namespace Provider
 	struct Alert
 	{
 		Data::Header<AlertType> Header;
+		Tools::Timestamp Timestamp; // Clock::GetUtcNow() at construction, on the raising thread
+
+		// OrderRejected only; resolved by AlertManager (header path), carried on the wire as String64.
+		std::string Symbol;
 
 		// Typed payload (C#'s boxed `object?`). std::monostate = no object (message-only).
 		// Each non-monostate alternative must be POD so its bytes go on the wire verbatim.
@@ -59,16 +63,16 @@ namespace Provider
 
 		// Message-only (e.g. pre-resolved text alerts).
 		Alert(AlertType type, std::string message)
-			: Header(type), Object(std::monostate{}), Message(std::move(message)) {}
+			: Header(type), Timestamp(Clock::GetUtcNow()), Object(std::monostate{}), Message(std::move(message)) {}
 
 		// Object + message.
 		template <typename T> requires Tools::PlainOldData<T>
 		Alert(AlertType type, const T& object, std::string message)
-			: Header(type), Object(object), Message(std::move(message)) {}
+			: Header(type), Timestamp(Clock::GetUtcNow()), Object(object), Message(std::move(message)) {}
 
 		// Deferred-exception alert: rich Message built by the consumer from Exception + Location.
 		Alert(std::exception_ptr exception, std::source_location location)
-			: Header(AlertType::Exception), Object(std::monostate{}),
+			: Header(AlertType::Exception), Timestamp(Clock::GetUtcNow()), Object(std::monostate{}),
 			  Exception(std::move(exception)), Location(location) {}
 
 		// ToString()/JSON includes Object (glaze writes the active alternative; monostate -> null).
@@ -78,6 +82,8 @@ namespace Provider
 			using T = Alert;
 			static constexpr auto value = glz::object(
 				"Header", &T::Header,
+				"Timestamp", &T::Timestamp,
+				"Symbol", &T::Symbol,
 				"Object", &T::Object,
 				"Message", &T::Message
 			);
@@ -93,7 +99,7 @@ namespace Provider
 	{
 	public:
 		const std::string MachineName;
-		const Provider::Context& Context;
+		Provider::Context& Context;
 
 	private:
 		std::unique_ptr<Socket::ClientSocket> _logger;
@@ -235,8 +241,24 @@ namespace Provider
 			}
 		}
 
-		// Wire layout: [Header] [Object bytes (e.g. OrderRejected struct)] [ASCII message].
-		void WriteToSocket(const Alert& alert)
+		// Header path, not GetInstrument: no lazy Instrument creation from this thread; a rejection
+		// may name an instrument this client never allocated.
+		std::string GetSymbol(int32_t instrumentId)
+		{
+			try
+			{
+				int32_t instrumentHeaderId = Context.GetInstrumentHeaderIdByInstrumentId(instrumentId).Read();
+				return Context.GetInstrumentHeader(instrumentHeaderId).GetReadonlyRef().Symbology()->Symbol();
+			}
+			catch (...)
+			{
+				return "UnknownSymbol_" + std::to_string(instrumentId);
+			}
+		}
+
+		// Wire layout: [Header] [Timestamp] [OrderRejected | String64 Symbol] [ASCII message] -
+		// must match C# Alert.ToBytes/FromBytes byte for byte, the GUI parses it.
+		void WriteToSocket(Alert& alert)
 		{
 			constexpr int32_t headerSize = static_cast<int32_t>(sizeof(Data::Header<AlertType>));
 			const int32_t bufferSize = static_cast<int32_t>(_buffer.size());
@@ -245,7 +267,11 @@ namespace Provider
 			std::memcpy(_buffer.data() + pos, &alert.Header, static_cast<size_t>(headerSize));
 			pos += headerSize;
 
+			std::memcpy(_buffer.data() + pos, &alert.Timestamp, sizeof(Tools::Timestamp));
+			pos += static_cast<int32_t>(sizeof(Tools::Timestamp));
+
 			// C#'s `switch (alert.Header.Type)` -> type-safe visit; monostate writes nothing.
+			// An OrderRejected is followed by its String64 symbol, resolved here on the alert thread.
 			std::visit([&](const auto& object)
 			{
 				using O = std::decay_t<decltype(object)>;
@@ -254,6 +280,15 @@ namespace Provider
 					const int32_t bytes = std::min(static_cast<int32_t>(sizeof(O)), bufferSize - pos);
 					std::memcpy(_buffer.data() + pos, &object, static_cast<size_t>(bytes));
 					pos += bytes;
+
+					if constexpr (std::is_same_v<O, Execution::OrderRejected>)
+					{
+						alert.Symbol = GetSymbol(object.OrderHeader.OrderId.InstrumentId());
+						Tools::String64 symbol(alert.Symbol.c_str());
+						const int32_t symbolBytes = std::min(static_cast<int32_t>(sizeof(Tools::String64)), bufferSize - pos);
+						std::memcpy(_buffer.data() + pos, &symbol, static_cast<size_t>(symbolBytes));
+						pos += symbolBytes;
+					}
 				}
 			}, alert.Object);
 

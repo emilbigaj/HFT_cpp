@@ -436,11 +436,6 @@ namespace Data
 			return _mbpEntry.GetReadonlyRef();
 		}
 
-		bool IsInSession()
-		{
-			return true;
-		}
-
 		double InverseTickSize() const
 		{
 			return Header().InverseTickSize;
@@ -533,7 +528,9 @@ namespace Data
 
 				const MarketByPrice64& mbp = MarketByPriceRef();
 
-                if (!IsInSession())
+                // Session state IS the exchange's TradingStatus; Unknown counts as closed, so an
+                // instrument whose status was never published has no quote (see Spec.md).
+                if (Header().TradingStatus != TradingStatus::Open)
                 {
                     quote = {};
                     return false;

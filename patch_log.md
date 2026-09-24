@@ -4,6 +4,34 @@ Newest first. Each entry says what changed, why, and what it broke or unblocked.
 
 ---
 
+## Session state is the exchange's TradingStatus; Alert carries a Timestamp (C# `9155763`, 2026-09-24)
+
+**TradingStatus gate**: C# deleted `Instrument.SessionManager`/`IsInSession`; ours was a
+`return true` stub, so this side goes from "always in session" to the real gate. The three call
+sites now test `Header().TradingStatus == Open`: `RiskLayer::ValidateOrder` rejects a create
+`NotInSession` otherwise, and `Instrument::TryGetQuote` + the position quote return empty.
+**Unknown counts as closed**: an instrument whose status was never published neither trades nor
+quotes, so the C++ CME server MUST publish each instrument's status from the snapshot /
+SecurityStatus at startup via `OnTradingStatusUpdate` (2026-09-10 report T1-T5) - this gate makes
+that a hard requirement, not a display nicety.
+
+**Alert wire** (`Provider/AlertManager.hpp`): now `Header | Timestamp | [OrderRejected | String64
+Symbol] | Message`, matching C# `Alert.ToBytes/FromBytes` byte for byte (the GUI parses it).
+`Timestamp` = sim-aware `Clock::GetUtcNow()` at construction on the raising thread. The
+`String64 Symbol` after an OrderRejected was ALSO missing here (pre-existing divergence - our
+port predated it); resolved on the alert thread via the header path (`GetSymbol`), never
+`GetInstrument` (no lazy Instrument creation from that thread; a rejection may name an
+instrument this client never allocated), `UnknownSymbol_<id>` when the lookup fails. glaze meta
+gains Timestamp + Symbol to match C# JSON.
+
+Not portable: `Clock.SimulationSpeed` pacing-break (C++ Provider::Clock has no pacing loop),
+MessageEfficiency day-end rewire (no MessageEfficiency array here yet), simulator
+SessionManagerByExchange + workspace speed drop-down (C#-only).
+
+Verified: build clean, ExecutionTests + DataTests pass.
+
+---
+
 ## CoreGroups from files, cancels never throttled, PendingNew queue seed (C# `a8fd70f`+`868467c`+`e5b8bfc`, 2026-09-23)
 
 Three C# commits in one alignment; the ladder-layout commit (`bdd921f`) is widget-only.

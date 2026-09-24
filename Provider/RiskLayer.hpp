@@ -83,7 +83,9 @@ public:
 
         Data::Instrument& instrument = _serverContext.GetInstrument(instrumentId);
 
-        if (!instrument.IsInSession())
+        // Session state IS the exchange's TradingStatus; Unknown counts as closed. The server must
+        // publish each instrument's status at startup or nothing trades (see Spec.md).
+        if (instrument.Header().TradingStatus != Data::TradingStatus::Open)
         {
             orderRejectedReasons.Set(static_cast<int32_t>(Execution::OrderRejectedReason::NotInSession));
         }

@@ -1020,7 +1020,7 @@ inline bool Position::TryGetQuote(Data::Quote& quote)
 	NextOrder:;
 	}
 
-	if (!Instrument.IsInSession() || mbp.BidsCount() == 0 || mbp.AsksCount() == 0)
+	if (Instrument.Header().TradingStatus != Data::TradingStatus::Open || mbp.BidsCount() == 0 || mbp.AsksCount() == 0)
 	{
 		quote = Data::Quote
 		{
