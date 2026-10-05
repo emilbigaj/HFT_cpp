@@ -4,6 +4,20 @@ Newest first. Each entry says what changed, why, and what it broke or unblocked.
 
 ---
 
+## Second shutdown signal no longer aborts the cleanup (2026-10-05)
+
+Found on New Release: `timeout` signals both the program and its process group, so SIGINT arrived twice;
+the second landed on another thread, `OnExit` returned at once and the handler called `std::exit`,
+killing the process mid-cleanup (no cancel-all, no Terminate on segments 68/74). A double Ctrl+C did
+the same. `Tools/Application.hpp`: the signal handler now ignores a signal while a shutdown is running,
+and `OnExit` returns whether this caller claimed the shutdown, so two simultaneous signals cannot both
+reach `std::exit`. The handler never waits (that deadlocked against `CmeServer::Stop`'s joins in
+`4c487be`). C# already blocks a second `OnExit` until the first finishes, so the outcome matches; nothing
+for C#. Verified with a program whose exit action takes 500 ms, two SIGINTs to its process group 100 ms
+apart: the old handler exited before the action finished, the new one completes it.
+
+---
+
 ## C++/C# review, item by item (2026-10-05) — see `csharp_alignment_report_2026-10-05.md`
 
 **FOR C# CLAUDE:** read `csharp_alignment_report_2026-10-05.md` (repo root, branch

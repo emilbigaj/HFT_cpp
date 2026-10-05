@@ -37,6 +37,8 @@ No wire or shared-memory shape changes in any item. Behaviour only.
 | 25 | JSON output: C++ must print byte-for-byte the same JSON as C# for every serialised type | Done: C++ aligned; a C#/C++ harness (140 files, every type both sides serialise, pretty and line) diffs byte-identical. Known gaps: `ForexHeader` (C# cannot serialise it, its `Symbology` getter throws); C++ `Profit` has no JSON form |
 | 26 | Default `RiskLimit` (Max/Min) stamped with the sim-aware clock inside the factory; `Clock` lives in `Tools`, ported in full from `Tools/Clock.cs` | Done in C++ (`Tools/Clock.hpp`, `GetMaxLimits(instrumentId)`/`GetMinLimits(instrumentId)` as C#). Two C# `Clock` bugs found by the port: **C# to implement** (§7) |
 | 27 | `Settlement` tick and its constructor, `Quote.MicroPrice`, `TryGetQuote` returning the cached quote first | Done: C++ aligned. Accepted gap: C++ `TickHeader` has no 5-argument constructor (it stays an aggregate so field-name initialisation keeps working, including in the CME book builder); the `Settlement` constructor fills it field by field with the same values |
+| 28 | CME fallout: the CME adapter needs six one-line updates to build against this tree | CME-side (listed in `patch_log.md`); nothing for C# |
+| 29 | A second shutdown signal (second Ctrl+C, or SIGINT to the whole process group) must not cut the running shutdown short | Done in C++: the handler ignores a signal while a shutdown runs. C# already blocks the second `OnExit` until the first finishes, so the outcome matches; nothing for C# |
 
 ---
 

@@ -33,12 +33,16 @@ namespace Tools
 
 		static void SignalHandler(int signal)
 		{
+			// A signal during a shutdown already running (a second Ctrl+C, or one also sent to the process group) is
+			// ignored: exiting here would kill the cleanup mid-way, and waiting here could deadlock against a thread it joins.
+			if (IsExiting())
+				return;
 			if (signal == SIGHUP)
 				std::cout << "Hang-up Signal (SIGHUP) Captured. Shutting down...\n";
 			else
 				std::cout << "Terminal Signal (Ctrl+C) Captured. Shutting down...\n";
-			OnExit();
-			std::exit(signal);
+			if (OnExit())
+				std::exit(signal);
 		}
 
         struct AutoInit
@@ -85,10 +89,11 @@ namespace Tools
 			s_actions.emplace_back(name, priority, action);
 		}
 
-		static void OnExit()
+		// Runs the exit actions once; false when another caller already started the shutdown.
+		static bool OnExit()
 		{
 			if (s_exiting.exchange(1, std::memory_order_acq_rel) == 1)
-				return;
+				return false;
 
 			std::cout << "Application shutdown initiated. Running cleanup actions...\n";
 
@@ -120,6 +125,7 @@ namespace Tools
 					std::cerr << "Exit action '" << act.Name << "' failed with unknown error." << std::endl;
 				}
 			}
+			return true;
 		}
 	};
 }
