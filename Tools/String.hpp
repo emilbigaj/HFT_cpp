@@ -42,7 +42,7 @@ struct alignas(1) StringN
 	void Set(const std::string& s)
 	{
 		if (s.length() > N)
-			throw std::runtime_error("String<" + std::to_string(N) + ">.Set can not fit"+ s);
+			throw std::runtime_error("String<" + std::to_string(N) + ">.Set can not fit " + s);
 
 		std::memset(Chars, 0, N);
 		size_t len =
@@ -63,7 +63,7 @@ struct alignas(1) StringN
 		{
 			size_t len = std::strlen(s);
 			if (len > N)
-				len = N;
+				throw std::runtime_error("String<" + std::to_string(N) + ">.Set can not fit " + std::string(s));
 			std::memcpy(Chars, s, len);
 		}
 	}
@@ -124,4 +124,6 @@ using String64 = StringN<64>;
 using String128 = StringN<128>;
 using String256 = StringN<256>;
 using String512 = StringN<512>;
+
+static_assert(sizeof(String16) == 16 && sizeof(String128) == 128);
 } // namespace Tools

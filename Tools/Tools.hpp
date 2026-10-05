@@ -96,11 +96,9 @@ namespace Tools
 
 	inline bool IsProcessAlive(int32_t pid)
 	{
-		if (pid <= 0)
-			return false;
 		if (kill(pid, 0) == 0)
 			return true;
-		return errno == EPERM;
+		return errno != ESRCH;
 	}
 
 	enum class Access

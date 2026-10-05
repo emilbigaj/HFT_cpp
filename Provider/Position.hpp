@@ -54,29 +54,7 @@ namespace Provider
 
         const Execution::PositionHeader& Header() { return _headerEntry.GetReadonlyRef(); }
 
-        Profit GetProfit()
-        {
-            if (_headerEntry.IsEmpty())
-                return Profit(Tools::Timestamp::UtcNow(), std::nan(""), std::nan(""), 0.0, 0, std::nan(""), std::nan(""));
-
-            Execution::PositionHeader positionHeader = _headerEntry.Read();
-            Data::Quote quote
-            {
-                .TickSize = 0.0,
-                .Bid = Data::Level { .Ticks = 0, .Quantity = 0 },
-                .Ask = Data::Level { .Ticks = 0, .Quantity = 0 }
-            };
-
-            if (Instrument.TryGetQuote(quote))
-            {
-                double floating = Instrument.GetProfit(positionHeader.AvgPrice, quote.MidPrice(), positionHeader.Quantity);
-                return Profit(Tools::Timestamp::UtcNow(), floating + positionHeader.RealizedProfit, floating, positionHeader.RealizedProfit, positionHeader.Quantity, positionHeader.AvgPrice, quote.MidPrice());
-            }
-            else
-            {
-                return Profit(Tools::Timestamp::UtcNow(), std::nan(""), std::nan(""), positionHeader.RealizedProfit, positionHeader.Quantity, positionHeader.AvgPrice, std::nan(""));
-            }
-        }
+        Profit GetProfit(); // Implemented inline in Context.hpp: it stamps with Clock, declared there
 
         // --- One strategy run per ReadSocket pass (2026-09-14 report, C3) ---
         // Phase 1 keeps only the latest row; phase 2 raises once per pass with it. Two position

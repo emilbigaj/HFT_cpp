@@ -2,6 +2,7 @@
 #pragma once
 
 #include "Bitset.hpp"
+#include "Client.hpp"
 #include "Context.hpp"
 #include "Instrument.hpp"
 #include "Loggable.hpp"
@@ -116,7 +117,8 @@ public:
 
     Server(const ServerHeader& serverHeader)
     : ServerName(serverHeader.ServerName.ToString()),
-      _serverHeaderBox(ServerContext::Connect(serverHeader)),
+      // Directories first, as C#: before the header box publishes and the shared arrays are built.
+      _serverHeaderBox((InitDirectories(), ServerContext::Connect(serverHeader))),
       _serverSocket(ServerName.string(), serverHeader.ClientIds.Length()),
       _serverContext(ServerName, Tools::Access::Write),
       _loggingServer(ServerName.string() + ".server", _serverContext.LoggingServerName, {Socket::SocketChannel::AdminChannelLength}, {Socket::SocketChannel::AdminChannelLength}),
@@ -124,8 +126,6 @@ public:
       _riskLayer(_serverContext, Execution::OrderRejectedSource::Server),
       _loggableManager()
     {
-        InitDirectories();
-
         // Before anything else: LoadClients() runs between construction and Connect(), and
         // CreateDetatchedClient() refuses to build a Detached socket while this is false.
         _serverSocket.Persistance = serverHeader.Persistance;
@@ -231,6 +231,7 @@ public:
     // reading every connected client's channel for THIS segment and dispatching its OrderTargets.
     // One reader thread per (client, channel) => SPSC-safe; different segments touch different
     // ReadOnlySockets. It also drains the injection queue first (hub cancels + RX replays).
+    // Realtime: the caller wraps each call in try/catch -> AlertManager::OnException and keeps polling; an exception must never end the process.
     void ReadExecution(int32_t coreGroupId)
     {
         // Drain injected OrderTargets first (hub cancels + RX replays): sole reader, no lock. Copy out
@@ -266,7 +267,9 @@ public:
                     case static_cast<uint8_t>(Execution::OrderType::OrderRejected):
                     {
                         const Execution::OrderRejected& orderRejected = *reinterpret_cast<const Execution::OrderRejected*>(rdst.data());
-                        OnControlAlgoStatus(orderRejected.OrderHeader.OrderId.StrategyId(), orderRejected.OrderHeader.OrderId.InstrumentId(), Execution::AlgoStatus::Paused);
+                        // A manual order is not the algo's: its refusal never pauses the strategy it books to.
+                        if (orderRejected.OrderHeader.OrderId.IsAlgoOrder())
+                            OnControlAlgoStatus(orderRejected.OrderHeader.OrderId.StrategyId(), orderRejected.OrderHeader.OrderId.InstrumentId(), Execution::AlgoStatus::Paused);
                         break;
                     }
                     case static_cast<uint8_t>(Provider::ControlType::RiskLimit):
@@ -301,7 +304,7 @@ public:
         riskLimitEntry.AcquireLock();
         riskLimit.MaxOrderQuantity = controlRiskLimit.MaxOrderQuantity;
         riskLimit.MaxPositionQuantity = controlRiskLimit.MaxPositionQuantity;
-        riskLimit.Timestamp = Tools::Timestamp::UtcNow();
+        riskLimit.Timestamp = Clock::GetUtcNow();
         riskLimitEntry.ReleaseLock();
 
         // Server-wide limit: the posted row is what the logging server appends to the server's .risklimit file.
@@ -312,7 +315,7 @@ public:
     
     void OnControlAlgoStatus(int32_t strategyId, int32_t instrumentId, Execution::AlgoStatus algoStatus)
     {
-        Tools::Timestamp now = Tools::Timestamp::UtcNow();
+        Tools::Timestamp now = Clock::GetUtcNow();
         Socket::SharedArrayEntry<Execution::PositionHeader>& localPositionEntry = _serverContext.GetPositionHeader(strategyId, instrumentId);
         Execution::PositionHeader localPosition = localPositionEntry.GetReadonlyRef();
         localPosition.OrderHeader.ExchangeTimestamp = now;
@@ -341,7 +344,7 @@ public:
                 orderTarget.OrderTargetStatus = Execution::OrderStateStatus::Active;
                 orderTarget.OrderTargetAction = Execution::OrderTargetAction::Cancel;
                 orderTarget.OrderHeader.Seq += 1'000'000;
-                orderTarget.OrderHeader.NicTimestamp = Tools::Timestamp::UtcNow();
+                orderTarget.OrderHeader.NicTimestamp = Clock::GetUtcNow();
                 // Client process is dead, so the server is the slot's sole writer: stamp the cancel in
                 // so the vendor's replay-on-ack cancels a still-PendingNew order.
                 orderTargetEntry.RecoveryWrite(orderTarget);
@@ -351,6 +354,7 @@ public:
         }
     }
 
+    // Realtime: the caller wraps each call in try/catch -> AlertManager::OnException and keeps polling; an exception must never end the process.
     void ReadAdmin()
     {
         std::span<const uint8_t> rdst;
@@ -385,19 +389,23 @@ public:
         _serverContext.OnInstrumentHeader(instrumentHeader128);
     }
 
-    void OnQuantityAhead(Execution::OrderId clientOrderId, int32_t quantityAhead)
+    void OnQuantityAhead(Execution::OrderId clientOrderId, int32_t quantityAhead, int32_t quantityBehind)
     {
         Execution::OrderState& orderState = _serverContext.GetOrderState(clientOrderId).GetRef();
         if (orderState.OrderHeader.OrderId == clientOrderId)
         {
-            // Quick write, its atomic, do not lock, it would contend with OnOrderState
-            orderState.QuantityAhead = quantityAhead;
+            // One 64-bit store, no lock (it would contend with OnOrderState): QuantityAhead @56 and QuantityBehind @60 are
+            // adjacent and 8-aligned, so a reader never sees one updated without the other. Keep the two fields together.
+            static_assert(offsetof(Execution::OrderState, QuantityAhead) % 8 == 0
+                && offsetof(Execution::OrderState, QuantityBehind) == offsetof(Execution::OrderState, QuantityAhead) + 4);
+            uint64_t packed = static_cast<uint32_t>(quantityAhead) | (static_cast<uint64_t>(static_cast<uint32_t>(quantityBehind)) << 32);
+            std::atomic_ref<uint64_t>(*reinterpret_cast<uint64_t*>(&orderState.QuantityAhead)).store(packed, std::memory_order_relaxed);
         }
     }
 
     Execution::OrderState OnOrderState(Execution::OrderState& orderState)
     {
-        orderState.OrderHeader.NicTimestamp = Tools::Timestamp::UtcNow();
+        orderState.OrderHeader.NicTimestamp = Clock::GetUtcNow();
         Execution::OrderState& existingOrderState = WriteOrderState(orderState);
         WriteToExecution(existingOrderState);
         if (OrderState)
@@ -420,7 +428,6 @@ public:
         
         if (isSafeToOverwrite)
         {
-            int32_t beforeAckedOrderQuantity = existingOrderState.OrderProfile.Quantity;
             int32_t quantityFilled = std::abs(existingOrderState.QuantityFilled) > std::abs(orderState.QuantityFilled) ? existingOrderState.QuantityFilled : orderState.QuantityFilled;
             orderStateEntry.AcquireLock();
             existingOrderState.OrderHeader.Seq = orderState.OrderHeader.Seq;
@@ -432,7 +439,7 @@ public:
             existingOrderState.OrderHeader.ExchangeTimestamp = orderState.OrderHeader.ExchangeTimestamp;
             existingOrderState.OrderHeader.NicTimestamp = orderState.OrderHeader.NicTimestamp;
             orderStateEntry.ReleaseLock();
-            _riskLayer.OnOrderState(existingOrderState, beforeAckedOrderQuantity);
+            _riskLayer.OnOrderState(existingOrderState);
         }
         return existingOrderState;
     }
@@ -454,7 +461,19 @@ public:
 
         if (orderState.OrderHeader.OrderId == orderRejected.OrderHeader.OrderId)
         {
-            orderRejected.OrderHeader.NicTimestamp = Tools::Timestamp::UtcNow();
+            // A refused Create ends its order: the Done (which releases its risk) is published before the reject that explains it.
+            if (orderRejected.OrderTargetAction == Execution::OrderTargetAction::Create)
+            {
+                Execution::OrderState rejectedState
+                {
+                    .OrderHeader = orderRejected.OrderHeader,
+                    .OrderProfile = orderRejected.OrderProfile,
+                    .OrderStateStatus = Execution::OrderStateStatus::Done,
+                    .OrderStateReason = Execution::OrderStateReason::Rejected,
+                };
+                OnOrderState(rejectedState);
+            }
+            orderRejected.OrderHeader.NicTimestamp = Clock::GetUtcNow();
             _riskLayer.OnOrderRejected(orderRejected);
             Reject(orderRejected, message);
             return orderRejected;
@@ -468,9 +487,11 @@ public:
     void Reject(const Execution::OrderRejected& orderRejected, const std::string& message)
     { 
         WriteToExecution(orderRejected);
-        if (!orderRejected.OrderRejectedReasons.IsEmpty() && orderRejected.OrderRejectedReasons.IsSubsetOf(Execution::OrderRejected::OrderDiscarded))
+        if (Client::IsDiscarded(orderRejected))
             return;
-        OnControlAlgoStatus(orderRejected.OrderHeader.OrderId.StrategyId(), orderRejected.OrderHeader.OrderId.InstrumentId(), Execution::AlgoStatus::Paused);
+        // A manual order is not the algo's: its refusal is reported but never pauses the strategy it books to.
+        if (orderRejected.OrderHeader.OrderId.IsAlgoOrder())
+            OnControlAlgoStatus(orderRejected.OrderHeader.OrderId.StrategyId(), orderRejected.OrderHeader.OrderId.InstrumentId(), Execution::AlgoStatus::Paused);
         if (OrderRejected)
             OrderRejected(orderRejected, message);
     }
@@ -504,9 +525,10 @@ public:
                 .OrderStateReason = isValid ? Execution::OrderStateReason::PendingNew : Execution::OrderStateReason::Rejected,
                 .QuantityFilled = 0,
                 .QuantityAhead = quantityAhead,
+                .QuantityBehind = 0,
             };
             orderState.OrderHeader.Seq = 0; // indicates new Order but that ordertarget is not acked by exchange
-            orderState.OrderHeader.NicTimestamp = Tools::Timestamp::UtcNow();
+            orderState.OrderHeader.NicTimestamp = Clock::GetUtcNow();
             orderStateEntry.ReleaseLock();
             WriteToExecution(orderState);
         }
@@ -528,7 +550,7 @@ public:
 				.OrderProfile = orderTarget.OrderProfile,
 				.OrderRejectedReasons = orderRejectedReasons,
 			};
-            orderRejected.OrderHeader.NicTimestamp = Tools::Timestamp::UtcNow();
+            orderRejected.OrderHeader.NicTimestamp = Clock::GetUtcNow();
 			Reject(orderRejected, "Rejected by Server Risk Layer");
 		}
     }
@@ -629,8 +651,12 @@ public:
             throw std::out_of_range("Server::OnFill: unknown clientOrderId");
         }
 
-        Tools::Timestamp now = Tools::Timestamp::UtcNow();
-        orderState.OrderHeader.NicTimestamp = now;
+        // A resent fill (iLink PossRetransFlag) repeats a cumulative filled quantity the row already holds: drop it whole.
+        if (std::abs(orderState.QuantityFilled) <= std::abs(existingOrderState.QuantityFilled))
+            return;
+
+        Tools::Timestamp now = Clock::GetUtcNow();
+        orderState.OrderHeader.NicTimestamp = now;   // same stamp as its fills: equal NIC keeps ring order (state, fill, position) in the audit
         for (Execution::Fill& fill : fills)
         {
             // Leg ids differ from the order's only in the InstrumentId bits, so GlobalIndex (client +
@@ -663,11 +689,7 @@ public:
             Data::Instrument& instrument = _serverContext.GetInstrument(instrumentId);
             _serverContext.GetPositionHeader(instrumentId).GetRef().OnFill(fill, instrument.Multiplier());
             _serverContext.GetPositionHeader(strategyId, instrumentId).GetRef().OnFill(fill, instrument.Multiplier());
-            // A legged instrument's own fill is accounting only (volume/position view on the spread
-            // row); risk lives on the legs, so releasing it here would double-release the legs the
-            // leg fills already covered. Risk is an outright concept.
-            if (!instrument.IsLegged())
-                _riskLayer.OnFill(fill);
+            _riskLayer.OnFill(fill);
         }
 
         for (size_t i = fills.size(); i-- > 0; )
@@ -886,7 +908,7 @@ public:
                           << allocateInstrument.ExchangeInstrumentId << ") is no longer listed; not restored." << std::endl;
                 continue;
             }
-            OnAllocateInstrument(allocateInstrument.ClientId, allocateInstrument);
+            OnAllocateInstrument(allocateInstrument);
         }
     }
 

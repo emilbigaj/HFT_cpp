@@ -4,6 +4,71 @@ Newest first. Each entry says what changed, why, and what it broke or unblocked.
 
 ---
 
+## Client-side risk copy, RiskLimit/WorkingRisk split, Reduce, duplicate-fill drop (C# `fdae2ab` + `8f229aa`, report 2026-10-04)
+
+**FOR C# CLAUDE — read this first.** The report's §0 "Baseline" and §1.9 claims about the C++ tree
+(no `RiskLimit.Timestamp`, no `OrderTarget.TimeInForce`, no `TimeInForce::Day = 0`, discard set
+missing 45) and its C++ line numbers were taken from branch `main`, which is still the initial
+commit. All C++ alignment work lives on **`persist-client-sockets`**; diff against that branch.
+Two "already handed off" items were in fact NOT yet ported and are done here: `SideByPrice64.Quantity`
+and SIGHUP. C++ has no TCP mirror (the mirror is C#-only and numbers arrays by its own C# creation
+order), so the missing C++ `MessageEfficiency` array does not shift mirror ids.
+
+WIRE (deploy in lockstep with C#): `RiskLimit` 24 B (Worst* removed); new `WorkingRisk` 16 B,
+`OrderType::WorkingRisk = 17`; `OrderRisk` still 64 B but `AbsAckedOrderQuantity@4`,
+`AbsOrderQuantities[29]@6`, `MaxActiveTargets = 29`, zero-arg `GetAbsWorstOrderQuantity()`;
+`OrderTargetAction {Create 0, Replace 1, Cancel 2, Reduce 3}`; `OrderProfile::IsReduceOf`;
+`OrderState` 64 B with `QuantityBehind@60` (2026-09-26 item); `AheadOfOrder` 20 B;
+`SideByPrice64.Quantity@17` (320 B kept), `MarketByPrice64` pack 1 / 664 B; new `Settlement` 64 B
+tick. Shared arrays: `<dir>/WorkingRisks` (new, last base array), `<dir>/OrderRisks` now per
+context, base-array creation order matches C#. Static asserts for every size/offset above.
+
+RiskLayer runs on server AND client over its own context (`RiskLayer(Context&, source)`): server-
+only early returns removed; `ApplyWorstWorkingQuantityDelta` seq-bumps `WorkingRisk`;
+`GetAbsAllowedOrderQuantity` (int64, floor for negative room) + `IsWithinRiskLimit` check-then-
+commit; rate limit counts Cancel and a true `Reduce` (IsReduceOf vs STATE row) without refusing;
+`OnOrderState(state)` one-arg; `OnFill(fill, isReserved)` moves `WorkingRisk.Position` for every
+fill and releases only non-legged; `OnOrderRejected` ignores own-source and Cancel.
+`TryClipToRiskLimit` not ported (Algo-only).
+
+Server: resent fills dropped whole (`|reported filled| <= |row filled|`, before any stamp/lock);
+a manual order's reject never pauses (both sites); `RiskLayer::OnFill` for every fill; refused
+Create publishes Done/Rejected through `OnOrderState` BEFORE the reject (`8f229aa`);
+`OnQuantityAhead(id, ahead, behind)` one 64-bit atomic_ref store; every timestamp via the
+sim-aware `Clock::GetUtcNow()`; `InitDirectories` before `Connect`; `LoadInstruments` replays
+server-side only. Read-loop try/catch lives in the vendor loops (CME `CmeServer` already wraps
+them in `TryCatch`). The C++-only "Simulation on live server" guard is kept deliberately.
+
+Client: echo gate (`_ackedSeqs[64]`), `OnFill(fill, own ClientId)`, reject release before the
+discard check, `IsDiscarded` with the sim-only TooManyOrdersPerSession (57) carve-out (C++ had
+56 — wrong), spread-shape refusal (two-leg ±1 only) before onboarding, startup refusal on a
+previous process's Active order + `OrderRisk` clear + `WorkingRisk` seed from own position;
+`ApplyMarketByPrice` follows the C# Delta/Update/Snapshot branches. `Strategy::Amend` sends
+Reduce when `IsReduceOf` the active profile, else Replace. Simulation algos allocate Live.
+
+Tools/Socket parity: SIGHUP handled; Bitset64 JSON is a bare number; JSON accepts comments and
+trailing commas; `StringN::Set` throws on overflow (no silent truncation); `Timestamp::FromString`
+fallback formats; `MLock` reports instead of throwing; sockets/logger cancel their exit actions
+in their destructors (C++-only: OnExit now also runs from atexit). Stale duplicate
+`Execution/RateLimit.hpp` structs deleted.
+
+CME adapter (`~/cpp/CME`, uncommitted there): router sends only the reject for a refused Create
+(three sites: `ExecutionReportReject`, `OnRequestRefused`, `OnOrderRefused`); a refused modify
+echoes the request's own action; `Reduce` already encodes as `NewReplace` (iLink modify, never a
+default/throw branch); queue tracker passes `QuantityBehind = 0` (no queue model on a live
+session); reject re-arm accepts Replace|Reduce.
+
+Not ported (C#-only or decision items): MessageEfficiency array/structs (pre-existing gap, no C++
+consumer); `TryClipToRiskLimit`; Algo/ActiveTarget/simulator/widgets.
+
+Verified: build clean; ExecutionTests (incl. §6.2 OrderRisk differential test, 29-slot cap,
+QuantityNotValid edge cases, fixed vector [1,9,7,9]), DataTests (200k-step book property test),
+ToolsTests pass; CME adapter builds against the new headers and its unit tests pass. Five
+independent reviewers (wire, risk, server, client, completeness) re-diffed against C#; one JSON
+key regression found and fixed.
+
+---
+
 ## Session state is the exchange's TradingStatus; Alert carries a Timestamp (C# `9155763`, 2026-09-24)
 
 **TradingStatus gate**: C# deleted `Instrument.SessionManager`/`IsInSession`; ours was a

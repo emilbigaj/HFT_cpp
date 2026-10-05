@@ -1,7 +1,11 @@
 #include "Order.hpp"
+#include <algorithm>
+#include <cstring>
 #include <iostream>
+#include <random>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 // Minimal check harness: prints each failure, returns non-zero if any check failed.
 static int32_t s_failures = 0;
@@ -25,12 +29,141 @@ int main()
     // ---------------------------------------------------------------------
     CHECK(sizeof(Execution::OrderId) == 8);
     CHECK(sizeof(Execution::OrderHeader) == 28);
-    CHECK(sizeof(Execution::OrderState) == 60);
+    CHECK(sizeof(Execution::OrderState) == 64);
     CHECK(sizeof(Execution::Fill) == 64);
     CHECK(offsetof(Execution::Fill, Price) == 40);
     CHECK(sizeof(Execution::OrderRejected) == 52);
     CHECK(sizeof(Execution::OrderTarget) == 52);
     CHECK(sizeof(Execution::PositionHeader) == 57);
+    CHECK(sizeof(Execution::RiskLimit) == 24);
+    CHECK(sizeof(Execution::WorkingRisk) == 16);
+    CHECK(sizeof(Execution::OrderRisk) == 64);
+    CHECK(Execution::OrderRisk::MaxActiveTargets == 29);
+    CHECK(sizeof(Execution::AheadOfOrder) == 20);
+
+    // ---------------------------------------------------------------------
+    // Enum values and the discarded set (wire contract with C#)
+    // ---------------------------------------------------------------------
+    CHECK(static_cast<uint8_t>(Execution::OrderType::WorkingRisk) == 17);
+    CHECK(static_cast<uint8_t>(Execution::OrderTargetAction::Create) == 0);
+    CHECK(static_cast<uint8_t>(Execution::OrderTargetAction::Replace) == 1);
+    CHECK(static_cast<uint8_t>(Execution::OrderTargetAction::Cancel) == 2);
+    CHECK(static_cast<uint8_t>(Execution::OrderTargetAction::Reduce) == 3);
+    CHECK(Execution::OrderRejected::OrderDiscarded.Raw() == 0x01007F0000000000ULL); // bits 40..46 and 56
+
+    // ---------------------------------------------------------------------
+    // OrderRisk against a reference model: an in-flight multiset capped at 29 plus the acked quantity
+    // ---------------------------------------------------------------------
+    {
+        using Execution::OrderRisk;
+        using Execution::OrderRejectedReason;
+
+        std::mt19937 random(12345);
+        for (int32_t run = 0; run < 400; run++) // 400 x 500 = 200k ops
+        {
+            OrderRisk orderRisk{};
+            std::vector<int32_t> inFlight;
+            int32_t acked = 0;
+            for (int32_t op = 0; op < 500; op++)
+            {
+                int32_t quantity = std::uniform_int_distribution<int32_t>(1, 40)(random) * (random() % 2 ? 1 : -1);
+                int32_t kind = static_cast<int32_t>(random() % 3);
+                if (kind == 0)
+                {
+                    OrderRejectedReason reason = OrderRejectedReason::Unknown;
+                    bool isAdded = orderRisk.TryAdd(quantity, reason);
+                    bool isExpectedAdded = inFlight.size() < static_cast<size_t>(OrderRisk::MaxActiveTargets);
+                    CHECK(isAdded == isExpectedAdded);
+                    if (isExpectedAdded)
+                        inFlight.push_back(std::abs(quantity));
+                    else
+                        CHECK(reason == OrderRejectedReason::TooManyActiveTargets);
+                }
+                else
+                {
+                    // Mostly retire a live entry, sometimes a stray quantity that was never reserved.
+                    if (!inFlight.empty() && random() % 4 != 0)
+                        quantity = inFlight[random() % inFlight.size()] * (random() % 2 ? 1 : -1);
+                    auto it = std::find(inFlight.begin(), inFlight.end(), std::abs(quantity));
+                    if (it != inFlight.end())
+                        inFlight.erase(it);
+                    if (kind == 1)
+                    {
+                        orderRisk.Ack(quantity);
+                        acked = std::abs(quantity);
+                    }
+                    else
+                    {
+                        orderRisk.Reject(quantity);
+                    }
+                }
+
+                int32_t worst = acked;
+                for (int32_t q : inFlight)
+                    worst = std::max(worst, q);
+                CHECK(orderRisk.GetAbsWorstOrderQuantity() == worst);
+                CHECK(orderRisk.ActiveTargetsCount == inFlight.size());
+                CHECK(orderRisk.IsFull() == (inFlight.size() == static_cast<size_t>(OrderRisk::MaxActiveTargets)));
+            }
+        }
+
+        // The 30th add is refused.
+        {
+            OrderRisk orderRisk{};
+            OrderRejectedReason reason = OrderRejectedReason::Unknown;
+            for (int32_t i = 0; i < OrderRisk::MaxActiveTargets; i++)
+                CHECK(orderRisk.TryAdd(i + 1, reason));
+            CHECK(orderRisk.IsFull());
+            CHECK(!orderRisk.TryAdd(1, reason));
+            CHECK(reason == OrderRejectedReason::TooManyActiveTargets);
+        }
+
+        // Quantities outside 1..65535 are refused before the count is looked at.
+        for (int32_t quantity : { 0, 65536, std::numeric_limits<int32_t>::max(), std::numeric_limits<int32_t>::min() })
+        {
+            OrderRisk orderRisk{};
+            OrderRejectedReason reason = OrderRejectedReason::Unknown;
+            CHECK(!orderRisk.TryAdd(quantity, reason));
+            CHECK(reason == OrderRejectedReason::QuantityNotValid);
+            CHECK(orderRisk.ActiveTargetsCount == 0);
+        }
+
+        // A zeroed row reserves nothing.
+        {
+            OrderRisk orderRisk;
+            std::memset(static_cast<void*>(&orderRisk), 0, sizeof(orderRisk));
+            CHECK(orderRisk.GetAbsWorstOrderQuantity() == 0);
+        }
+
+        // Fixed vector, checked word by word: count, worst, acked, first in-flight entry.
+        {
+            OrderRisk orderRisk{};
+            OrderRejectedReason reason = OrderRejectedReason::Unknown;
+            CHECK(orderRisk.TryAdd(7, reason));
+            CHECK(orderRisk.TryAdd(-9, reason));
+            orderRisk.Ack(7);
+            uint16_t words[32];
+            std::memcpy(words, &orderRisk, sizeof(words));
+            CHECK(words[0] == 1);
+            CHECK(words[1] == 9);
+            CHECK(words[2] == 7);
+            CHECK(words[3] == 9);
+            CHECK(orderRisk.GetAbsWorstOrderQuantity() == 9);
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // OrderProfile::IsReduceOf: strictly less quantity, same price and side
+    // ---------------------------------------------------------------------
+    {
+        using Execution::OrderProfile;
+        CHECK((OrderProfile{ 100, 3 }.IsReduceOf(OrderProfile{ 100, 5 })));
+        CHECK((OrderProfile{ 100, -3 }.IsReduceOf(OrderProfile{ 100, -5 })));
+        CHECK(!(OrderProfile{ 100, 5 }.IsReduceOf(OrderProfile{ 100, 5 })));
+        CHECK(!(OrderProfile{ 101, 3 }.IsReduceOf(OrderProfile{ 100, 5 })));
+        CHECK(!(OrderProfile{ 100, -3 }.IsReduceOf(OrderProfile{ 100, 5 })));
+        CHECK(!(OrderProfile{ 100, 0 }.IsReduceOf(OrderProfile{ 100, 5 })));
+    }
 
     // ---------------------------------------------------------------------
     // Bit-budget constants

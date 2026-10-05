@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <emmintrin.h>
@@ -33,6 +34,12 @@ namespace Socket
             int32_t Length;
             int32_t ObjectType;
         };
+
+        static_assert(sizeof(std::atomic<uint64_t>) == 8 && std::atomic<uint64_t>::is_always_lock_free);
+        static_assert(sizeof(Header64) == 64);
+        static_assert(offsetof(Header64, Magic) == 8);
+        static_assert(offsetof(Header64, Length) == 16);
+        static_assert(offsetof(Header64, ObjectType) == 20);
 
         static inline int32_t GetAlignedEntryLength(int32_t valueLength)
         {

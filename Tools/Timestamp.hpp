@@ -7,6 +7,7 @@
 #include <sstream>
 #include <chrono>
 #include <algorithm>
+#include <array>
 #include <format>
 
 #include <cstdio>
@@ -392,15 +393,30 @@ namespace Tools
                 static_cast<unsigned>(ymd.day()));
         }
 
+        static bool TryParse(const std::string& input, const std::string& format, std::chrono::sys_time<std::chrono::nanoseconds>& tp, bool exact)
+        {
+            std::istringstream iss(input);
+            iss >> std::chrono::parse(format, tp);
+            return !iss.fail() && (!exact || iss.peek() == std::char_traits<char>::eof());
+        }
+
         static Timestamp FromString(const std::string& input, const std::string& format = "%Y-%m-%d %H:%M:%S")
         {
             std::string cleaned = input;
             cleaned.erase(std::remove(cleaned.begin(), cleaned.end(), '_'), cleaned.end());
+            size_t first = cleaned.find_first_not_of(" \t\n\r\f\v");
+            size_t last = cleaned.find_last_not_of(" \t\n\r\f\v");
+            cleaned = first == std::string::npos ? std::string() : cleaned.substr(first, last - first + 1);
+
+            // The short formats are tried only after the caller's own format fails, so nothing that parses
+            // today changes: a date alone means midnight, a time without seconds means :00.
+            static constexpr std::array<const char*, 3> s_shortFormats = { "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d" };
 
             std::chrono::sys_time<std::chrono::nanoseconds> tp;
-            std::istringstream iss(cleaned);
-            iss >> std::chrono::parse(format, tp);
-            if (iss.fail())
+            bool parsed = TryParse(cleaned, format, tp, false);
+            for (size_t i = 0; !parsed && i < s_shortFormats.size(); i++)
+                parsed = TryParse(cleaned, s_shortFormats[i], tp, true);
+            if (!parsed)
                 throw std::runtime_error("Timestamp parse error: '" + input + "' does not match format '" + format + "'");
 
             int64_t ns = tp.time_since_epoch().count();
@@ -420,6 +436,8 @@ namespace Tools
 
     inline const Timestamp Timestamp::MaxValue = Timestamp(INT64_MAX);
     inline const Timestamp Timestamp::MinValue = Timestamp(0);
+
+    static_assert(sizeof(Timestamp) == 8);
 }
 
 

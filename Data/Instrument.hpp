@@ -60,21 +60,25 @@ namespace Data
 		uint8_t Reserved1[4] = {0};
 		std::string ToString() const
 		{
-			return Tools::Json::Serialize(this);
+			return Tools::Json::Serialize(*this);
 		}
 
 		struct glaze
 		{
 			using T = InstrumentHeader;
 			static constexpr auto value = glz::object(
+				"Header", &T::Header,
 				"InstrumentType", &T::InstrumentType,
 				"CoreGroupId", &T::CoreGroupId,
+				"TradingStatus", &T::TradingStatus,
 				"Exchange", &T::Exchange,
 				"Root", &T::Root,
+				"TickSize", &T::TickSize,
+				"InverseTickSize", &T::InverseTickSize,
+				"DisplayFactor", &T::DisplayFactor,
 				"InstrumentHeaderId", &T::InstrumentHeaderId,
 				"InstrumentId", &T::InstrumentId,
-				"TickSize", &T::TickSize,
-				"InverseTickSize", &T::InverseTickSize
+				"ExchangeInstrumentId", &T::ExchangeInstrumentId
 			);
 		};
 	};
@@ -98,7 +102,7 @@ namespace Data
 
 		std::string ToString() const
 		{
-			return Tools::Json::Serialize(this);
+			return Tools::Json::Serialize(*this);
 		}
 
 		struct glaze
@@ -127,7 +131,7 @@ namespace Data
 
 		std::string ToString() const
 		{
-			return Tools::Json::Serialize(this);
+			return Tools::Json::Serialize(*this);
 		}
 
 		struct glaze
@@ -359,6 +363,13 @@ namespace Data
 		// (Client::MarketByPrice - the C++ rendering of C#'s Instrument.MarketByPriceDelta).
 		std::function<void()> QuoteChanged;
 		std::function<void()> MarketByPriceChanged;
+		std::function<void(const Data::Settlement&)> SettlementChanged;
+
+		void OnSettlement(const Data::Settlement& settlement)
+		{
+			if (SettlementChanged)
+				SettlementChanged(settlement);
+		}
 
 		// Phase 1, per folded delta: refresh the quote cache from the book image, remembering the
 		// quote as it was when this pass FIRST touched the book.
@@ -516,6 +527,18 @@ namespace Data
 
 		bool TryGetQuote(Quote& quote)
 		{
+			if (Header().TradingStatus != TradingStatus::Open)
+			{
+				quote = {};
+				return false;
+			}
+
+			if (_isQuoteValid)
+			{
+				quote = _quote;
+				return true;
+			}
+
 			while (true)
 			{
 				uint64_t seq0 = _mbpEntry.GetSeq();
@@ -627,11 +650,6 @@ namespace Data
 		Spread(int32_t id, Socket::SharedArrayEntry<Data::LeggedHeader> headerEntry, Socket::SharedArrayEntry<MarketByPrice64> mbpEntry, const Future& longFuture, const Future& shortFuture) : Instrument(id, headerEntry.Cast<Data::InstrumentHeader128>(), mbpEntry), _long(longFuture), _short(shortFuture)
 		{
 			_symbology = Legged().Symbology();
-			// Current runtime scope is 2-leg ±1 calendars; wider weights are out of scope and
-			// must fail loudly at construction, not misprice risk quietly.
-			for (const Data::LegHeader& legHeader : Legged().Legs())
-				if (legHeader.Weight != 1 && legHeader.Weight != -1)
-					throw std::invalid_argument("Spread: only ±1 leg weights are supported.");
 			_legs = { Data::InstrumentLeg{ longFuture.InstrumentId, 1 }, Data::InstrumentLeg{ shortFuture.InstrumentId, -1 } };
 		}
 

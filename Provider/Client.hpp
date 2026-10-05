@@ -35,11 +35,9 @@ public:
 private:
     Socket::ClientSocket _socket;
     Tools::Bitset64 _isOrderActive;
+    // Per local slot: the last seq whose ack RiskLayer applied, so an echoed state is not applied twice.
+    int32_t _ackedSeqs[64] = {};
     bool _isDisposed = false;
-    // Read-only view of the server's rows for validation only. RiskLayer borrows rather than owns,
-    // so the client has to hold the instance it hands over.
-    Provider::ServerContext _riskServerContext;
-    Provider::RiskLayer _riskLayer;
 
     // CoreGroupIds of the instruments this client has allocated => which execution channels ReadSocket drains.
     Tools::Bitset64 _coreGroupIds;
@@ -82,6 +80,8 @@ public:
     Provider::ClientContext ClientContext;
 
 private:
+    // Bound to ClientContext: a client's OrderRisks and WorkingRisks are its own rows.
+    Provider::RiskLayer _riskLayer;
     // Read-only view of the server's authoritative book (serverName-keyed), used to seed each
     // instrument's replica once on subscription. The strategy process does not init ContextManager,
     // so we open the server's book directly here rather than via ContextManager::ServerContextInstance.
@@ -106,13 +106,14 @@ public:
           // server's declared CoreGroupIds (read before connecting).
           _socket(ClientName, ServerName, ReadServerChannelLengths(ServerName), ReadServerChannelLengths(ServerName)),
           _isOrderActive(0ULL),
-          _riskServerContext(ServerName, Tools::Access::Read),
-          _riskLayer(_riskServerContext, Execution::OrderRejectedSource::Client),
           ClientId(_socket.Connect()),
           ClientContext(ClientName, ServerName, Tools::Access::Write),
+          _riskLayer(ClientContext, Execution::OrderRejectedSource::Client),
           _serverMarketsByPrice(ServerName / "MarketsByPrice", ClientContext.ServerHeader().GetReadonlyRef().InstrumentIds.Length(), Tools::Access::Read)
     {
         _instrumentData.resize(static_cast<size_t>(ClientContext.ServerHeader().GetReadonlyRef().InstrumentIds.Length()));
+        ExchangeTimestamp = Clock::GetUtcNow();
+        NicTimestamp = Clock::GetUtcNow();
     }
 
     // One strategy run per pass (2026-09-14 report): phase 1 folds everything queued into the
@@ -161,6 +162,9 @@ public:
         if (ClientContext.GetInstrumentHeader(instrumentHeaderId).GetReadonlyRef().AsInstrumentHeader().InstrumentType == Data::InstrumentType::Spread)
         {
             Data::LeggedHeader leggedHeader = ClientContext.GetInstrumentHeader(instrumentHeaderId).GetReadonlyRef().AsLegged();
+            // Only a two-leg +1/-1 calendar is modelled (Spread builds its risk legs that way); refused here so the request never reaches the server.
+            if (leggedHeader.LegCount != 2 || std::abs(leggedHeader.Leg0.Weight) != 1 || leggedHeader.Leg0.Weight != -leggedHeader.Leg1.Weight)
+                throw std::logic_error("Spread " + std::to_string(instrumentHeaderId) + ": only a two-leg +1/-1 calendar is supported");
             for (const Data::LegHeader& legHeader : leggedHeader.Legs())
                 GetInstrument(legHeader.InstrumentHeaderId);
         }
@@ -191,9 +195,32 @@ public:
     {
         Data::Instrument& instrument = ClientContext.GetInstrument(instrumentId);
         ClientContext.GetPosition(instrumentId);   // ensure the position is created
+
+        // A previous process's Active orders would hold room, slots and fills this process never made; the server cancels them when that process closes (see Spec.md).
+        ThrowIfPreviousOrdersActive(instrumentId);
+
+        // RiskLayer starts from this strategy's own position, every process: the region can outlive one (the GUI maps it).
+        // A spread's legs come through here themselves before the spread (GetInstrument onboards them first).
+        ClientContext.GetWorkingRisk(instrumentId).Write(Execution::WorkingRisk{ .Position = ClientContext.GetPositionHeader(instrumentId).GetReadonlyRef().Quantity });
+
         OpenInstrumentDataSocket(instrumentId, instrument.Symbol());
         _coreGroupIds.Set(instrument.Header().CoreGroupId);
         return instrument;
+    }
+
+    void ThrowIfPreviousOrdersActive(int32_t instrumentId)
+    {
+        for (int32_t localIndex = 0; localIndex < 64; ++localIndex)
+        {
+            Execution::OrderId orderId = Execution::OrderId().ClientId(ClientId).LocalIndex(localIndex);
+            const Execution::OrderState& orderState = ClientContext.GetOrderState(orderId).GetReadonlyRef();
+            if (orderState.OrderHeader.OrderId.InstrumentId() != instrumentId)
+                continue;
+            if (orderState.OrderStateStatus == Execution::OrderStateStatus::Active)
+                throw std::runtime_error("Order " + orderState.OrderHeader.OrderId.ToString() + " from a previous process is still Active on instrument " + std::to_string(instrumentId) + ": start again once the server has cancelled it.");
+            // Done: its risk row is the previous process's, so this process starts from an empty one.
+            ClientContext.GetOrderRisk(orderId).GetRef() = Execution::OrderRisk{};
+        }
     }
 
     // Strategy: open the per-instrument ring, drain stale frames (protect against lapping), and seed
@@ -261,6 +288,12 @@ public:
                     Trade(trade);
                 break;
             }
+            case static_cast<uint8_t>(Data::TickType::Settlement):
+            {
+                const Data::Settlement& settlement = *reinterpret_cast<const Data::Settlement*>(bytes.data());
+                ClientContext.GetInstrument(instrumentId).OnSettlement(settlement);
+                break;
+            }
             case static_cast<uint8_t>(Data::TickType::TradingStatus):
             {
                 const Data::TradingStatusUpdate& tradingStatusUpdate = *reinterpret_cast<const Data::TradingStatusUpdate*>(bytes.data());
@@ -268,18 +301,53 @@ public:
                 break;
             }
             default:
-                break; // ignore market-data frames this client doesn't consume (e.g. settlements)
+                throw std::runtime_error("Unknown instrument data type: " + std::to_string(type));
         }
     }
 
-    // Apply a delta/snapshot to our own replica under the seqlock, then fire the MarketByPrice callback
-    // with the delta (a mutable copy, matching the callback signature).
+    // Apply a delta/update/snapshot to our own replica under the seqlock; a stale tick or one that changes
+    // no level stops here. Then fire the MarketByPrice callback with the tick (a mutable copy, matching the
+    // callback signature).
     void ApplyMarketByPrice(int32_t instrumentId, std::span<const uint8_t> bytes)
     {
         Socket::SharedArrayEntry<Data::MarketByPrice64>& entry = ClientContext.GetMarketByPrice64(instrumentId);
-        entry.AcquireLock();
-        entry.GetRef().TrySet(bytes);
-        entry.ReleaseLock();
+        Data::MarketByPrice64& mbp64 = entry.GetRef();
+        Data::TickType tickType = reinterpret_cast<const Data::MarketByPrice*>(bytes.data())->TickHeader.TickType;
+
+        bool isDeltas = false;
+        if (tickType == Data::TickType::MarketByPriceDelta)
+        {
+            entry.AcquireLock();
+            isDeltas = mbp64.TrySet(bytes);
+            entry.ReleaseLock();
+        }
+        else if (tickType == Data::TickType::MarketByPriceUpdate)
+        {
+            alignas(Data::MarketByPrice) uint8_t deltaBuffer[Socket::ReadOnlySocket::BufferSize];
+            std::memcpy(deltaBuffer, bytes.data(), bytes.size());
+            std::span<uint8_t> deltaSpan(deltaBuffer, bytes.size());
+
+            entry.AcquireLock();
+            isDeltas = mbp64.TrySetAsDeltas(deltaSpan);
+            entry.ReleaseLock();
+        }
+        else if (tickType == Data::TickType::MarketByPriceSnapshot)
+        {
+            alignas(Data::MarketByPrice) uint8_t pastBuffer[Data::MarketByPrice::SizeOf(64, 64)];
+            alignas(Data::MarketByPrice) uint8_t updateBuffer[Data::MarketByPrice::SizeOf(128, 128)];
+            std::span<uint8_t> pastSpan(pastBuffer, sizeof(pastBuffer));
+            std::span<uint8_t> deltaSpan(updateBuffer, sizeof(updateBuffer));
+
+            mbp64.CopyToSnapshot(instrumentId, pastSpan);
+            Data::MarketByPrice::SnapshotAsUpdate(pastSpan, bytes, deltaSpan); // shrinks deltaSpan to the update
+
+            entry.AcquireLock();
+            isDeltas = mbp64.TrySetAsDeltas(deltaSpan);
+            entry.ReleaseLock();
+        }
+
+        if (!isDeltas)
+            return;
 
         // Phase-1 mark: refresh the instrument's quote cache from our own replica (this thread is
         // its only writer, so the direct read is race-free) and defer the Changed events to phase 2.
@@ -341,6 +409,7 @@ public:
             return false;
         }
         int32_t localOrderIndex = orderTarget.OrderHeader.OrderId.LocalIndex();
+        _ackedSeqs[localOrderIndex] = 0;
 
         if (Send(orderTarget))
         {
@@ -401,25 +470,43 @@ public:
             .OrderRejectedReasons = orderRejectedReasons,
         };
 
-        if (!orderRejectedReasons.IsEmpty() && orderRejectedReasons.IsSubsetOf(Execution::OrderRejected::OrderDiscarded))
-            return;
-
-        if (Clock::Mode == ClockMode::Simulation && orderRejectedReasons.Raw() == (1ULL << static_cast<int32_t>(Execution::OrderRejectedReason::TooManyOrdersPerSecond)))
+        if (IsDiscarded(orderRejected))
             return;
 
         _socket.Write(ClientContext.GetInstrument(orderRejected.OrderHeader.OrderId.InstrumentId()).Header().CoreGroupId, orderRejected);
         if (OrderRejected) OrderRejected(orderRejected);
     }
 
+    // Benign rejections are absorbed silently - no alert, no pause, no escalation. The sim-only
+    // session-limit carve-out layers on top of the struct's own reason check.
+    static bool IsDiscarded(const Execution::OrderRejected& orderRejected)
+    {
+        return orderRejected.IsDiscarded()
+            || (Clock::Mode == ClockMode::Simulation && orderRejected.OrderRejectedReasons.Raw() == (1ULL << static_cast<int32_t>(Execution::OrderRejectedReason::TooManyOrdersPerSession)));
+    }
 
 private:
 
     void OnOrderRejected(const Execution::OrderRejected& orderRejected)
     {
+        NicTimestamp = orderRejected.OrderHeader.NicTimestamp;
+        ExchangeTimestamp = orderRejected.OrderHeader.ExchangeTimestamp;
         Execution::OrderTarget& orderTarget = ClientContext.GetOrderTarget(orderRejected.OrderHeader.OrderId).GetRef();
         bool isTargetDone = orderRejected.OrderHeader.OrderId == orderTarget.OrderHeader.OrderId && orderTarget.OrderHeader.Seq == orderRejected.OrderHeader.Seq;
         if (isTargetDone)
             orderTarget.OrderTargetStatus = Execution::OrderStateStatus::Done;
+
+        // RiskLayer releases what this client reserved for the order, discarded rejects included.
+        if (orderRejected.OrderHeader.OrderId == orderTarget.OrderHeader.OrderId && orderRejected.OrderHeader.OrderId.IsAlgoOrder())
+            _riskLayer.OnOrderRejected(orderRejected);
+
+        // Non-discarded rejections raise the event regardless of source, so exchange/server
+        // rejections severe enough to pause the algo reach the alert layer too.
+        if (IsDiscarded(orderRejected))
+            return;
+
+        if (OrderRejected)
+            OrderRejected(orderRejected);
     }
 
     void OnOrderState(const Execution::OrderState& orderState)
@@ -429,10 +516,22 @@ private:
         Execution::OrderTarget& orderTarget = ClientContext.GetOrderTarget(orderState.OrderHeader.OrderId).GetRef();
         if (orderState.OrderHeader.OrderId == orderTarget.OrderHeader.OrderId)
         {
+            // RiskLayer applies only what the server applied: an echo repeats a Done or an ack this client already saw.
+            int32_t localOrderIndex = orderState.OrderHeader.OrderId.LocalIndex();
+            bool isRiskEvent = orderState.OrderHeader.OrderId.IsAlgoOrder() && _isOrderActive[localOrderIndex]
+                && (orderState.OrderStateStatus == Execution::OrderStateStatus::Done
+                    || (orderState.OrderStateReason == Execution::OrderStateReason::Acked && orderState.OrderHeader.Seq > _ackedSeqs[localOrderIndex]));
+            if (isRiskEvent)
+            {
+                _riskLayer.OnOrderState(orderState);
+                if (orderState.OrderStateReason == Execution::OrderStateReason::Acked)
+                    _ackedSeqs[localOrderIndex] = orderState.OrderHeader.Seq;
+            }
+
             if (orderState.OrderStateStatus == Execution::OrderStateStatus::Done)
             {
                 orderTarget.OrderTargetStatus = Execution::OrderStateStatus::Done;
-                ClientContext.GetPosition(orderState.OrderHeader.OrderId.InstrumentId()).OnOrderDone(orderState.OrderHeader.OrderId.LocalIndex());
+                ClientContext.GetPosition(orderState.OrderHeader.OrderId.InstrumentId()).OnOrderDone(localOrderIndex);
                 Execution::OrderIdAllocator::Free(_isOrderActive, orderState.OrderHeader.OrderId);
             }
             else if (orderState.OrderHeader.Seq >= orderTarget.OrderHeader.Seq)
@@ -450,6 +549,8 @@ private:
         const Execution::Fill& fill = *reinterpret_cast<const Execution::Fill*>(rsrc.data());
         NicTimestamp = fill.OrderHeader.NicTimestamp;
         ExchangeTimestamp = fill.OrderHeader.ExchangeTimestamp;
+        // Every fill on this channel is this strategy's and moves its position; only this client's own orders were reserved here.
+        _riskLayer.OnFill(fill, fill.OrderHeader.OrderId.ClientId() == ClientId);
         if (Fill)
             Fill(fill);
     }

@@ -6,6 +6,7 @@
 #include "Bitset.hpp"
 #include "Tools.hpp"
 #include <cmath>
+#include <limits>
 #include <iostream>
 
 namespace Provider
@@ -15,11 +16,8 @@ namespace Provider
 class RiskLayer
 {
 private:
-    // Borrowed, not owned. The server hands in the context it opened with Access::Write, because the
-    // ledger writes RiskLimit and OrderRisk rows — a context of its own would be Access::Read and every
-    // GetRef() below would throw "Readonly" straight into the ExceptionThrownByRiskLayer catch,
-    // rejecting every order. A client passes a read-only one; its reservation block is gated off.
-    Provider::ServerContext& _serverContext;
+    // The server's context on the server, the client's own on a client: OrderRisks and WorkingRisks are per context.
+    Provider::Context& _context;
     // CLIENT-side only: the high-water mark of this client's own allocations. Valid there because
     // validation runs at send time on one thread, so validation order IS allocation order. The
     // server must NOT run this check: ids come from one per-client counter but travel on per-core-
@@ -30,15 +28,15 @@ private:
     Execution::OrderRejectedSource _orderRejectedSource;
 
 public:
-    RiskLayer(Provider::ServerContext& serverContext, Execution::OrderRejectedSource orderRejectedSource)
-    : _serverContext(serverContext), _orderRejectedSource(orderRejectedSource)
+    RiskLayer(Provider::Context& context, Execution::OrderRejectedSource orderRejectedSource)
+    : _context(context), _orderRejectedSource(orderRejectedSource)
     {
     }
 
     ALWAYS_INLINE Tools::Bitset64 ValidateClient(int32_t clientId, int32_t strategyId)
     {
         Tools::Bitset64 orderRejectedReasons;
-        const ServerHeader& serverHeader = _serverContext.ServerHeader().GetReadonlyRef();
+        const ServerHeader& serverHeader = _context.ServerHeader().GetReadonlyRef();
 
         bool isClientIdValid = clientId >= 0 && clientId < serverHeader.ClientIds.Length();
         if (!isClientIdValid)
@@ -67,7 +65,7 @@ public:
     ALWAYS_INLINE Tools::Bitset64 ValidateInstrument(int32_t strategyId, int32_t instrumentId)
     {
         Tools::Bitset64 orderRejectedReasons;
-        const ServerHeader& serverHeader = _serverContext.ServerHeader().GetReadonlyRef();
+        const ServerHeader& serverHeader = _context.ServerHeader().GetReadonlyRef();
 
         bool isValidInstrumentId = instrumentId >= 0 && instrumentId < serverHeader.InstrumentIds.Length();
         if (!isValidInstrumentId)
@@ -76,12 +74,12 @@ public:
             return orderRejectedReasons;
         }
 
-        if (!_serverContext.GetInstrumentIdsByClientId(strategyId).GetReadonlyRef()[instrumentId])
+        if (!_context.GetInstrumentIdsByClientId(strategyId).GetReadonlyRef()[instrumentId])
         {
             orderRejectedReasons.Set(static_cast<int32_t>(Execution::OrderRejectedReason::InstrumentNotAllocated));
         }
 
-        Data::Instrument& instrument = _serverContext.GetInstrument(instrumentId);
+        Data::Instrument& instrument = _context.GetInstrument(instrumentId);
 
         // Session state IS the exchange's TradingStatus; Unknown counts as closed. The server must
         // publish each instrument's status at startup or nothing trades (see Spec.md).
@@ -148,9 +146,6 @@ public:
         return orderRejectedReasons;
     }
 
-    // ---- retire paths. Server-side only: the client has no authority over the ledger and its
-    // ---- RiskLayer maps the arrays read-only, so touching them there would throw.
-
     // The single home of aggregate arithmetic - every hook and the validator commit go through it.
     // Aggregates are per LEG (an outright is its own single leg, weight +1). Applies an ORDER-unit
     // magnitude delta (negative = release) to each leg's side of exposure. legSide = orderSide *
@@ -161,45 +156,45 @@ public:
         if (magnitudeDelta == 0)
             return;
 
-        for (const Data::InstrumentLeg& leg : _serverContext.GetInstrument(orderId.InstrumentId()).Legs())
+        for (const Data::InstrumentLeg& leg : _context.GetInstrument(orderId.InstrumentId()).Legs())
         {
             int32_t legSide = orderSideSign * ((leg.Weight > 0) - (leg.Weight < 0));
             int32_t legMagnitudeDelta = magnitudeDelta * std::abs(leg.Weight);
-            Execution::RiskLimit& riskLimit = _serverContext.GetRiskLimit(leg.InstrumentId).GetRef();
-            riskLimit.WorstLongWorkingQuantity += legSide > 0 ? legMagnitudeDelta : 0;
-            riskLimit.WorstShortWorkingQuantity -= legSide < 0 ? legMagnitudeDelta : 0;
+            // Seq-bumped (single writer: two plain seq stores) so a reader sees an untorn row and the TCP mirror ships the change.
+            Socket::SharedArrayEntry<Execution::WorkingRisk>& workingRiskEntry = _context.GetWorkingRisk(leg.InstrumentId);
+            Execution::WorkingRisk& workingRisk = workingRiskEntry.GetRef();
+            workingRiskEntry.AcquireLock();
+            workingRisk.WorstLongWorkingQuantity += legSide > 0 ? legMagnitudeDelta : 0;
+            workingRisk.WorstShortWorkingQuantity -= legSide < 0 ? legMagnitudeDelta : 0;
+            workingRiskEntry.ReleaseLock();
         }
     }
 
-    ALWAYS_INLINE void OnOrderState(const Execution::OrderState& orderState, int32_t beforeAckedOrderQuantity)
+    ALWAYS_INLINE void OnOrderState(const Execution::OrderState& orderState)
     {
-        if (_orderRejectedSource != Execution::OrderRejectedSource::Server)
-            return;
-
         // Expects the exchange to acknowledge before it trades: a marketable create or amend arrives as Acked,
         // then its fills. The Acked branch releases the old-to-new quantity change, the Done branch releases
-        // the rest measured from the acked quantity; a fill that carried an unacked quantity would leak the
-        // difference for good. The simulator and CME both honour this (see Spec.md "Acceptance before trade").
+        // the rest of what OrderRisk holds. An ack that rides inside a Fill or Done message is not seen here:
+        // its quantity stays reserved until Done, which releases exactly what the order holds (see Spec.md
+        // "Acceptance before trade").
         if (orderState.OrderStateReason == Execution::OrderStateReason::Acked)
         {
-            Execution::OrderRisk& orderRisk = _serverContext.GetOrderRisk(orderState.OrderHeader.OrderId).GetRef();
+            Execution::OrderRisk& orderRisk = _context.GetOrderRisk(orderState.OrderHeader.OrderId).GetRef();
             Data::Side side = orderState.OrderProfile.Side();
 
-            int32_t worstOrderQuantityBefore = orderRisk.GetAbsWorstOrderQuantity(beforeAckedOrderQuantity);
+            int32_t worstOrderQuantityBefore = orderRisk.GetAbsWorstOrderQuantity();
             orderRisk.Ack(orderState.OrderProfile.Quantity);
-            int32_t worstOrderQuantityAfter = orderRisk.GetAbsWorstOrderQuantity(orderState.OrderProfile.Quantity);
+            int32_t worstOrderQuantityAfter = orderRisk.GetAbsWorstOrderQuantity();
             int32_t worstOrderQuantityDelta = worstOrderQuantityAfter - worstOrderQuantityBefore;
 
             ApplyWorstWorkingQuantityDelta(orderState.OrderHeader.OrderId, side == Data::Side::Buy ? 1 : -1, worstOrderQuantityDelta);
         }
         else if (orderState.OrderStateStatus == Execution::OrderStateStatus::Done)
         {
-            // Release on Done rather than on a reason match: a cancel, reject or expiry that carries a
-            // label this switch does not know would otherwise leak its whole reservation, permanently.
-            Execution::OrderRisk& orderRisk = _serverContext.GetOrderRisk(orderState.OrderHeader.OrderId).GetRef();
+            Execution::OrderRisk& orderRisk = _context.GetOrderRisk(orderState.OrderHeader.OrderId).GetRef();
             Data::Side side = orderState.OrderProfile.Side();
 
-            int32_t worstOrderQuantity = orderRisk.GetAbsWorstOrderQuantity(orderState.OrderProfile.Quantity);
+            int32_t worstOrderQuantity = orderRisk.GetAbsWorstOrderQuantity();
             int32_t released = worstOrderQuantity - std::abs(orderState.QuantityFilled);
 
             orderRisk = Execution::OrderRisk{};
@@ -208,37 +203,75 @@ public:
         }
     }
 
-    // A fill converts reservation into position, so the reservation shrinks by exactly the fill.
+    // Every fill moves Position; only an outright fill of an order this RiskLayer reserved releases one.
     // Raw fill quantity, NOT a state delta: per-fill releases + the Done remainder telescope to
     // exactly the reserved worst, per leg. A leg fill IS an outright fill - its OrderId carries the
     // leg's InstrumentId, whose single self-leg releases the leg's own reservation directly.
-    ALWAYS_INLINE void OnFill(const Execution::Fill& fill)
+    ALWAYS_INLINE void OnFill(const Execution::Fill& fill, bool isReserved = true)
     {
-        if (_orderRejectedSource != Execution::OrderRejectedSource::Server)
+        int32_t instrumentId = fill.OrderHeader.OrderId.InstrumentId();
+        Socket::SharedArrayEntry<Execution::WorkingRisk>& workingRiskEntry = _context.GetWorkingRisk(instrumentId);
+        workingRiskEntry.AcquireLock();
+        workingRiskEntry.GetRef().Position += fill.Quantity;
+        workingRiskEntry.ReleaseLock();
+
+        // A legged instrument's own fill is accounting only (volume/position view on the spread row); risk lives on the
+        // legs, so releasing it here would double-release the legs the leg fills already covered. Risk is an outright concept.
+        if (!isReserved || _context.GetInstrument(instrumentId).IsLegged())
             return;
 
         ApplyWorstWorkingQuantityDelta(fill.OrderHeader.OrderId, fill.Sign(), -std::abs(fill.Quantity));
     }
 
-    // An exchange reject retires exactly the target it names; a server reject never reserved anything.
     ALWAYS_INLINE void OnOrderRejected(const Execution::OrderRejected& orderRejected)
     {
-        if (_orderRejectedSource != Execution::OrderRejectedSource::Server)
+        // Nothing to release: a reject from this side never reserved anything here, and a cancel never reserves.
+        if (orderRejected.OrderRejectedSource == _orderRejectedSource || orderRejected.OrderTargetAction == Execution::OrderTargetAction::Cancel)
             return;
 
-        if (orderRejected.OrderRejectedSource == Execution::OrderRejectedSource::Server)
-            return;
-
-        const Execution::OrderState& orderState = _serverContext.GetOrderState(orderRejected.OrderHeader.OrderId).GetReadonlyRef();
-        Execution::OrderRisk& orderRisk = _serverContext.GetOrderRisk(orderRejected.OrderHeader.OrderId).GetRef();
+        Execution::OrderRisk& orderRisk = _context.GetOrderRisk(orderRejected.OrderHeader.OrderId).GetRef();
         Data::Side side = orderRejected.OrderProfile.Side();
 
-        int32_t worstOrderQuantityBefore = orderRisk.GetAbsWorstOrderQuantity(orderState.OrderProfile.Quantity);
+        int32_t worstOrderQuantityBefore = orderRisk.GetAbsWorstOrderQuantity();
         orderRisk.Reject(orderRejected.OrderProfile.Quantity);
-        int32_t worstOrderQuantityAfter = orderRisk.GetAbsWorstOrderQuantity(orderState.OrderProfile.Quantity);
+        int32_t worstOrderQuantityAfter = orderRisk.GetAbsWorstOrderQuantity();
         int32_t worstOrderQuantityDelta = worstOrderQuantityAfter - worstOrderQuantityBefore;
 
         ApplyWorstWorkingQuantityDelta(orderRejected.OrderHeader.OrderId, side == Data::Side::Buy ? 1 : -1, worstOrderQuantityDelta);
+    }
+
+    // The largest |order quantity| (filled included) this order may carry and still pass the position check: its current
+    // worst plus the room left on every leg. Past the limit ValidateOrder lets it keep its worst (a cut always passes);
+    // isWithinLimit cuts it back to what fits the limit instead, which the server always accepts (see Spec.md).
+    ALWAYS_INLINE int32_t GetAbsAllowedOrderQuantity(const Execution::OrderTarget& orderTarget, bool isWithinLimit = false)
+    {
+        // A Create's row still holds the previous order's values until ValidateOrder resets it.
+        int32_t worstOrderQuantity = orderTarget.OrderTargetAction == Execution::OrderTargetAction::Create ? 0
+            : _context.GetOrderRisk(orderTarget.OrderHeader.OrderId).GetReadonlyRef().GetAbsWorstOrderQuantity();
+        int32_t sign = orderTarget.OrderProfile.Sign();
+        int64_t absAllowedOrderQuantity = std::numeric_limits<int32_t>::max();
+
+        for (const Data::InstrumentLeg& leg : _context.GetInstrument(orderTarget.OrderHeader.OrderId.InstrumentId()).Legs())
+        {
+            // legSide = orderSide * sign(weight), as in ApplyWorstWorkingQuantityDelta: a buy calendar reserves the back leg SHORT.
+            int32_t legSide = sign * ((leg.Weight > 0) - (leg.Weight < 0));
+            const Execution::RiskLimit& riskLimit = _context.GetRiskLimit(leg.InstrumentId).GetReadonlyRef();
+            const Execution::WorkingRisk& workingRisk = _context.GetWorkingRisk(leg.InstrumentId).GetReadonlyRef();
+            int64_t room = legSide > 0
+                ? static_cast<int64_t>(riskLimit.MaxPositionQuantity) - workingRisk.Position - workingRisk.WorstLongWorkingQuantity
+                : static_cast<int64_t>(riskLimit.MaxPositionQuantity) + workingRisk.Position + workingRisk.WorstShortWorkingQuantity;
+            // Past the limit nothing may grow: keep the worst, or within the limit cut by the overshoot rounded up to whole orders.
+            int64_t absWeight = std::abs(leg.Weight);
+            int64_t roomOrderQuantity = room >= 0 ? room / absWeight : isWithinLimit ? -((absWeight - 1 - room) / absWeight) : 0;
+            absAllowedOrderQuantity = std::min(absAllowedOrderQuantity, worstOrderQuantity + roomOrderQuantity);
+        }
+        return static_cast<int32_t>(absAllowedOrderQuantity);
+    }
+
+    // ValidateOrder's position check: what TryAdd would add must fit the room on every leg.
+    ALWAYS_INLINE bool IsWithinRiskLimit(const Execution::OrderTarget& orderTarget)
+    {
+        return std::abs(orderTarget.OrderProfile.Quantity) <= GetAbsAllowedOrderQuantity(orderTarget);
     }
 
     ALWAYS_INLINE bool ValidateOrder(const Execution::OrderTarget& orderTarget, Tools::Bitset64& orderRejectedReasons)
@@ -248,11 +281,12 @@ public:
         {
             // 1. Basic Bounds Check
             int32_t instrumentId = orderTarget.OrderHeader.OrderId.InstrumentId();
+            Data::Instrument& instrument = _context.GetInstrument(instrumentId);
             int32_t strategyId = orderTarget.OrderHeader.OrderId.StrategyId();
             int32_t clientId = orderTarget.OrderHeader.OrderId.ClientId();
 
-            const Execution::OrderTarget& existingTarget = _serverContext.GetOrderTarget(orderTarget.OrderHeader.OrderId).GetReadonlyRef();
-            const Execution::OrderState& orderState = _serverContext.GetOrderState(orderTarget.OrderHeader.OrderId).GetReadonlyRef();
+            const Execution::OrderTarget& existingTarget = _context.GetOrderTarget(orderTarget.OrderHeader.OrderId).GetReadonlyRef();
+            const Execution::OrderState& orderState = _context.GetOrderState(orderTarget.OrderHeader.OrderId).GetReadonlyRef();
 
             // 3. Validate Creation Logic
             if (orderTarget.OrderTargetAction == Execution::OrderTargetAction::Create) // check slot is vacant
@@ -277,7 +311,7 @@ public:
             }
             else
             {
-                bool isAmend = orderTarget.OrderTargetAction == Execution::OrderTargetAction::Amend;
+                bool isReduceOrReplace = orderTarget.OrderTargetAction == Execution::OrderTargetAction::Replace || orderTarget.OrderTargetAction == Execution::OrderTargetAction::Reduce;
 
                 if (_orderRejectedSource == Execution::OrderRejectedSource::Server)
                 {
@@ -290,13 +324,13 @@ public:
                     if (orderState.OrderStateStatus == Execution::OrderStateStatus::Done)
                         orderRejectedReasons.Set(static_cast<int32_t>(Execution::OrderRejectedReason::StateIsDone));
 
-                    if (isAmend && orderState.OrderHeader.Seq + 1 == orderTarget.OrderHeader.Seq && orderState.OrderProfile == orderTarget.OrderProfile)
+                    if (isReduceOrReplace && orderState.OrderHeader.Seq + 1 == orderTarget.OrderHeader.Seq && orderState.OrderProfile == orderTarget.OrderProfile)
                         orderRejectedReasons.Set(static_cast<int32_t>(Execution::OrderRejectedReason::TargetIsActive));
 
                     if (existingTarget.OrderHeader.Seq > orderTarget.OrderHeader.Seq)
                         orderRejectedReasons.Set(static_cast<int32_t>(Execution::OrderRejectedReason::TargetIsStale));
 
-                    if (orderTarget.OrderTargetAction == Execution::OrderTargetAction::Amend && orderState.OrderProfile.Side() != orderTarget.OrderProfile.Side())
+                    if (isReduceOrReplace && orderState.OrderProfile.Side() != orderTarget.OrderProfile.Side())
                         orderRejectedReasons.Set(static_cast<int32_t>(Execution::OrderRejectedReason::SideNotValid));
                 }
 
@@ -312,7 +346,7 @@ public:
                     {
                         if (orderState.OrderStateStatus == Execution::OrderStateStatus::Done)
                             orderRejectedReasons.Set(static_cast<int32_t>(Execution::OrderRejectedReason::StateIsDone));
-                        if (isAmend && existingTarget.OrderTargetStatus == Execution::OrderStateStatus::Done && orderState.OrderProfile == orderTarget.OrderProfile)
+                        if (isReduceOrReplace && existingTarget.OrderTargetStatus == Execution::OrderStateStatus::Done && orderState.OrderProfile == orderTarget.OrderProfile)
                             orderRejectedReasons.Set(static_cast<int32_t>(Execution::OrderRejectedReason::TargetIsActive));
                     }
 
@@ -321,7 +355,7 @@ public:
 
                     if (existingTarget.OrderTargetStatus == Execution::OrderStateStatus::Active) // lastTarget = newTarget ??
                     {
-                        if (isAmend && existingTarget.OrderProfile == orderTarget.OrderProfile)
+                        if (isReduceOrReplace && existingTarget.OrderProfile == orderTarget.OrderProfile)
                             orderRejectedReasons.Set(static_cast<int32_t>(Execution::OrderRejectedReason::TargetIsActive));
 
                         // An in-flight amend whose total is at or below the reported fills leaves the
@@ -336,12 +370,12 @@ public:
                             orderRejectedReasons.Set(static_cast<int32_t>(Execution::OrderRejectedReason::CancelIsActive));
                     }
 
-                    if (orderTarget.OrderTargetAction == Execution::OrderTargetAction::Amend && existingTarget.OrderProfile.Side() != orderTarget.OrderProfile.Side())
+                    if (isReduceOrReplace && existingTarget.OrderProfile.Side() != orderTarget.OrderProfile.Side())
                         orderRejectedReasons.Set(static_cast<int32_t>(Execution::OrderRejectedReason::SideNotValid));
                 }
             }
 
-            const Execution::PositionHeader& localPosition = _serverContext.GetPositionHeader(orderTarget.OrderHeader.OrderId.StrategyId(), orderTarget.OrderHeader.OrderId.InstrumentId()).GetReadonlyRef();
+            const Execution::PositionHeader& localPosition = _context.GetPositionHeader(orderTarget.OrderHeader.OrderId.StrategyId(), orderTarget.OrderHeader.OrderId.InstrumentId()).GetReadonlyRef();
 
             bool isCancel = orderTarget.OrderTargetAction == Execution::OrderTargetAction::Cancel;
             if (!isCancel && orderTarget.OrderHeader.OrderId.IsAlgoOrder() && localPosition.AlgoStatus == Execution::AlgoStatus::Paused)
@@ -350,16 +384,12 @@ public:
                 return false;
             }
 
-            // Risk limits are owned by the server. A client maps the arrays read-only, so taking the
-            // mutable refs below would throw and every client order would come back
-            // ExceptionThrownByRiskLayer. It must not double-count exposure either.
-            if (_orderRejectedSource != Execution::OrderRejectedSource::Server)
+            // The client checks only its own algo orders: a manual order's position sits on another strategy's row.
+            if (_orderRejectedSource == Execution::OrderRejectedSource::Client && !orderTarget.OrderHeader.OrderId.IsAlgoOrder())
                 return orderRejectedReasons.IsEmpty();
 
             if (!orderRejectedReasons.IsEmpty())
                 return false;
-
-            Data::Instrument& instrument = _serverContext.GetInstrument(instrumentId);
 
             // Order-entry throttle, one rolling window per CoreGroup (a CoreGroup maps to an iLink
             // session, which is the scope CME throttles). One combined window sized at the tighter
@@ -368,10 +398,12 @@ public:
             // owns the row.
             if (_orderRejectedSource == Execution::OrderRejectedSource::Server)
             {
-                Execution::RollingRateLimit& rollingRateLimit = _serverContext.GetRateLimit(instrument.Header().CoreGroupId).GetRef();
+                Execution::RollingRateLimit& rollingRateLimit = _context.GetRateLimit(instrument.Header().CoreGroupId).GetRef();
 
-                // A cancel is counted but never refused: it is the message that reduces risk.
-                if (isCancel)
+                // A cancel, or a reduce that really is one against the order's current state, is counted but never refused:
+                // both only take risk off. A reduce that can't be verified (one behind an unacked replace) is throttled like any amend.
+                bool isReduce = orderTarget.OrderTargetAction == Execution::OrderTargetAction::Reduce && orderTarget.OrderProfile.IsReduceOf(orderState.OrderProfile);
+                if (isCancel || isReduce)
                 {
                     rollingRateLimit.SendOrder(Clock::GetUtcNow());
                 }
@@ -383,7 +415,7 @@ public:
             }
 
             // 10. RISK LIMITS - per LEG (an outright is the 1-leg degenerate case).
-            // Only check risk on New or Amend (increasing size)
+            // Only check risk on Create, Replace or Reduce
             if (!isCancel)
             {
 
@@ -393,56 +425,36 @@ public:
                 // Max order quantity per leg, in LEG units - before TryAdd, so rejects need no back-out.
                 for (const Data::InstrumentLeg& leg : instrument.Legs())
                 {
-                    if (std::abs(workingQuantity * leg.Weight) > _serverContext.GetRiskLimit(leg.InstrumentId).GetReadonlyRef().MaxOrderQuantity)
+                    if (std::abs(workingQuantity * leg.Weight) > _context.GetRiskLimit(leg.InstrumentId).GetReadonlyRef().MaxOrderQuantity)
                     {
                         orderRejectedReasons.Set(static_cast<int32_t>(Execution::OrderRejectedReason::QuantityExceedsRiskLimit));
                         return false;
                     }
                 }
 
-                int32_t ackedOrderQuantity = orderTarget.OrderTargetAction == Execution::OrderTargetAction::Create ? 0 : orderState.OrderProfile.Quantity;
+                // Phase 1 - pure: check every leg, write nothing.
+                if (!IsWithinRiskLimit(orderTarget))
+                {
+                    orderRejectedReasons.Set(static_cast<int32_t>(Execution::OrderRejectedReason::PositionExceedsRiskLimit));
+                    return false;
+                }
 
-                Execution::OrderRisk& orderRisk = _serverContext.GetOrderRisk(orderTarget.OrderHeader.OrderId).GetRef();
+                Execution::OrderRisk& orderRisk = _context.GetOrderRisk(orderTarget.OrderHeader.OrderId).GetRef();
 
                 if (orderTarget.OrderTargetAction == Execution::OrderTargetAction::Create)
                     orderRisk = Execution::OrderRisk{};
 
-                // The ONE pre-verdict mutation, with its first-class inverse (Reject) on any breach.
-                int32_t sign = orderTarget.OrderProfile.Sign();
-                int32_t worstQuantityFilledBefore = orderRisk.GetAbsWorstOrderQuantity(ackedOrderQuantity);
-
+                // Phase 2 - commit through the same arithmetic the release hooks use. Single-writer:
+                // nothing can change between the phases, so check-then-apply is atomic by ownership.
+                int32_t worstOrderQuantityBefore = orderRisk.GetAbsWorstOrderQuantity();
                 Execution::OrderRejectedReason reason = Execution::OrderRejectedReason::Unknown;
                 if (!orderRisk.TryAdd(orderTarget.OrderProfile.Quantity, reason))
                 {
                     orderRejectedReasons.Set(static_cast<int32_t>(reason));
                     return false;
                 }
-                int32_t worstMagnitudeDelta = orderRisk.GetAbsWorstOrderQuantity(ackedOrderQuantity) - worstQuantityFilledBefore;
-
-                // Phase 1 - PURE: check every leg, write nothing. The magnitude delta is >= 0, so
-                // legDelta's own sign IS the leg's side - routing by the ORDER's sign corrupts every
-                // negative-weight leg (a buy calendar reserves the back leg SHORT, not long).
-                for (const Data::InstrumentLeg& leg : instrument.Legs())
-                {
-                    int32_t legDelta = worstMagnitudeDelta * sign * leg.Weight;
-                    const Execution::RiskLimit& riskLimit = _serverContext.GetRiskLimit(leg.InstrumentId).GetReadonlyRef();
-                    int32_t quantity = _serverContext.GetPosition(leg.InstrumentId).Header().Quantity;
-
-                    bool isRiskLimitExceeded = legDelta >= 0
-                        ? quantity + riskLimit.WorstLongWorkingQuantity + legDelta > riskLimit.MaxPositionQuantity
-                        : quantity + riskLimit.WorstShortWorkingQuantity + legDelta < -riskLimit.MaxPositionQuantity;
-
-                    if (isRiskLimitExceeded)
-                    {
-                        orderRisk.Reject(orderTarget.OrderProfile.Quantity);
-                        orderRejectedReasons.Set(static_cast<int32_t>(Execution::OrderRejectedReason::PositionExceedsRiskLimit));
-                        return false;
-                    }
-                }
-
-                // Phase 2 - commit through the SAME arithmetic the release hooks use. Single-writer:
-                // nothing can change between the phases, so check-then-apply is atomic by ownership.
-                ApplyWorstWorkingQuantityDelta(orderTarget.OrderHeader.OrderId, sign, worstMagnitudeDelta);
+                int32_t worstMagnitudeDelta = orderRisk.GetAbsWorstOrderQuantity() - worstOrderQuantityBefore;
+                ApplyWorstWorkingQuantityDelta(orderTarget.OrderHeader.OrderId, orderTarget.OrderProfile.Sign(), worstMagnitudeDelta);
             }
         }
         catch (const std::exception& ex)

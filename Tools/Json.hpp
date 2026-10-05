@@ -89,23 +89,91 @@ namespace Tools
 		// ---------------------------------------------------------------------
 		// Deserialization
 		// ---------------------------------------------------------------------
+		// Accepts // and /* */ comments and trailing commas, as the C# reader does.
 		template <typename T>
 		static T Deserialize(std::string_view jsonString)
 		{
 			T obj{};
 
 			static constexpr glz::opts readerOpts = glz::opts{
+				.comments = true,
 				.error_on_unknown_keys = false,
 			};
 
-			glz::error_ctx ec = glz::read<readerOpts>(obj, jsonString);
+			std::string json = RemoveTrailingCommas(jsonString);
+			glz::error_ctx ec = glz::read<readerOpts>(obj, json);
 
 			if (ec)
 			{
-				throw std::runtime_error("Deserialization failed: " + glz::format_error(ec, jsonString));
+				throw std::runtime_error("Deserialization failed: " + glz::format_error(ec, json));
 			}
 
 			return obj;
+		}
+
+	private:
+		// Index of the first character at or after i that is neither whitespace nor inside a comment.
+		static size_t SkipWhitespaceAndComments(std::string_view json, size_t i)
+		{
+			while (i < json.size())
+			{
+				char c = json[i];
+				if (c == ' ' || c == '\t' || c == '\n' || c == '\r')
+					i++;
+				else if (c == '/' && i + 1 < json.size() && json[i + 1] == '/')
+				{
+					size_t end = json.find('\n', i + 2);
+					i = end == std::string_view::npos ? json.size() : end + 1;
+				}
+				else if (c == '/' && i + 1 < json.size() && json[i + 1] == '*')
+				{
+					size_t end = json.find("*/", i + 2);
+					i = end == std::string_view::npos ? json.size() : end + 2;
+				}
+				else
+					break;
+			}
+			return i;
+		}
+
+		static std::string RemoveTrailingCommas(std::string_view json)
+		{
+			std::string result;
+			result.reserve(json.size());
+			size_t i = 0;
+			while (i < json.size())
+			{
+				char c = json[i];
+				if (c == '"')
+				{
+					size_t start = i++;
+					while (i < json.size() && json[i] != '"')
+						i += json[i] == '\\' ? 2 : 1;
+					i = std::min(i + 1, json.size());
+					result.append(json.substr(start, i - start));
+				}
+				else if (c == '/' && i + 1 < json.size() && (json[i + 1] == '/' || json[i + 1] == '*'))
+				{
+					size_t end = SkipWhitespaceAndComments(json, i);
+					result.append(json.substr(i, end - i));
+					i = end;
+				}
+				else
+				{
+					if (c == ',')
+					{
+						size_t next = SkipWhitespaceAndComments(json, i + 1);
+						if (next < json.size() && (json[next] == '}' || json[next] == ']'))
+						{
+							i++;
+							continue;
+						}
+					}
+					result.push_back(c);
+					i++;
+				}
+			}
+			return result;
 		}
 	};
 }

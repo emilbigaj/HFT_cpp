@@ -93,6 +93,7 @@ namespace Tools
 
 		std::atomic<bool> _finished{false}; // signalled when WriteLoop() exits
 		std::atomic<int> _disposeCASLock{0};
+		std::shared_ptr<Tools::Application::ExitAction> _exitAction;
 
 	public:
 		explicit Logger(const std::filesystem::path& directoryPath) : DirectoryPath(directoryPath)
@@ -100,7 +101,7 @@ namespace Tools
 			std::filesystem::create_directories(DirectoryPath);
 
 			// int::min priority => disposed last (Application sorts descending by priority).
-			Tools::Application::AddExitAction("Dispose Logger " + DirectoryPath.string(),
+			_exitAction = Tools::Application::AddExitAction("Dispose Logger " + DirectoryPath.string(),
 				std::numeric_limits<int>::min(), [this]() { Dispose(); });
 
 			Connect();
@@ -108,6 +109,7 @@ namespace Tools
 
 		~Logger()
 		{
+			_exitAction->Cancel();
 			Dispose();
 		}
 

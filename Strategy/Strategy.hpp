@@ -97,7 +97,7 @@ public:
         {
             if (buyState.OrderHeader.OrderId > 0 && buyState.OrderStateStatus == Execution::OrderStateStatus::Active)
             {
-                Amend(buyTarget, buy);
+                Amend(buyTarget, buy, buyState);
             }
             else
             {
@@ -109,7 +109,7 @@ public:
         {
             if (sellState.OrderHeader.OrderId > 0 && sellState.OrderStateStatus == Execution::OrderStateStatus::Active)
             {
-                Amend(sellTarget, sell);
+                Amend(sellTarget, sell, sellState);
             }
             else
             {
@@ -139,9 +139,12 @@ public:
         _client.OnOrderTarget(orderTarget);
     }
 
-    void Amend(Execution::OrderTarget orderTarget, Execution::OrderProfile orderProfile)
+    void Amend(Execution::OrderTarget orderTarget, Execution::OrderProfile orderProfile, const Execution::OrderState& state)
     {
-        orderTarget.OrderTargetAction = Execution::OrderTargetAction::Amend;
+        // Reduce only against what the order is working now: the state once it has caught up with the target, else the target in flight.
+        bool stateIsTruth = orderTarget.OrderTargetStatus == Execution::OrderStateStatus::Done || (state.OrderHeader.OrderId == orderTarget.OrderHeader.OrderId && state.OrderHeader.Seq >= orderTarget.OrderHeader.Seq);
+        Execution::OrderProfile activeProfile = stateIsTruth ? state.OrderProfile : orderTarget.OrderProfile;
+        orderTarget.OrderTargetAction = orderProfile.IsReduceOf(activeProfile) ? Execution::OrderTargetAction::Reduce : Execution::OrderTargetAction::Replace;
         orderTarget.OrderProfile = orderProfile;
         orderTarget.OrderHeader.Seq++;
         orderTarget.OrderTargetStatus = Execution::OrderStateStatus::Active;

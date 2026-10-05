@@ -28,6 +28,7 @@ namespace Execution
 		Position = 14,
 		AheadOfOrder = 15,
 		RiskLimit = 16,
+		WorkingRisk = 17,
 	};
 
 	enum class TimeInForce : uint8_t
@@ -130,9 +131,11 @@ namespace Execution
 	enum class OrderTargetAction : uint8_t
 	{
 		Create = 0,
-		Amend = 1,
+		Replace = 1,   // a new price or more quantity: loses queue priority (was Amend, same wire value)
 		Cancel = 2,
+		Reduce = 3,    // less quantity at the same price: keeps queue priority, never adds risk
 	};
+	static_assert(static_cast<uint8_t>(OrderTargetAction::Replace) == 1 && static_cast<uint8_t>(OrderTargetAction::Reduce) == 3);
 
 	enum class OrderFlags : uint8_t
 	{
@@ -150,8 +153,41 @@ namespace Execution
 	};
 
 #pragma pack(push, 1)
-	// Server-wide: one row per instrument, applied to every strategy. StrategyId was removed - it
-	// was never enforced or restored per strategy, it only chose where an echo went.
+	// What the RiskLayer has applied for an instrument: its fills and worst-case working reservations.
+	// Never persisted or audited; always written seq-bumped, so a reader and the TCP mirror see untorn rows.
+	struct WorkingRisk
+	{
+		Data::Header<OrderType> Header = Data::Header<OrderType>(OrderType::WorkingRisk); // the TCP mirror dispatches every row on its first byte
+		int32_t Position = 0;
+		// One aggregate per side: long signed positive, short signed negative. GetShortQuantityAllowance
+		// and the position test both depend on that, so a delta added here must carry the order's sign.
+		int32_t WorstLongWorkingQuantity = 0;   // >= 0
+		int32_t WorstShortWorkingQuantity = 0;  // <= 0
+
+		std::string ToString() const
+		{
+			return Tools::Json::Serialize(*this);
+		}
+
+		struct glaze
+		{
+			using T = WorkingRisk;
+			static constexpr auto value = glz::object(
+				"Header", &T::Header,
+				"Position", &T::Position,
+				"WorstLongWorkingQuantity", &T::WorstLongWorkingQuantity,
+				"WorstShortWorkingQuantity", &T::WorstShortWorkingQuantity
+			);
+		};
+	};
+
+	static_assert(sizeof(WorkingRisk) == 16, "WorkingRisk must be 16 bytes");
+	static_assert(offsetof(WorkingRisk, Position) == 4 && offsetof(WorkingRisk, WorstLongWorkingQuantity) == 8
+		&& offsetof(WorkingRisk, WorstShortWorkingQuantity) == 12);
+	static_assert(Tools::PlainOldData<WorkingRisk>, "WorkingRisk must be unmanaged");
+
+	// Server-wide config: one row per instrument, applied to every strategy, written on edits only.
+	// The live numbers it is checked against are in WorkingRisk.
 	struct RiskLimit
 	{
         Data::Header<OrderType> Header = Data::Header<OrderType>(OrderType::RiskLimit);
@@ -159,38 +195,35 @@ namespace Execution
 		Tools::Timestamp Timestamp = Tools::Timestamp::MinValue; // stamped by the server on apply
 		int32_t MaxOrderQuantity = 0;
 		int32_t MaxPositionQuantity = 0;
-		// The reserved exposure the RiskLayer is currently holding against this instrument, one
-		// aggregate per side. Long is signed positive, short signed negative — GetShortQuantityAllowance
-		// and the position test both depend on that, so a delta added here must carry the order's sign.
-		int32_t WorstLongWorkingQuantity = 0;
-		int32_t WorstShortWorkingQuantity = 0;
 
 		RiskLimit() = default;
 		explicit RiskLimit(int32_t instrumentId) : InstrumentId(instrumentId) {}
 
-		[[nodiscard]] int32_t GetLongQuantityAllowance(int32_t position) const
+		[[nodiscard]] int32_t GetLongQuantityAllowance(const WorkingRisk& workingRisk) const
 		{
-			return std::max(0, MaxPositionQuantity - position - WorstLongWorkingQuantity);
+			return std::max(0, MaxPositionQuantity - workingRisk.Position - workingRisk.WorstLongWorkingQuantity);
 		}
 
-		[[nodiscard]] int32_t GetShortQuantityAllowance(int32_t position) const
+		[[nodiscard]] int32_t GetShortQuantityAllowance(const WorkingRisk& workingRisk) const
 		{
-			return std::min(0, -MaxPositionQuantity - position - WorstShortWorkingQuantity);
+			return std::min(0, -MaxPositionQuantity - workingRisk.Position - workingRisk.WorstShortWorkingQuantity);
 		}
 
-		static RiskLimit GetMaxLimits(int32_t instrumentId)
+		static RiskLimit GetMaxLimits(int32_t instrumentId, Tools::Timestamp timestamp)
 		{
 			RiskLimit maxLimit(instrumentId);
 			maxLimit.MaxOrderQuantity = std::numeric_limits<int32_t>::max();
 			maxLimit.MaxPositionQuantity = std::numeric_limits<int32_t>::max();
+			maxLimit.Timestamp = timestamp;
 			return maxLimit;
 		}
 
-		static RiskLimit GetMinLimits(int32_t instrumentId)
+		static RiskLimit GetMinLimits(int32_t instrumentId, Tools::Timestamp timestamp)
 		{
 			RiskLimit minLimit(instrumentId);
 			minLimit.MaxOrderQuantity = 0;
 			minLimit.MaxPositionQuantity = 0;
+			minLimit.Timestamp = timestamp;
 			return minLimit;
 		}
 
@@ -207,14 +240,12 @@ namespace Execution
 				"InstrumentId", &T::InstrumentId,
 				"Timestamp", &T::Timestamp,
 				"MaxOrderQuantity", &T::MaxOrderQuantity,
-				"MaxPositionQuantity", &T::MaxPositionQuantity,
-				"WorstLongWorkingQuantity", &T::WorstLongWorkingQuantity,
-				"WorstShortWorkingQuantity", &T::WorstShortWorkingQuantity
+				"MaxPositionQuantity", &T::MaxPositionQuantity
 			);
 		};
 	};
 
-	static_assert(sizeof(RiskLimit) == 32, "RiskLimit must be 32 bytes");
+	static_assert(sizeof(RiskLimit) == 24, "RiskLimit must be 24 bytes");
 
 #pragma pack(push, 1)
 	struct RateLimit
@@ -422,11 +453,12 @@ namespace Execution
 	struct OrderRisk
 	{
 		static constexpr int32_t MaxOrderQuantity = 65535;
-		static constexpr int32_t MaxActiveTargets = 30;
+		static constexpr int32_t MaxActiveTargets = 29;
 
-		uint16_t ActiveTargetsCount = 0;         // live entries, 0..30
+		uint16_t ActiveTargetsCount = 0;         // live entries, 0..29
 		uint16_t WorstOrderQuantity = 0;         // max over the live entries, 0 when none
-		uint16_t AbsOrderQuantities[30] = {};    // live at [0, ActiveTargetsCount), zeros after; swap-remove reorders, never assume FIFO
+		uint16_t AbsAckedOrderQuantity = 0;      // the exchange's last acked |quantity|, 0 until the first ack
+		uint16_t AbsOrderQuantities[MaxActiveTargets] = {}; // live at [0, ActiveTargetsCount), zeros after; swap-remove reorders, never assume FIFO
 
 		// Branchless abs. Returns INT32_MIN for INT32_MIN (no throw); callers range-check unsigned.
 		ALWAYS_INLINE static int32_t Abs(int32_t value)
@@ -435,9 +467,15 @@ namespace Execution
 			return static_cast<int32_t>((static_cast<uint32_t>(value) ^ mask) - mask);
 		}
 
-		[[nodiscard]] ALWAYS_INLINE int32_t GetAbsWorstOrderQuantity(int32_t ackedOrderQuantity) const
+		[[nodiscard]] ALWAYS_INLINE int32_t GetAbsWorstOrderQuantity() const
 		{
-			return std::max(Abs(ackedOrderQuantity), static_cast<int32_t>(WorstOrderQuantity));
+			return std::max(static_cast<int32_t>(AbsAckedOrderQuantity), static_cast<int32_t>(WorstOrderQuantity));
+		}
+
+		// TryAdd refuses another target once this many are in flight.
+		[[nodiscard]] ALWAYS_INLINE bool IsFull() const
+		{
+			return ActiveTargetsCount == MaxActiveTargets;
 		}
 
 		ALWAYS_INLINE bool TryAdd(int32_t orderQuantity, OrderRejectedReason& reason)
@@ -464,7 +502,11 @@ namespace Execution
 			return true;
 		}
 
-		ALWAYS_INLINE void Ack(int32_t orderQuantity) { Remove(orderQuantity); }
+		ALWAYS_INLINE void Ack(int32_t orderQuantity)
+		{
+			Remove(orderQuantity);
+			AbsAckedOrderQuantity = static_cast<uint16_t>(Abs(orderQuantity)); // in range: every acked quantity passed TryAdd
+		}
 		ALWAYS_INLINE void Reject(int32_t orderQuantity) { Remove(orderQuantity); }
 
 	private:
@@ -474,9 +516,10 @@ namespace Execution
 			if (static_cast<uint32_t>(absOrderQuantity) > static_cast<uint32_t>(MaxOrderQuantity))
 				return;
 
-			// An ack/reject for a quantity that was never reserved is a NO-OP - deliberate and
-			// required: a stray ack must not collapse the reservation. Acks retire the oldest
-			// target, so the forward scan normally stops at index 0.
+			// An ack/reject for a quantity that was never reserved removes nothing - deliberate and
+			// required: a stray ack must not collapse the in-flight reservations (Ack still records
+			// it as the acked quantity). Acks retire the oldest target, so the forward scan normally
+			// stops at index 0.
 			int32_t activeTargetsCount = ActiveTargetsCount;
 			int32_t targetIndex = 0;
 			while (targetIndex < activeTargetsCount && AbsOrderQuantities[targetIndex] != absOrderQuantity)
@@ -535,6 +578,12 @@ namespace Execution
 		bool IsThisCrossing(int32_t ticks) const
 		{
 			return (Ticks - ticks) * Sign() >= 0;
+		}
+
+		// Less quantity at the same price and side: keeps queue priority and can never add risk.
+		[[nodiscard]] ALWAYS_INLINE bool IsReduceOf(const OrderProfile& orderProfile) const
+		{
+			return Ticks == orderProfile.Ticks && Sign() == orderProfile.Sign() && std::abs(Quantity) < std::abs(orderProfile.Quantity);
 		}
 
 		static OrderProfile Cancel()
@@ -663,6 +712,11 @@ namespace Execution
 			return b;
 		}();
 
+		[[nodiscard]] bool IsDiscarded() const
+		{
+			return !OrderRejectedReasons.IsEmpty() && OrderRejectedReasons.IsSubsetOf(OrderDiscarded);
+		}
+
         // Moving this to the bottom allows the lambda to see OrderRejectedReasonsString
         struct glaze
         {
@@ -695,6 +749,7 @@ namespace Execution
 		uint8_t Reserved[1] = { 0 };
 		int32_t QuantityFilled = 0;
 		int32_t QuantityAhead = 0;
+		int32_t QuantityBehind = 0;  // same queue as QuantityAhead; only the simulator reports it
 
 		int32_t WorkingQuantity() const
 		{
@@ -718,21 +773,23 @@ namespace Execution
 				"OrderStateStatus", &T::OrderStateStatus,
 				"OrderStateReason", &T::OrderStateReason,
 				"QuantityFilled", &T::QuantityFilled,
-				"QuantityAhead", &T::QuantityAhead
+				"QuantityAhead", &T::QuantityAhead,
+				"QuantityBehind", &T::QuantityBehind
 			);
 		};
 	};
 
-	static_assert(sizeof(OrderState) == 60, "OrderState must be 60 bytes");
+	static_assert(sizeof(OrderState) == 64, "OrderState must be 64 bytes");
 
 	struct AheadOfOrder
 	{
 		Data::Header<OrderType> Header = Data::Header<OrderType>(OrderType::AheadOfOrder);
         int32_t Quantity = 0;
 		uint64_t ClientOrderId = 0;
+		int32_t QuantityBehind = 0;
 
 		AheadOfOrder() = default;
-		AheadOfOrder(uint64_t clientOrderId, int32_t quantity) : Quantity(quantity), ClientOrderId(clientOrderId) {}
+		AheadOfOrder(uint64_t clientOrderId, int32_t quantity, int32_t quantityBehind) : Quantity(quantity), ClientOrderId(clientOrderId), QuantityBehind(quantityBehind) {}
 
 		struct glaze
 		{
@@ -740,10 +797,13 @@ namespace Execution
 			static constexpr auto value = glz::object(
 				"Header", &T::Header,
 				"ClientOrderId", &T::ClientOrderId,
-				"Quantity", &T::Quantity
+				"Quantity", &T::Quantity,
+				"QuantityBehind", &T::QuantityBehind
 			);
 		};
 	};
+
+	static_assert(sizeof(AheadOfOrder) == 20, "AheadOfOrder must be 20 bytes");
 
 	struct OrderTarget
 	{
@@ -851,7 +911,8 @@ namespace Execution
 				"Quantity", &T::Quantity,
 				"AvgPrice", &T::AvgPrice,
 				"RealizedProfit", &T::RealizedProfit,
-				"QuantityTraded", &T::QuantityTraded
+				"QuantityTraded", &T::QuantityTraded,
+				"AlgoStatus", &T::AlgoStatus
 			);
 		};
 	};
@@ -864,17 +925,18 @@ namespace Execution
 		&& offsetof(OrderHeader, ExchangeTimestamp) == 12 && offsetof(OrderHeader, NicTimestamp) == 20);
 	static_assert(offsetof(RiskLimit, InstrumentId) == 4 && offsetof(RiskLimit, Timestamp) == 8
 		&& offsetof(RiskLimit, MaxOrderQuantity) == 16
-		&& offsetof(RiskLimit, MaxPositionQuantity) == 20
-		&& offsetof(RiskLimit, WorstLongWorkingQuantity) == 24
-		&& offsetof(RiskLimit, WorstShortWorkingQuantity) == 28);
+		&& offsetof(RiskLimit, MaxPositionQuantity) == 20);
 	static_assert(offsetof(OrderRisk, ActiveTargetsCount) == 0 && offsetof(OrderRisk, WorstOrderQuantity) == 2
-		&& offsetof(OrderRisk, AbsOrderQuantities) == 4);
+		&& offsetof(OrderRisk, AbsAckedOrderQuantity) == 4 && offsetof(OrderRisk, AbsOrderQuantities) == 6);
 	static_assert(offsetof(Fill, OrderHeader) == 4 && offsetof(Fill, FillId) == 32
 		&& offsetof(Fill, Price) == 40 && offsetof(Fill, Quantity) == 48 && offsetof(Fill, FillType) == 52);
 	static_assert(offsetof(OrderState, OrderHeader) == 4 && offsetof(OrderState, ExchangeOrderId) == 32
 		&& offsetof(OrderState, OrderProfile) == 40 && offsetof(OrderState, TimeInForce) == 48
 		&& offsetof(OrderState, OrderStateStatus) == 49 && offsetof(OrderState, OrderStateReason) == 50
-		&& offsetof(OrderState, QuantityFilled) == 52 && offsetof(OrderState, QuantityAhead) == 56);
+		&& offsetof(OrderState, QuantityFilled) == 52 && offsetof(OrderState, QuantityAhead) == 56
+		&& offsetof(OrderState, QuantityBehind) == 60);
+	static_assert(offsetof(AheadOfOrder, Quantity) == 4 && offsetof(AheadOfOrder, ClientOrderId) == 8
+		&& offsetof(AheadOfOrder, QuantityBehind) == 16);
 	static_assert(offsetof(OrderTarget, OrderHeader) == 4 && offsetof(OrderTarget, TriggerTimestamp) == 32
 		&& offsetof(OrderTarget, OrderProfile) == 40 && offsetof(OrderTarget, TimeInForce) == 48
 		&& offsetof(OrderTarget, OrderTargetAction) == 49 && offsetof(OrderTarget, OrderTargetStatus) == 50);

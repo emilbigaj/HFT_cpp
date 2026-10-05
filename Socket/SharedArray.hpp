@@ -175,8 +175,10 @@ namespace Socket
 			_entryLength = Protocol::GetAlignedEntryLength(sizeof(T));
 			
 			// 3. Create or Open Backing Shared Memory and View
-			// Compute the total in size_t (avoid int32 overflow), then narrow for the int32 API.
-			int32_t totalLength = static_cast<int32_t>(static_cast<size_t>(_entryLength) * static_cast<size_t>(capacity));
+			size_t total = static_cast<size_t>(_entryLength) * static_cast<size_t>(capacity);
+			if (total > static_cast<size_t>(INT32_MAX))
+				throw std::overflow_error("SharedArray: total length overflows int32");
+			int32_t totalLength = static_cast<int32_t>(total);
 			_mmf = Socket::SharedMemory::CreateOrOpen(name, totalLength);
 			_view = _mmf.GetView(0, totalLength, access);
 			_basePtr = _view.Ptr();

@@ -33,7 +33,8 @@ namespace Data
 		int32_t _bestIndex;
 		int32_t _bestTicks; 
         enum Side _side;
-        [[maybe_unused]] uint8_t _reserved[47] = {0};
+		int32_t _quantity = 0;
+        [[maybe_unused]] uint8_t _reserved[43] = {0};
 		int32_t _quantities[64];
 
 	public:
@@ -57,12 +58,14 @@ namespace Data
 			return _bitset.IsEmpty();
 		}
 
+		int32_t Quantity() const
+		{
+			return _quantity;
+		}
+
 		void Clear()
 		{
-			_bitset.ClearAll();
-			_bestIndex = -1;
-			_bestTicks = 0;
-			std::memset(_quantities, 0, sizeof(_quantities));
+			*this = SideByPrice64(_side);
 		}
 
         Level operator[](int32_t index) const
@@ -87,8 +90,11 @@ namespace Data
             return _bestTicks;
         }
 
-		SideByPrice64(enum Side side) : _bitset(0), _bestIndex(-1), _bestTicks(0), _side(side)
+		SideByPrice64(enum Side side) : _bitset(0), _bestIndex(-1), _bestTicks(0), _side(side), _quantity(0)
 		{
+			static_assert(offsetof(SideByPrice64, _side) == 16);
+			static_assert(offsetof(SideByPrice64, _quantity) == 17);
+			static_assert(offsetof(SideByPrice64, _quantities) == 64);
 			std::memset(_quantities, 0, sizeof(_quantities));
 		}
 
@@ -159,14 +165,18 @@ namespace Data
 				_quantities[_bestIndex] = quantity;
 				delta = quantity;
 				_bitset.Set(_bestIndex);
+				_quantity = quantity;
 				
 				return true;
 			}
 
 			int32_t ringIndex = MapBestOffsetToRingIndex(bestOffset);
 			int32_t isOldNonZero = (!isBetter && _bitset[ringIndex]) ? 1 : 0;
+			// on a better price an active slot is an aliased worse level that gets overwritten
+			int32_t isSlotActive = _bitset[ringIndex] ? 1 : 0;
 
 			delta = quantity - _quantities[ringIndex] * isOldNonZero;
+			_quantity += quantity - _quantities[ringIndex] * isSlotActive;
 			_quantities[ringIndex] = quantity;
 
 			if (isNewZero)
@@ -198,8 +208,17 @@ namespace Data
 			if (isBetter)
 			{
 				_bestTicks = ticks;
+				uint64_t bitsBefore = _bitset.Raw();
 				_bitset.ClearOutside(_bestIndex, ringIndex);
 				_bestIndex = ringIndex;
+
+				uint64_t cleared = bitsBefore & ~_bitset.Raw();
+
+				while (cleared != 0ULL)
+				{
+					_quantity -= _quantities[std::countr_zero(cleared)];
+					cleared &= cleared - 1ULL;
+				}
 			}
 
 			return true;
@@ -211,6 +230,7 @@ namespace Data
 	#pragma pack(pop)
 
 	static_assert(Tools::PlainOldData<SideByPrice64>, "SideByPrice64 must be unmanaged");
+	static_assert(sizeof(SideByPrice64) == 320);
 
 	// ─────────────────────────────────────────────────────────────────────────
 	// Enumerator Definition
@@ -334,6 +354,7 @@ namespace Data
 	// ─────────────────────────────────────────────────────────────────────────
 	// MarketByPrice64
 	// ─────────────────────────────────────────────────────────────────────────
+	#pragma pack(push, 1)
 	struct MarketByPrice64
 	{
 		SideByPrice64 Bids;
@@ -549,8 +570,8 @@ namespace Data
 		
 		void Clear()
 		{
-			Bids.Clear();
-			Asks.Clear();
+			Bids = SideByPrice64(Side::Buy);
+			Asks = SideByPrice64(Side::Sell);
 		}
 
 		SideByPrice64::Enumerator EnumerateBids() const
@@ -563,4 +584,11 @@ namespace Data
 			return Asks.GetEnumerator();
 		}
 	};
+	#pragma pack(pop)
+
+	static_assert(sizeof(MarketByPrice64) == 664);
+	static_assert(offsetof(MarketByPrice64, Asks) == 320);
+	static_assert(offsetof(MarketByPrice64, ExchangeTimestamp) == 640);
+	static_assert(offsetof(MarketByPrice64, SendingTimestamp) == 648);
+	static_assert(offsetof(MarketByPrice64, NicTimestamp) == 656);
 }

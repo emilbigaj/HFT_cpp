@@ -169,6 +169,17 @@ namespace Socket
 	};
 #pragma pack(pop)
 
+	static_assert(sizeof(SocketHeader) == 344);
+	static_assert(offsetof(SocketHeader, ClientName) == 128);
+	static_assert(offsetof(SocketHeader, Timestamp) == 256);
+	static_assert(offsetof(SocketHeader, ClientId) == 264);
+	static_assert(offsetof(SocketHeader, ClientProcessId) == 268);
+	static_assert(offsetof(SocketHeader, ClientToServerChannelCount) == 272);
+	static_assert(offsetof(SocketHeader, ServerToClientChannelCount) == 276);
+	static_assert(offsetof(SocketHeader, ClientToServerLengths) == 280);
+	static_assert(offsetof(SocketHeader, ServerToClientLengths) == 312);
+	static_assert(Tools::PlainOldData<SocketHeader>);
+
 	enum class ClientStatus : uint8_t
 	{
 		Disposed = 0,
@@ -810,6 +821,7 @@ namespace Socket
 	private:
 		SocketHeader _socketHeader;
 		std::unique_ptr<Socket> _socket;
+		std::shared_ptr<Tools::Application::ExitAction> _exitAction;
 
 	public:
 		ClientSocket(const std::string& clientName, const std::string& serverName, const std::vector<int32_t>& clientToServerLengths, const std::vector<int32_t>& serverToClientLengths) : ClientName(clientName), ServerName(serverName), Name(SocketUtils::GetSocketName(clientName, serverName)), ClientToServerChannelCount(static_cast<int32_t>(clientToServerLengths.size())), ServerToClientChannelCount(static_cast<int32_t>(serverToClientLengths.size()))
@@ -856,7 +868,14 @@ namespace Socket
 			}
 
 			_socket = std::make_unique<Socket>(Name, std::move(sharedMemory), std::move(clientToServer), std::move(serverToClient));
-			Tools::Application::AddExitAction("Close ClientSocket " + Name, [this]() { Close(); });
+			_exitAction = Tools::Application::AddExitAction("Close ClientSocket " + Name, [this]() { Close(); });
+		}
+
+		// The exit action captures this: it must never run after the object is gone.
+		~ClientSocket()
+		{
+			if (_exitAction)
+				_exitAction->Cancel();
 		}
 
 		inline bool IsDisposed() const
@@ -1019,6 +1038,7 @@ namespace Socket
 		Tools::Bitset64 _clientIds; // replace with IBitset so it can handle any capacity
 		std::thread _listenThread;
 		std::atomic<bool> _isRunning;
+		std::shared_ptr<Tools::Application::ExitAction> _exitAction;
 
 	public:
 		ServerSocket(std::string name, int32_t capacity) : Capacity(capacity), ServerName(std::move(name)), _letterBox(ServerName, Tools::Access::Write), _isRunning(false)
@@ -1029,7 +1049,13 @@ namespace Socket
 			AllocateClientId = [this](const SocketHeader& header) { return DefaultClientIdAllocator(header); };
 			DeallocateClient = [this](int32_t id) { return DefaultClientDeallocator(id); };
 
-			Tools::Application::AddExitAction("Close ServerSocket " + ServerName, [this]() { Dispose(); });
+			_exitAction = Tools::Application::AddExitAction("Close ServerSocket " + ServerName, [this]() { Dispose(); });
+		}
+
+		// The exit action captures this: it must never run after the object is gone.
+		~ServerSocket()
+		{
+			_exitAction->Cancel();
 		}
 
 		// Only availalbe if the capacity is 64 or less, otherwise returns garbage.

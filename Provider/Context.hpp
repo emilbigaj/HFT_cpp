@@ -173,13 +173,22 @@ protected:
 	// One row per CoreGroup, server-written from its .coregroup file: the name and the core ids.
 	Socket::SharedArray<Provider::CoreGroup> _coreGroups;
 	Socket::SharedArray<Execution::OrderState> _orderStates;
-	Socket::SharedArray<Execution::OrderTarget> _orderTargets;
-	// Reserved exposure per order slot. Server-owned: the RiskLayer is the only writer, and it runs
-	// server-side only. Keyed by OrderId::GlobalIndex, so a client and the server name the same row.
+	// Reserved exposure per order slot, keyed by OrderId::GlobalIndex. Per context like the book: the
+	// server's covers every order, a client's only its own, and each has a single writer (its RiskLayer).
 	Socket::SharedArray<Execution::OrderRisk> _orderRisks;
+	Socket::SharedArray<Execution::OrderTarget> _orderTargets;
 	
 	// positions
 	Socket::SharedArray<Execution::PositionHeader> _localPositionHeaders;
+
+	// Last of the base arrays so the ids before it keep their mirror order. Per context like the book:
+	// the server's covers every order on the instrument, a client's only its own.
+	Socket::SharedArray<Execution::WorkingRisk> _workingRisks;
+
+	// The allocation ThrowIfInstrumentIdOutOfRange tests: ServerHeader.InstrumentIds for the server,
+	// InstrumentIdsByClientId[ClientId] for a client (C# overrides it per context). Set by each derived
+	// constructor; a pointer rather than a virtual keeps the hot-path accessors free of an indirect call.
+	const Tools::Bitset64* _allocatedInstrumentIds = nullptr;
 
 	std::vector<std::unique_ptr<Data::Instrument>> _instruments;
 	std::vector<std::unique_ptr<Position>> _positions;
@@ -212,9 +221,10 @@ protected:
     _rateLimits(serverName / "RateLimits", ServerHeader().GetReadonlyRef().CoreGroupIds.Length(), ServerAccess),
     _coreGroups(serverName / "CoreGroups", ServerHeader().GetReadonlyRef().CoreGroupIds.Length(), ServerAccess),
     _orderStates(serverName / "OrderStates", ServerHeader().GetReadonlyRef().OrdersCapacity(), ServerAccess, false),
+    _orderRisks(directoryPath / "OrderRisks", ServerHeader().GetReadonlyRef().OrdersCapacity(), (directoryPath == serverName) ? serverAccess : clientAccess, false),
     _orderTargets(serverName / "OrderTargets", ServerHeader().GetReadonlyRef().OrdersCapacity(), ClientAccess, false),
-    _orderRisks(serverName / "OrderRisks", ServerHeader().GetReadonlyRef().OrdersCapacity(), ServerAccess, false),
-    _localPositionHeaders(serverName / "LocalPositionHeaders", ServerHeader().GetReadonlyRef().LocalPositionsCapacity(), ServerAccess, false)
+    _localPositionHeaders(serverName / "LocalPositionHeaders", ServerHeader().GetReadonlyRef().LocalPositionsCapacity(), ServerAccess, false),
+    _workingRisks(directoryPath / "WorkingRisks", ServerHeader().GetReadonlyRef().InstrumentIds.Length(), (directoryPath == serverName) ? serverAccess : clientAccess)
 	{
         std::cout << Tools::GetTypeName(typeid(*this)) << "(" << serverName << ", " << directoryPath.string() << ", "
                   << static_cast<int>(serverAccess) << ", " << static_cast<int>(clientAccess) << ")" << std::endl;
@@ -268,11 +278,19 @@ public:
 	virtual ~Context() = default;
 
 	virtual Socket::SharedArrayEntry<Execution::PositionHeader>& GetPositionHeader(int32_t instrumentId) = 0;
+
+	// Any strategy's row on the instrument; read-only on a client.
+	Socket::SharedArrayEntry<Execution::PositionHeader>& GetPositionHeader(int32_t clientId, int32_t instrumentId)
+	{
+		int32_t localPositionIndex = GetLocalPositionIndex(clientId, instrumentId);
+		return _localPositionHeaders[localPositionIndex];
+	}
+
     virtual bool TryGetInstrumentId(int32_t instrumentIndex, int32_t& instrumentId) = 0;
 	virtual Tools::Bitset64 InstrumentIds() = 0;
 
-	// Order rows are ONE server-wide array (all three keyed by serverName), so every context is a
-	// view over the same storage. These used to be virtual, with ClientContext reading the argument
+	// OrderStates and OrderTargets are ONE server-wide array (keyed by serverName), so every context is
+	// a view over the same storage; OrderRisks is this context's own copy. These used to be virtual, with ClientContext reading the argument
 	// as a local index and ServerContext as a global one - same signature, two meanings, so a caller
 	// holding a base Context could not know which to pass. Keyed by the id there is only one
 	// meaning: OrderId already carries clientId and localIndex, so GlobalIndex is exact and no
@@ -297,6 +315,13 @@ public:
 	{
 		ThrowIfInstrumentIdOutOfRange(instrumentId);
 		return _riskLimits[instrumentId];
+	}
+
+	// This context's own: the server's or this client's (see _workingRisks).
+	Socket::SharedArrayEntry<Execution::WorkingRisk>& GetWorkingRisk(int32_t instrumentId)
+	{
+		ThrowIfInstrumentIdOutOfRange(instrumentId);
+		return _workingRisks[instrumentId];
 	}
 
 	// One per CoreGroup, server-written (index == CoreGroupId).
@@ -385,15 +410,15 @@ public:
 		return *_positions[index];
 	}
 
-protected:
-
 	ALWAYS_INLINE void ThrowIfInstrumentIdOutOfRange(int32_t instrumentId)
 	{
-		if (!ServerHeader().GetReadonlyRef().InstrumentIds[instrumentId]) [[unlikely]]
+		if (!(*_allocatedInstrumentIds)[instrumentId]) [[unlikely]]
 		{
 			throw std::out_of_range(std::string(typeid(*this).name()) + ".ThrowIfInstrumentIdOutOfRange(" + std::to_string(instrumentId) + "), instrumentId has not been allocated.");
 		}
 	}
+
+protected:
 
 	ALWAYS_INLINE void ThrowIfInstrumentHeaderIdOutOfRange(int32_t instrumentHeaderId)
 	{
@@ -443,7 +468,7 @@ protected:
 		}
 		else if (instrHeader.InstrumentType == Data::InstrumentType::Spread)
 		{
-			// Legs reference sibling headers; long = the positive-weight leg (2-leg spreads for now).
+			// Legs reference sibling headers; long = the positive-weight leg (2-leg spreads only: Client::GetInstrument refuses any other shape).
 			Data::LeggedHeader leggedHeader = header128Entry.GetReadonlyRef().AsLegged();
 			class Data::Future* longLeg = nullptr;
 			class Data::Future* shortLeg = nullptr;
@@ -455,6 +480,7 @@ protected:
 				else if (legHeader.Weight < 0)
 					shortLeg = &legFuture;
 			}
+			// C# throws here too: Spread's constructor dereferences both legs.
 			if (!longLeg || !shortLeg)
 				throw std::runtime_error(std::string(typeid(*this).name()) + ".CreateInstrument(" + std::to_string(instrumentId) + "), spread header must carry one positive and one negative leg.");
 			instrument = std::make_unique<class Data::Spread>(instrumentId, header128Entry.Cast<Data::LeggedHeader>(), mbpEntry, *longLeg, *shortLeg);
@@ -527,6 +553,7 @@ public:
       ServerStrategyName(GetStrategyDirectoryPath(ServerName.filename().string()))
 	{
 		ThrowIfInvalidServerName(serverName);
+		_allocatedInstrumentIds = &ServerHeader().GetReadonlyRef().InstrumentIds;
 
 		std::filesystem::create_directories(ClientsDirectoryPath);
 		std::filesystem::create_directories(InstrumentsDirectoryPath);
@@ -607,6 +634,8 @@ public:
 	}
 
 	// --- Global Implementations ---
+	using Context::GetPositionHeader;
+
 	Socket::SharedArrayEntry<Execution::PositionHeader>& GetPositionHeader(int32_t instrumentId) override
 	{
 		return _serverPositionHeaders[instrumentId];
@@ -619,12 +648,6 @@ public:
 	}
 
 	// --- Specific Server Expositions ---
-	Socket::SharedArrayEntry<Execution::PositionHeader>& GetPositionHeader(int32_t clientId, int32_t instrumentId)
-	{
-		int32_t localPositionIndex = GetLocalPositionIndex(clientId, instrumentId);
-		return _localPositionHeaders[localPositionIndex];
-	}
-
 	const Socket::SharedArrayEntry<Socket::SocketHeader>& GetSocketHeader(int32_t clientId)
 	{
 		ThrowIfClientIdOutOfRange(clientId);
@@ -739,13 +762,8 @@ public:
         {
             std::cout << "Context::AllocateInstrument(" <<  symbol << ") Loaded RiskLimit: " << riskLimitLine.value() << std::endl;
         }
-		Execution::RiskLimit riskLimit = riskLimitLine ? Tools::Json::Deserialize<Execution::RiskLimit>(riskLimitLine.value()) : (Clock::Mode == ClockMode::Simulation ? Execution::RiskLimit::GetMaxLimits(instrumentId) : Execution::RiskLimit::GetMinLimits(instrumentId));
+		Execution::RiskLimit riskLimit = riskLimitLine ? Tools::Json::Deserialize<Execution::RiskLimit>(riskLimitLine.value()) : (Clock::Mode == ClockMode::Simulation ? Execution::RiskLimit::GetMaxLimits(instrumentId, Clock::GetUtcNow()) : Execution::RiskLimit::GetMinLimits(instrumentId, Clock::GetUtcNow()));
 		riskLimit.InstrumentId = instrumentId;
-		// The working quantities are live state, not configuration: they mirror this SESSION's
-		// in-flight reservations, and a fresh session has none. Restoring yesterday's values would
-		// hand the ledger phantom exposure no retire path can ever release. Matches C#.
-		riskLimit.WorstLongWorkingQuantity = 0;
-		riskLimit.WorstShortWorkingQuantity = 0;
         _riskLimits.GetEntry(instrumentId).Write(riskLimit);
 
 		std::string positionPath = GetPositionFilePath(DirectoryPath, symbology->Symbol()).string();
@@ -755,6 +773,7 @@ public:
 		// Client 0 stands in for the old -1 sentinel (-1 is unrepresentable in 6 bits) - display/JSON-only change.
 		positionHeader.OrderHeader.OrderId = Execution::OrderId().InstrumentId(instrumentId);
 		_serverPositionHeaders[instrumentId].Write(positionHeader);
+		_workingRisks[instrumentId].Write(Execution::WorkingRisk{ .Position = positionHeader.Quantity });
 
 		header.InstrumentId = instrumentId;
 		serverHeader.InstrumentIds.Set(instrumentId);
@@ -795,6 +814,12 @@ public:
 		// BEFORE the first fill overwrites OrderHeader. ClientId == StrategyId for a client's own
 		// (algo) positions. A template id (Generation 0) carries the identity until the first fill.
 		positionHeader.OrderHeader.OrderId = Execution::OrderId().ClientId(clientId).StrategyId(clientId).InstrumentId(instrumentId);
+
+		// A backtest has no operator to un-pause it, and the RiskLayer rejects a paused algo with
+		// AlgoIsPaused. Realtime is forced Paused rather than left to whatever the restored row said:
+		// a persisted Live would otherwise re-arm a strategy at startup with nobody asking for it.
+		positionHeader.AlgoStatus = Clock::Mode == ClockMode::Simulation ? Execution::AlgoStatus::Live : Execution::AlgoStatus::Paused;
+
 		GetPositionHeader(clientId, instrumentId).Write(positionHeader);
 
 		Socket::SharedArrayEntry<Tools::Bitset64>& instrumentIdsEntry = GetInstrumentIdsByClientId(clientId);
@@ -820,6 +845,9 @@ public:
 	ClientContext(const std::filesystem::path& clientName, const std::filesystem::path& serverName, Tools::Access access) 
         : Context(serverName.string(), clientName, Tools::Access::Read, access), ClientId(GetClientIdFromMap(clientName.string()))
 	{
+		ServerContext::ThrowIfInvalidServerName(serverName);
+		_allocatedInstrumentIds = &_instrumentIdsByClientId[ClientId].GetReadonlyRef();
+
 		if (clientName.string().find(serverName.string()) != std::string::npos)
 			ServerContext::ThrowIfInvalidServerName(clientName);
 		else
@@ -865,6 +893,8 @@ public:
 	}
 
 	// --- Local Implementations ---
+	using Context::GetPositionHeader;
+
 	Socket::SharedArrayEntry<Execution::PositionHeader>& GetPositionHeader(int32_t instrumentId) override
 	{
 		int32_t localPositionIndex = GetLocalPositionIndex(ClientId, instrumentId);
@@ -955,6 +985,30 @@ inline void Context::CreatePosition(Data::Instrument& instrument)
 	ClientContext* clientContext = dynamic_cast<ClientContext*>(this);
 	int32_t clientId = clientContext ? clientContext->ClientId : Execution::OrderIdAllocator::ServerStrategyId;
 	_positions[static_cast<size_t>(instrument.InstrumentId)] = std::make_unique<Position>(instrument, GetPositionHeader(instrument.InstrumentId), *this, clientId);
+}
+
+inline Profit Position::GetProfit()
+{
+	if (_headerEntry.IsEmpty())
+		return Profit(Clock::GetUtcNow(), std::nan(""), std::nan(""), 0.0, 0, std::nan(""), std::nan(""));
+
+	Execution::PositionHeader positionHeader = _headerEntry.Read();
+	Data::Quote quote
+	{
+		.TickSize = 0.0,
+		.Bid = Data::Level { .Ticks = 0, .Quantity = 0 },
+		.Ask = Data::Level { .Ticks = 0, .Quantity = 0 }
+	};
+
+	if (Instrument.TryGetQuote(quote))
+	{
+		double floating = Instrument.GetProfit(positionHeader.AvgPrice, quote.MidPrice(), positionHeader.Quantity);
+		return Profit(Clock::GetUtcNow(), floating + positionHeader.RealizedProfit, floating, positionHeader.RealizedProfit, positionHeader.Quantity, positionHeader.AvgPrice, quote.MidPrice());
+	}
+	else
+	{
+		return Profit(Clock::GetUtcNow(), std::nan(""), std::nan(""), positionHeader.RealizedProfit, positionHeader.Quantity, positionHeader.AvgPrice, std::nan(""));
+	}
 }
 
 inline bool Position::TryGetQuote(Data::Quote& quote)

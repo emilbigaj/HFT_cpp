@@ -105,6 +105,11 @@ namespace Data
 		Level Bid;
 		Level Ask;
 
+		double MicroPrice() const
+		{
+			return (Bid.Ticks * Ask.Quantity + Ask.Ticks * Bid.Quantity) * TickSize / (Bid.Quantity + Ask.Quantity);
+		}
+
 		double MidPrice() const
 		{
 			return (Bid.Ticks + Ask.Ticks) * 0.5 * TickSize;
@@ -160,6 +165,31 @@ namespace Data
 	};
 	
 	static_assert(Tools::PlainOldData<Trade>);
+
+	struct Settlement
+	{
+		Data::TickHeader TickHeader;
+		double Price;
+		uint8_t _reserved[64 - sizeof(Data::TickHeader) - sizeof(double)] = {};
+
+		std::string ToString() const
+		{
+			return Tools::Json::Serialize(*this);
+		}
+
+		struct glaze
+		{
+			using T = Settlement;
+			static constexpr auto value = glz::object(
+				"TickHeader", &T::TickHeader,
+				"Price", &T::Price
+			);
+		};
+	};
+
+	static_assert(Tools::PlainOldData<Settlement>);
+	static_assert(sizeof(Settlement) == 64);
+	static_assert(offsetof(Settlement, Price) == 32);
 
 	// Trading-status transition for one instrument, broadcast on its data ring. The convenience
 	// ctor stamps ONE timestamp into all three header clocks - that is the simulator's shortcut,

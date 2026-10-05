@@ -47,11 +47,10 @@ namespace Tools
             _bits = value;
         }
 
+        // A bare JSON number, as C#'s Bitset64JsonConverter reads and writes it.
         struct glaze
         {
-            static constexpr auto value = glz::object(
-                "Raw", &Bitset64::_bits
-            );
+            static constexpr auto value = &Bitset64::_bits;
         };
 
         // ─────────────────────────────────────────────────────────────────────────
@@ -366,4 +365,6 @@ namespace Tools
             return sb.str();
         }
     };
+
+    static_assert(sizeof(Bitset64) == 8);
 }
