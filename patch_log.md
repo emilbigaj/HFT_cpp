@@ -4,6 +4,37 @@ Newest first. Each entry says what changed, why, and what it broke or unblocked.
 
 ---
 
+## Regressions in `4c487be`, fixed
+
+Found by a post-commit regression hunt (each finding upheld by two independent refutation
+attempts). All came from changes beyond the 2026-10-04 report:
+- **`IsProcessAlive` lost its `pid <= 0` guard** (copied from C#): `kill(0, 0)` targets the process
+  group and succeeds, so a client slot with pid 0 never closed and its orders were never
+  cancelled. Guard restored. **C# has the same bug** (`ProcessId.IsAlive_Linux`) — add the guard there.
+- **`LoadInstruments` replayed through the server-only `OnAllocateInstrument`** (C# parity): after a
+  restart no client/house-book allocation and no `AllocateInstrument` callback, so the CME adapter
+  built no routers or market data — fills for orders still working at CME were dropped as
+  "unrouted" and cancels never left. Restored to the client path.
+- **Signal handling rewrite** (second caller waited on the first exit chain, plus OnExit via atexit):
+  a second Ctrl+C/SIGTERM/SIGHUP during shutdown deadlocked a signal-handling background thread
+  against `CmeServer::Stop`'s join. Reverted `Application.hpp`, `Logger.hpp` and the socket exit
+  actions to the previous code; SIGHUP is now handled like SIGINT unless inherited as ignored
+  (`nohup`).
+- **`MLock` stopped throwing** (C# parity): a host without the memlock ulimit would trade unpinned.
+  Throwing restored.
+- **Refused-Create Done**: the server's synthesised Done now keeps the row's `ExchangeOrderId`,
+  `QuantityFilled` and `TimeInForce` and is skipped when the row is already Done (the CME
+  reconcile path fails acked orders this way); CME `OnOrderSendFailed` no longer sends its own
+  Done (duplicate), and an `ExecutionReportReject` carries CME's TransactTime. **C# should keep
+  the row's exchange identity in the same place.**
+
+Not changed (C# design, flagged to the user): the client-side position check measures the
+strategy's own position against the server-wide `MaxPositionQuantity`, so with offsetting books it
+can refuse (and pause) what the server would accept; the startup `WorkingRisk` seed can double-count
+a fill that lands between socket connect and seed (report §4.6 accepted residual).
+
+---
+
 ## Client-side risk copy, RiskLimit/WorkingRisk split, Reduce, duplicate-fill drop (C# `fdae2ab` + `8f229aa`, report 2026-10-04)
 
 **FOR C# CLAUDE — read this first.** The report's §0 "Baseline" and §1.9 claims about the C++ tree

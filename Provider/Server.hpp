@@ -462,14 +462,20 @@ public:
         if (orderState.OrderHeader.OrderId == orderRejected.OrderHeader.OrderId)
         {
             // A refused Create ends its order: the Done (which releases its risk) is published before the reject that explains it.
-            if (orderRejected.OrderTargetAction == Execution::OrderTargetAction::Create)
+            // The row's ExchangeOrderId and QuantityFilled are kept: the adapter also fails an order it had
+            // acked (reconcile after a reconnect) this way. An already-Done row gets no second Done.
+            if (orderRejected.OrderTargetAction == Execution::OrderTargetAction::Create
+                && orderState.OrderStateStatus != Execution::OrderStateStatus::Done)
             {
                 Execution::OrderState rejectedState
                 {
                     .OrderHeader = orderRejected.OrderHeader,
+                    .ExchangeOrderId = orderState.ExchangeOrderId,
                     .OrderProfile = orderRejected.OrderProfile,
+                    .TimeInForce = orderState.TimeInForce,
                     .OrderStateStatus = Execution::OrderStateStatus::Done,
                     .OrderStateReason = Execution::OrderStateReason::Rejected,
+                    .QuantityFilled = orderState.QuantityFilled,
                 };
                 OnOrderState(rejectedState);
             }
@@ -908,7 +914,10 @@ public:
                           << allocateInstrument.ExchangeInstrumentId << ") is no longer listed; not restored." << std::endl;
                 continue;
             }
-            OnAllocateInstrument(allocateInstrument);
+            // The full client path, not the server-only one: it restores the client and house-book
+            // allocations and fires AllocateInstrument, which the CME adapter needs to rebuild routers
+            // and market data for orders still working at the exchange after a restart.
+            OnAllocateInstrument(allocateInstrument.ClientId, allocateInstrument);
         }
     }
 

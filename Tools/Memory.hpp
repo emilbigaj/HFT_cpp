@@ -6,7 +6,6 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
-#include <iostream>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -294,17 +293,15 @@ namespace Tools
 
 		// ---- naming + reclaim ----
 
-		// Pins all current + future pages once per process. A failure (e.g. a low RLIMIT_MEMLOCK) is
-		// reported and not retried: the process runs unpinned, as the C# side does.
+		// Pins all current + future pages once per process. std::call_once makes the first
+		// call win race-free and re-runs only if it threw (mlockall is idempotent otherwise).
 		static void MLock()
 		{
 			static std::once_flag s_mlockOnce;
 			std::call_once(s_mlockOnce, []()
 			{
-				if (mlockall(MCL_CURRENT | MCL_FUTURE) == 0)
-					std::cout << "Tools.Memory: mlockall success." << std::endl;
-				else
-					std::cout << "Tools.Memory: mlockall failed (errno=" << errno << "). Check ulimits." << std::endl;
+				if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0)
+					throw std::runtime_error("mlockall failed: " + std::string(std::strerror(errno)));
 			});
 		}
 

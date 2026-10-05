@@ -96,6 +96,9 @@ namespace Tools
 
 	inline bool IsProcessAlive(int32_t pid)
 	{
+		// kill(0|-n, 0) targets a process GROUP and succeeds, so a pid <= 0 would read as alive and the dead-client sweep would never close it.
+		if (pid <= 0)
+			return false;
 		if (kill(pid, 0) == 0)
 			return true;
 		return errno != ESRCH;
