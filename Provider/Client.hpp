@@ -97,7 +97,6 @@ public:
     std::function<void(const Execution::PositionHeader&)> Position;
     // C++-only market-data surface (the C# strategy applies these via Instrument methods instead).
     std::function<void(const Data::Trade&)> Trade;
-    std::function<void(const Data::MarketByPrice&, std::span<uint8_t>)> MarketByPrice;
 
     Client(const std::string& clientName, const std::string& serverName)
         : ClientName(Provider::ClientContext::GetDirectoryPath(clientName)),
@@ -112,8 +111,15 @@ public:
           _serverMarketsByPrice(ServerName / "MarketsByPrice", ClientContext.ServerHeader().GetReadonlyRef().InstrumentIds.Length(), Tools::Access::Read)
     {
         _instrumentData.resize(static_cast<size_t>(ClientContext.ServerHeader().GetReadonlyRef().InstrumentIds.Length()));
-        ExchangeTimestamp = Clock::GetUtcNow();
-        NicTimestamp = Clock::GetUtcNow();
+        ExchangeTimestamp = Tools::Clock::UtcNow();
+        NicTimestamp = Tools::Clock::UtcNow();
+
+        // A previous process's Active order would hold room, slots and fills this process never made (see Spec.md).
+        ThrowIfPreviousOrdersActive();
+        // ensures all messages cleared out
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        // Every previous order is Done and already in the position rows WorkingRisk is seeded from: skip what is queued for them.
+        _socket.Recover();
     }
 
     // One strategy run per pass (2026-09-14 report): phase 1 folds everything queued into the
@@ -196,9 +202,6 @@ public:
         Data::Instrument& instrument = ClientContext.GetInstrument(instrumentId);
         ClientContext.GetPosition(instrumentId);   // ensure the position is created
 
-        // A previous process's Active orders would hold room, slots and fills this process never made; the server cancels them when that process closes (see Spec.md).
-        ThrowIfPreviousOrdersActive(instrumentId);
-
         // RiskLayer starts from this strategy's own position, every process: the region can outlive one (the GUI maps it).
         // A spread's legs come through here themselves before the spread (GetInstrument onboards them first).
         ClientContext.GetWorkingRisk(instrumentId).Write(Execution::WorkingRisk{ .Position = ClientContext.GetPositionHeader(instrumentId).GetReadonlyRef().Quantity });
@@ -208,16 +211,14 @@ public:
         return instrument;
     }
 
-    void ThrowIfPreviousOrdersActive(int32_t instrumentId)
+    void ThrowIfPreviousOrdersActive()
     {
         for (int32_t localIndex = 0; localIndex < 64; ++localIndex)
         {
             Execution::OrderId orderId = Execution::OrderId().ClientId(ClientId).LocalIndex(localIndex);
             const Execution::OrderState& orderState = ClientContext.GetOrderState(orderId).GetReadonlyRef();
-            if (orderState.OrderHeader.OrderId.InstrumentId() != instrumentId)
-                continue;
             if (orderState.OrderStateStatus == Execution::OrderStateStatus::Active)
-                throw std::runtime_error("Order " + orderState.OrderHeader.OrderId.ToString() + " from a previous process is still Active on instrument " + std::to_string(instrumentId) + ": start again once the server has cancelled it.");
+                throw std::runtime_error("Order " + orderState.OrderHeader.OrderId.ToString() + " from a previous process is still Active: start again once the server has cancelled it.");
             // Done: its risk row is the previous process's, so this process starts from an empty one.
             ClientContext.GetOrderRisk(orderId).GetRef() = Execution::OrderRisk{};
         }
@@ -306,32 +307,45 @@ public:
     }
 
     // Apply a delta/update/snapshot to our own replica under the seqlock; a stale tick or one that changes
-    // no level stops here. Then fire the MarketByPrice callback with the tick (a mutable copy, matching the
-    // callback signature).
+    // no level stops here. The instrument then refreshes its quote and fires MarketByPriceDelta with the delta.
     void ApplyMarketByPrice(int32_t instrumentId, std::span<const uint8_t> bytes)
     {
         Socket::SharedArrayEntry<Data::MarketByPrice64>& entry = ClientContext.GetMarketByPrice64(instrumentId);
         Data::MarketByPrice64& mbp64 = entry.GetRef();
-        Data::TickType tickType = reinterpret_cast<const Data::MarketByPrice*>(bytes.data())->TickHeader.TickType;
+        const Data::MarketByPrice& mbp = *reinterpret_cast<const Data::MarketByPrice*>(bytes.data());
 
-        bool isDeltas = false;
-        if (tickType == Data::TickType::MarketByPriceDelta)
+        Data::Instrument& instrument = ClientContext.GetInstrument(instrumentId);
+        if (mbp.TickHeader.TickType == Data::TickType::MarketByPriceDelta)
         {
+            std::span<const uint8_t> deltaSpan = bytes;
+
             entry.AcquireLock();
-            isDeltas = mbp64.TrySet(bytes);
+            bool isDeltas = mbp64.TrySet(deltaSpan);
             entry.ReleaseLock();
+            if (!isDeltas)
+                return;
+
+            instrument.ApplyMarketByPriceDelta(mbp, deltaSpan);
+            _dirtyBooks.Set(instrumentId);
         }
-        else if (tickType == Data::TickType::MarketByPriceUpdate)
+        else if (mbp.TickHeader.TickType == Data::TickType::MarketByPriceUpdate)
         {
             alignas(Data::MarketByPrice) uint8_t deltaBuffer[Socket::ReadOnlySocket::BufferSize];
             std::memcpy(deltaBuffer, bytes.data(), bytes.size());
             std::span<uint8_t> deltaSpan(deltaBuffer, bytes.size());
 
             entry.AcquireLock();
-            isDeltas = mbp64.TrySetAsDeltas(deltaSpan);
+            bool isDeltas = mbp64.TrySetAsDeltas(deltaSpan);
             entry.ReleaseLock();
+
+            if (!isDeltas)
+                return;
+
+            const Data::MarketByPrice& delta = *reinterpret_cast<const Data::MarketByPrice*>(deltaSpan.data());
+            instrument.ApplyMarketByPriceDelta(delta, deltaSpan);
+            _dirtyBooks.Set(instrumentId);
         }
-        else if (tickType == Data::TickType::MarketByPriceSnapshot)
+        else if (mbp.TickHeader.TickType == Data::TickType::MarketByPriceSnapshot)
         {
             alignas(Data::MarketByPrice) uint8_t pastBuffer[Data::MarketByPrice::SizeOf(64, 64)];
             alignas(Data::MarketByPrice) uint8_t updateBuffer[Data::MarketByPrice::SizeOf(128, 128)];
@@ -342,24 +356,15 @@ public:
             Data::MarketByPrice::SnapshotAsUpdate(pastSpan, bytes, deltaSpan); // shrinks deltaSpan to the update
 
             entry.AcquireLock();
-            isDeltas = mbp64.TrySetAsDeltas(deltaSpan);
+            bool isDeltas = mbp64.TrySetAsDeltas(deltaSpan);
             entry.ReleaseLock();
-        }
 
-        if (!isDeltas)
-            return;
+            if (!isDeltas)
+                return;
 
-        // Phase-1 mark: refresh the instrument's quote cache from our own replica (this thread is
-        // its only writer, so the direct read is race-free) and defer the Changed events to phase 2.
-        ClientContext.GetInstrument(instrumentId).ApplyMarketByPriceDelta(entry.GetReadonlyRef());
-        _dirtyBooks.Set(instrumentId);
-
-        if (MarketByPrice)
-        {
-            alignas(Data::MarketByPrice) uint8_t buffer[Socket::ReadOnlySocket::BufferSize];
-            std::memcpy(buffer, bytes.data(), bytes.size());
-            Data::MarketByPrice& mbp = *reinterpret_cast<Data::MarketByPrice*>(buffer);
-            MarketByPrice(mbp, std::span<uint8_t>(buffer, bytes.size()));
+            const Data::MarketByPrice& delta = *reinterpret_cast<const Data::MarketByPrice*>(deltaSpan.data());
+            instrument.ApplyMarketByPriceDelta(delta, deltaSpan);
+            _dirtyBooks.Set(instrumentId);
         }
     }
 
@@ -372,7 +377,7 @@ public:
     bool OnOrderTarget(Execution::OrderTarget& orderTarget)
     {
         orderTarget.TriggerTimestamp = NicTimestamp;
-        orderTarget.OrderHeader.NicTimestamp = Clock::GetUtcNow();
+        orderTarget.OrderHeader.NicTimestamp = Tools::Clock::UtcNow();
         orderTarget.OrderHeader.ExchangeTimestamp = ExchangeTimestamp;
 
         if (orderTarget.OrderTargetAction == Execution::OrderTargetAction::Create)
@@ -482,7 +487,7 @@ public:
     static bool IsDiscarded(const Execution::OrderRejected& orderRejected)
     {
         return orderRejected.IsDiscarded()
-            || (Clock::Mode == ClockMode::Simulation && orderRejected.OrderRejectedReasons.Raw() == (1ULL << static_cast<int32_t>(Execution::OrderRejectedReason::TooManyOrdersPerSession)));
+            || (Tools::Clock::Mode() == Tools::ClockMode::Simulation && orderRejected.OrderRejectedReasons.Raw() == (1ULL << static_cast<int32_t>(Execution::OrderRejectedReason::TooManyOrdersPerSession)));
     }
 
 private:

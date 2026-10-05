@@ -30,6 +30,42 @@
 
 namespace Tools
 {
+	// LogEntry's "Objects": C#'s converter writes each element with Utf8JsonWriter.WriteRawValue, which
+	// never indents a raw value. Elements follow '[' and each other directly; only the closing bracket
+	// of a non-empty array gets its own line.
+	struct JsonRawValues
+	{
+		const std::vector<glz::raw_json>& Values;
+	};
+}
+
+namespace glz::detail
+{
+	template <>
+	struct to_json<Tools::JsonRawValues>
+	{
+		template <auto Opts>
+		static void op(auto&& value, is_context auto&& ctx, auto&& b, auto&& ix) noexcept
+		{
+			dump<'['>(b, ix);
+			for (size_t i = 0; i < value.Values.size(); i++)
+			{
+				if (i > 0)
+					dump<','>(b, ix);
+				dump_maybe_empty(value.Values[i].str, b, ix);
+			}
+			if constexpr (Opts.prettify)
+			{
+				if (!value.Values.empty())
+					dump_newline_indent<Opts.indentation_char>(ctx.indentation_level, b, ix);
+			}
+			dump<']'>(b, ix);
+		}
+	};
+}
+
+namespace Tools
+{
 	// Mirror of the C# LogEntry. The payload objects are captured as deferred
 	// serializer closures so the JSON formatting happens on the background writer
 	// thread (entry.ToString()), not on the thread that called Log().
@@ -45,9 +81,9 @@ namespace Tools
 		std::vector<std::function<std::string()>> Objects;
 
 		// Scratch filled by ToString() on the writer thread: the deferred serializers are
-		// invoked to produce raw JSON fragments. glaze emits glz::raw_json verbatim, matching
-		// the C# converter's writer.WriteRawValue(Json.Serialize(obj)). 'Objects' (the closures)
-		// is intentionally absent from the meta, so glaze never inspects the std::function vector.
+		// invoked to produce raw JSON fragments, emitted verbatim like the C# converter's
+		// writer.WriteRawValue(Json.Serialize(obj)). 'Objects' (the closures) is intentionally
+		// absent from the meta, so glaze never inspects the std::function vector.
 		mutable std::vector<glz::raw_json> JsonObjects;
 
 		struct glaze
@@ -57,7 +93,7 @@ namespace Tools
 				"Timestamp", &T::Timestamp,
 				"Thread", &T::Thread,
 				"Source", &T::Source,
-				"Objects", &T::JsonObjects
+				"Objects", glz::custom<glz::skip{}, [](const T& entry) { return JsonRawValues{entry.JsonObjects}; }>
 			);
 		};
 
@@ -171,6 +207,7 @@ namespace Tools
 		// Captures a copy of the argument and returns a closure that serializes it
 		// lazily on the writer thread. Character arrays / pointers are normalised to
 		// std::string so we own the bytes; everything else must be glaze-serializable.
+		// Indented even in a single-line entry: C# serializes each object with Json.Serialize.
 		template <typename T>
 		static std::function<std::string()> MakeSerializer(T&& value)
 		{
@@ -178,16 +215,16 @@ namespace Tools
 
 			if constexpr (std::is_same_v<V, std::string>)
 			{
-				return [v = std::string(std::forward<T>(value))]() { return Tools::Json::SerializeToLine(v); };
+				return [v = std::string(std::forward<T>(value))]() { return Tools::Json::Serialize(v); };
 			}
 			else if constexpr (std::is_convertible_v<V, std::string_view>)
 			{
 				// string literals / const char*
-				return [v = std::string(std::string_view(value))]() { return Tools::Json::SerializeToLine(v); };
+				return [v = std::string(std::string_view(value))]() { return Tools::Json::Serialize(v); };
 			}
 			else
 			{
-				return [v = V(std::forward<T>(value))]() { return Tools::Json::SerializeToLine(v); };
+				return [v = V(std::forward<T>(value))]() { return Tools::Json::Serialize(v); };
 			}
 		}
 

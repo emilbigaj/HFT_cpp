@@ -196,7 +196,7 @@ public:
         std::filesystem::path filePath = GetSeriesFilePath<T>(_serverContext.SeriesDirectoryPath, name);
         std::unique_ptr<Series<T>> series = std::make_unique<Series<T>>(filePath.string(), _serverContext.LoggingServerName);
 
-        if (std::filesystem::exists(filePath) && Clock::Mode == ClockMode::Realtime)
+        if (std::filesystem::exists(filePath) && Tools::Clock::Mode() == Tools::ClockMode::Realtime)
         {
             std::optional<std::string> json = Tools::ReadLastLine(filePath.string());
             if (json.has_value())
@@ -304,7 +304,7 @@ public:
         riskLimitEntry.AcquireLock();
         riskLimit.MaxOrderQuantity = controlRiskLimit.MaxOrderQuantity;
         riskLimit.MaxPositionQuantity = controlRiskLimit.MaxPositionQuantity;
-        riskLimit.Timestamp = Clock::GetUtcNow();
+        riskLimit.Timestamp = Tools::Clock::UtcNow();
         riskLimitEntry.ReleaseLock();
 
         // Server-wide limit: the posted row is what the logging server appends to the server's .risklimit file.
@@ -315,7 +315,7 @@ public:
     
     void OnControlAlgoStatus(int32_t strategyId, int32_t instrumentId, Execution::AlgoStatus algoStatus)
     {
-        Tools::Timestamp now = Clock::GetUtcNow();
+        Tools::Timestamp now = Tools::Clock::UtcNow();
         Socket::SharedArrayEntry<Execution::PositionHeader>& localPositionEntry = _serverContext.GetPositionHeader(strategyId, instrumentId);
         Execution::PositionHeader localPosition = localPositionEntry.GetReadonlyRef();
         localPosition.OrderHeader.ExchangeTimestamp = now;
@@ -344,7 +344,7 @@ public:
                 orderTarget.OrderTargetStatus = Execution::OrderStateStatus::Active;
                 orderTarget.OrderTargetAction = Execution::OrderTargetAction::Cancel;
                 orderTarget.OrderHeader.Seq += 1'000'000;
-                orderTarget.OrderHeader.NicTimestamp = Clock::GetUtcNow();
+                orderTarget.OrderHeader.NicTimestamp = Tools::Clock::UtcNow();
                 // Client process is dead, so the server is the slot's sole writer: stamp the cancel in
                 // so the vendor's replay-on-ack cancels a still-PendingNew order.
                 orderTargetEntry.RecoveryWrite(orderTarget);
@@ -405,7 +405,7 @@ public:
 
     Execution::OrderState OnOrderState(Execution::OrderState& orderState)
     {
-        orderState.OrderHeader.NicTimestamp = Clock::GetUtcNow();
+        orderState.OrderHeader.NicTimestamp = Tools::Clock::UtcNow();
         Execution::OrderState& existingOrderState = WriteOrderState(orderState);
         WriteToExecution(existingOrderState);
         if (OrderState)
@@ -446,6 +446,7 @@ public:
 
     static constexpr uint64_t _orderNotFound = 1ULL << static_cast<int32_t>(Execution::OrderRejectedReason::OrderNotFound);
 
+    // The entry point for every refused target, the server's own (OnOrderTarget) and the exchange's (see Spec.md).
     Execution::OrderRejected OnOrderRejected(Execution::OrderRejected& orderRejected, const std::string& message)
     {
         Socket::SharedArrayEntry<Execution::OrderState>& orderStateEntry = _serverContext.GetOrderState(orderRejected.OrderHeader.OrderId);
@@ -462,24 +463,16 @@ public:
         if (orderState.OrderHeader.OrderId == orderRejected.OrderHeader.OrderId)
         {
             // A refused Create ends its order: the Done (which releases its risk) is published before the reject that explains it.
-            // The row's ExchangeOrderId and QuantityFilled are kept: the adapter also fails an order it had
-            // acked (reconcile after a reconnect) this way. An already-Done row gets no second Done.
-            if (orderRejected.OrderTargetAction == Execution::OrderTargetAction::Create
-                && orderState.OrderStateStatus != Execution::OrderStateStatus::Done)
+            if (orderRejected.OrderTargetAction == Execution::OrderTargetAction::Create)
             {
-                Execution::OrderState rejectedState
-                {
-                    .OrderHeader = orderRejected.OrderHeader,
-                    .ExchangeOrderId = orderState.ExchangeOrderId,
-                    .OrderProfile = orderRejected.OrderProfile,
-                    .TimeInForce = orderState.TimeInForce,
-                    .OrderStateStatus = Execution::OrderStateStatus::Done,
-                    .OrderStateReason = Execution::OrderStateReason::Rejected,
-                    .QuantityFilled = orderState.QuantityFilled,
-                };
+                Execution::OrderState rejectedState = orderState;
+                rejectedState.OrderHeader = orderRejected.OrderHeader;
+                rejectedState.OrderProfile = orderRejected.OrderProfile;
+                rejectedState.OrderStateStatus = Execution::OrderStateStatus::Done;
+                rejectedState.OrderStateReason = Execution::OrderStateReason::Rejected;
                 OnOrderState(rejectedState);
             }
-            orderRejected.OrderHeader.NicTimestamp = Clock::GetUtcNow();
+            orderRejected.OrderHeader.NicTimestamp = Tools::Clock::UtcNow();
             _riskLayer.OnOrderRejected(orderRejected);
             Reject(orderRejected, message);
             return orderRejected;
@@ -525,16 +518,16 @@ public:
                 .OrderHeader = orderTarget.OrderHeader,
                 .OrderProfile = orderTarget.OrderProfile,
                 .TimeInForce = orderTarget.TimeInForce,
-                .OrderStateStatus = isValid ? Execution::OrderStateStatus::Active : Execution::OrderStateStatus::Done,
+                .OrderStateStatus = Execution::OrderStateStatus::Active,
                 // Seq 0 already means "not acked"; naming it lets the RiskLayer retire hooks tell
                 // PendingNew from an ack without inferring it from the sequence.
-                .OrderStateReason = isValid ? Execution::OrderStateReason::PendingNew : Execution::OrderStateReason::Rejected,
+                .OrderStateReason = Execution::OrderStateReason::PendingNew,
                 .QuantityFilled = 0,
                 .QuantityAhead = quantityAhead,
                 .QuantityBehind = 0,
             };
             orderState.OrderHeader.Seq = 0; // indicates new Order but that ordertarget is not acked by exchange
-            orderState.OrderHeader.NicTimestamp = Clock::GetUtcNow();
+            orderState.OrderHeader.NicTimestamp = Tools::Clock::UtcNow();
             orderStateEntry.ReleaseLock();
             WriteToExecution(orderState);
         }
@@ -556,8 +549,7 @@ public:
 				.OrderProfile = orderTarget.OrderProfile,
 				.OrderRejectedReasons = orderRejectedReasons,
 			};
-            orderRejected.OrderHeader.NicTimestamp = Clock::GetUtcNow();
-			Reject(orderRejected, "Rejected by Server Risk Layer");
+			OnOrderRejected(orderRejected, "Rejected by Server Risk Layer");
 		}
     }
 
@@ -661,7 +653,7 @@ public:
         if (std::abs(orderState.QuantityFilled) <= std::abs(existingOrderState.QuantityFilled))
             return;
 
-        Tools::Timestamp now = Clock::GetUtcNow();
+        Tools::Timestamp now = Tools::Clock::UtcNow();
         orderState.OrderHeader.NicTimestamp = now;   // same stamp as its fills: equal NIC keeps ring order (state, fill, position) in the audit
         for (Execution::Fill& fill : fills)
         {
@@ -946,12 +938,14 @@ private:
     // clean slate rather than replaying yesterday's clients, instruments, fills and positions.
     void InitDirectories()
     {
+        // Before anything is deleted: a simulation run against a live server's name must throw here, not after wiping its files.
+        ServerContext::ThrowIfInvalidServerName(ServerName);
         for (const char* subDirectory : SubDirectories)
         {
             std::filesystem::path subDirectoryPath = ServerName / subDirectory;
             std::filesystem::create_directories(subDirectoryPath);
 
-            if (Clock::Mode == ClockMode::Realtime)
+            if (Tools::Clock::Mode() == Tools::ClockMode::Realtime)
                 continue;
 
             

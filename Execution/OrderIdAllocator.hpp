@@ -279,19 +279,20 @@ namespace Execution
 
         // Reads/writes as a JSON object, like every other struct in the project. ClientOrderId is the source
         // of truth on read; the decoded fields are emitted for readability and ignored on read (no-op
-        // setters). Lambda getters (not &T::Field) because the accessors are get/set-overloaded.
+        // setters). Lambda getters (not &T::Field) because the accessors are get/set-overloaded. ClientOrderId
+        // comes last because C# writes a struct's properties before its fields.
         struct glaze
         {
             using T = OrderId;
             static constexpr auto value = glz::object(
-                "ClientOrderId", &T::ClientOrderId,
                 "LocalIndex",   glz::custom<[](T&, int32_t) {},  [](const auto& o) { return o.LocalIndex(); }>,
                 "ClientId",     glz::custom<[](T&, int32_t) {},  [](const auto& o) { return o.ClientId(); }>,
                 "StrategyId",   glz::custom<[](T&, int32_t) {},  [](const auto& o) { return o.StrategyId(); }>,
                 "InstrumentId", glz::custom<[](T&, int32_t) {},  [](const auto& o) { return o.InstrumentId(); }>,
                 "Generation",   glz::custom<[](T&, uint32_t) {}, [](const auto& o) { return o.Generation(); }>,
                 "GlobalIndex",  glz::custom<[](T&, int32_t) {},  [](const auto& o) { return o.GlobalIndex(); }>,
-                "IsAllocated",  glz::custom<[](T&, bool) {},     [](const auto& o) { return o.IsAllocated(); }>
+                "IsAllocated",  glz::custom<[](T&, bool) {},     [](const auto& o) { return o.IsAllocated(); }>,
+                "ClientOrderId", &T::ClientOrderId
             );
         };
     };

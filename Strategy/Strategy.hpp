@@ -39,9 +39,9 @@ public:
 
         };
         
-        _client.MarketByPrice = [this](const Data::MarketByPrice& mbp, std::span<uint8_t>) 
+        _instrument.MarketByPriceDelta = [this](const Data::MarketByPrice& delta, std::span<const uint8_t>)
         {
-            Execute(mbp.TickHeader.InstrumentId);
+            Execute(delta.TickHeader.InstrumentId);
         };
     }
 

@@ -40,7 +40,7 @@ namespace Provider
 	struct Alert
 	{
 		Data::Header<AlertType> Header;
-		Tools::Timestamp Timestamp; // Clock::GetUtcNow() at construction, on the raising thread
+		Tools::Timestamp Timestamp; // Tools::Clock::UtcNow() at construction, on the raising thread
 
 		// OrderRejected only; resolved by AlertManager (header path), carried on the wire as String64.
 		std::string Symbol;
@@ -63,28 +63,29 @@ namespace Provider
 
 		// Message-only (e.g. pre-resolved text alerts).
 		Alert(AlertType type, std::string message)
-			: Header(type), Timestamp(Clock::GetUtcNow()), Object(std::monostate{}), Message(std::move(message)) {}
+			: Header(type), Timestamp(Tools::Clock::UtcNow()), Object(std::monostate{}), Message(std::move(message)) {}
 
 		// Object + message.
 		template <typename T> requires Tools::PlainOldData<T>
 		Alert(AlertType type, const T& object, std::string message)
-			: Header(type), Timestamp(Clock::GetUtcNow()), Object(object), Message(std::move(message)) {}
+			: Header(type), Timestamp(Tools::Clock::UtcNow()), Object(object), Message(std::move(message)) {}
 
 		// Deferred-exception alert: rich Message built by the consumer from Exception + Location.
 		Alert(std::exception_ptr exception, std::source_location location)
-			: Header(AlertType::Exception), Timestamp(Clock::GetUtcNow()), Object(std::monostate{}),
+			: Header(AlertType::Exception), Timestamp(Tools::Clock::UtcNow()), Object(std::monostate{}),
 			  Exception(std::move(exception)), Location(location) {}
 
-		// ToString()/JSON includes Object (glaze writes the active alternative; monostate -> null).
-		// On the wire it's the raw struct bytes instead — the two representations are independent.
+		// ToString()/JSON includes Object (glaze writes the active alternative). An empty Symbol and a
+		// monostate Object are C#'s nulls, so they are left out. On the wire it's the raw struct bytes
+		// instead — the two representations are independent.
 		struct glaze
 		{
 			using T = Alert;
 			static constexpr auto value = glz::object(
 				"Header", &T::Header,
 				"Timestamp", &T::Timestamp,
-				"Symbol", &T::Symbol,
-				"Object", &T::Object,
+				"Symbol", Tools::OmitEmpty<&T::Symbol>,
+				"Object", Tools::OmitEmpty<&T::Object>,
 				"Message", &T::Message
 			);
 		};

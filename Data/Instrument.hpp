@@ -109,6 +109,7 @@ namespace Data
 		{
 			using T = ForexHeader;
 			static constexpr auto value = glz::object(
+				"Symbology", glz::custom<glz::skip{}, Tools::NullIfThrows<&T::Symbology>>,
 				"InstrumentHeader", &T::InstrumentHeader,
 				"BaseCurrency", &T::BaseCurrency,
 				"QuoteCurrency", &T::QuoteCurrency
@@ -138,6 +139,7 @@ namespace Data
 		{
 			using T = FutureHeader;
 			static constexpr auto value = glz::object(
+				"Symbology", glz::custom<glz::skip{}, Tools::NullIfThrows<&T::Symbology>>,
 				"InstrumentHeader", &T::InstrumentHeader,
 				"Multiplier", &T::Multiplier,
 				"MaturityDate", &T::MaturityDate
@@ -194,6 +196,7 @@ namespace Data
 		{
 			using T = LeggedHeader;
 			static constexpr auto value = glz::object(
+				"Symbology", glz::custom<glz::skip{}, Tools::NullIfThrows<&T::Symbology>>,
 				"InstrumentHeader", &T::InstrumentHeader,
 				"Multiplier", &T::Multiplier,
 				"LegCount", &T::LegCount,
@@ -360,9 +363,10 @@ namespace Data
 		// Phase 2 events: QuoteChanged fires on a NET change against the START of the pass (a
 		// quote that moves and moves back within one pass is not a change); MarketByPriceChanged
 		// fires once per pass for any touched book. Per-delta consumers stay in phase 1
-		// (Client::MarketByPrice - the C++ rendering of C#'s Instrument.MarketByPriceDelta).
+		// (MarketByPriceDelta, with the delta the book was folded with).
 		std::function<void()> QuoteChanged;
 		std::function<void()> MarketByPriceChanged;
+		std::function<void(const Data::MarketByPrice& delta, std::span<const uint8_t> bytes)> MarketByPriceDelta;
 		std::function<void(const Data::Settlement&)> SettlementChanged;
 
 		void OnSettlement(const Data::Settlement& settlement)
@@ -371,18 +375,20 @@ namespace Data
 				SettlementChanged(settlement);
 		}
 
-		// Phase 1, per folded delta: refresh the quote cache from the book image, remembering the
-		// quote as it was when this pass FIRST touched the book.
-		void ApplyMarketByPriceDelta(const Data::MarketByPrice64& mbp64)
+		// Phase 1 of a ReadSocket pass, per delta: fold into the image, fire only the per-delta consumers (see Spec.md).
+		void ApplyMarketByPriceDelta(const Data::MarketByPrice& delta, std::span<const uint8_t> bytes)
 		{
 			if (!_isDirty)
 			{
 				_quoteAtPassStart = _quote;
 				_isDirty = true;
 			}
+			const Data::MarketByPrice64& mbp64 = MarketByPriceRef();
 			_quote.Bid = mbp64.BidsCount() > 0 ? mbp64.BestBid() : Level{};
 			_quote.Ask = mbp64.AsksCount() > 0 ? mbp64.BestAsk() : Level{};
 			_isQuoteValid = mbp64.BidsCount() > 0 && mbp64.AsksCount() > 0;
+			if (MarketByPriceDelta)
+				MarketByPriceDelta(delta, bytes);
 		}
 
 		// Phase 2, once per pass.

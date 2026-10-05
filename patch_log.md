@@ -4,6 +4,60 @@ Newest first. Each entry says what changed, why, and what it broke or unblocked.
 
 ---
 
+## C++/C# review, item by item (2026-10-05) — see `csharp_alignment_report_2026-10-05.md`
+
+**FOR C# CLAUDE:** read `csharp_alignment_report_2026-10-05.md` (repo root, branch
+`persist-client-sockets` — `main` is stale). Its table lists all 28 reviewed items; §1–§7 are the
+changes **C# must implement**: restart replay through the client path (§1), client startup refusal +
+100 ms + backlog skip (§2), `mlockall` failure throws (§3), SIGHUP honours `nohup` (§4), server-name
+check before `InitDirectories` deletes (§5), `SharedArray` > `int.MaxValue` throws (§6), two `Clock`
+bugs (§7). Already done in C#: `ProcessId.IsAlive` pid ≤ 0 guard (`8a8bffc`).
+
+Each item was reviewed with the user one at a time, C++ and C# code side by side. C++ changes:
+
+- **Client startup** (`Client.hpp`, `Socket.hpp`): the constructor refuses to start if any of the
+  client's 64 order slots is Active, clears the Done slots' `OrderRisk`, sleeps 100 ms, then
+  `_socket.Recover()` skips every queued message (new `ClientSocket::Recover` passthrough). The
+  per-instrument check at allocation is gone; allocation only seeds `WorkingRisk`.
+- **Refused targets** (`Server.hpp`): `OnOrderTarget` always writes and publishes the PendingNew row
+  and routes every refusal through `OnOrderRejected`; a refused Create's Done copies the order row and
+  takes the reject's header and profile (keeps `ExchangeOrderId`) — matches C# as supplied by the user.
+- **Server name validated before anything is opened or deleted** (`Context.hpp`, `Server.hpp`):
+  `ThrowIfInvalidServerName` is a static on the base `Context` and runs in its first initialiser for
+  every context; `Server::InitDirectories` calls it first, so a simulation against a live server's name
+  throws before any file is deleted. The C++-only "no simulation on this server" throw is kept.
+- **`RiskLayer::TryClipToRiskLimit`** ported verbatim (unused until a C++ Algo layer exists).
+- **Clock** (new `Tools/Clock.hpp`, `Tools/Event.hpp`, `Tools/LockedPriorityQueue.hpp`): full port of
+  C# `Tools/Clock.cs` (reminders, events, `Start`/`Stop`, `Begin`/`End`, `OnInterject`,
+  `SimulationSpeed`, simulation/realtime loops, "Stop Clock" exit action). `Provider::Clock` deleted;
+  every user moved to `Tools::Clock` (`Clock::UtcNow()`, `Mode()`/`SetMode()` throwing while running).
+  `RiskLimit::GetMaxLimits/GetMinLimits(instrumentId)` stamp `Clock::UtcNow()` themselves, as C#.
+  The sample `Strategy/Scenario.hpp` drives time through the Clock like C# `Program.cs`. Two C# Clock
+  bugs fixed here and handed to C# (report §7).
+- **Market-by-price** (`Client.hpp`, `Instrument.hpp`, `Strategy.hpp`): C#'s Delta/Update/Snapshot
+  branches with stale ticks dropped; the per-delta event is now `Instrument::MarketByPriceDelta(delta,
+  bytes)` as in C#, replacing the C++-only `Client::MarketByPrice` callback.
+- **JSON is byte-identical to C#** (`Json.hpp`, `Logger.hpp`, metas across Data/Execution/Provider/
+  Socket): 2-space indent, .NET number format (15 significant digits, no exponent, NaN/Infinity as
+  strings), .NET string escaping, C# computed properties written (never read), C# key order. Proven by
+  a C#/C++ harness over 140 files (scratchpad `jsonparity/run.sh`); C++ still reads old C++ and C#
+  output. Doubles are now written with 15 significant digits, as C# writes them.
+- **`RateLimit` / `RollingRateLimit`** moved from `Order.hpp` into `Execution/RateLimit.hpp` next to
+  `SessionRateLimit`, as in C#. `Settlement` gained C#'s constructor.
+- Renames: `Clock::GetUtcNow` → `Clock::UtcNow`, `_allocatedInstrumentIds` → `_instrumentIds`.
+
+**CME repo (`~/cpp/CME`, not touched) needs these updates to build against this tree:**
+`Server/CmeServer.hpp:268` (`OnQuantityAhead` third argument `quantityBehind`, 0 live),
+`Server/CmeServer.hpp:685`, `ILink3/InstrumentRouter.hpp:387`, `Tests/RouterTests.cpp:136`
+(`OrderTargetAction::Amend` → `Replace`, `Reduce` takes the modify path), `Server/Main.cpp:40` and
+`Tests/ServerTests.cpp:61` (`Provider::Clock::Mode = …` → `Tools::Clock::SetMode(…)`). Since the server
+now publishes the Done for a refused Create, the router's own post-reject Done is a duplicate.
+
+Verified: build clean (no warnings); ExecutionTests, DataTests, ToolsTests (with new Clock tests) pass;
+JSON harness 0 of 140 files differ.
+
+---
+
 ## Regressions in `4c487be`, fixed
 
 Found by a post-commit regression hunt (each finding upheld by two independent refutation
@@ -22,11 +76,6 @@ attempts). All came from changes beyond the 2026-10-04 report:
   (`nohup`).
 - **`MLock` stopped throwing** (C# parity): a host without the memlock ulimit would trade unpinned.
   Throwing restored.
-- **Refused-Create Done**: the server's synthesised Done now keeps the row's `ExchangeOrderId`,
-  `QuantityFilled` and `TimeInForce` and is skipped when the row is already Done (the CME
-  reconcile path fails acked orders this way); CME `OnOrderSendFailed` no longer sends its own
-  Done (duplicate), and an `ExecutionReportReject` carries CME's TransactTime. **C# should keep
-  the row's exchange identity in the same place.**
 
 Not changed (C# design, flagged to the user): the client-side position check measures the
 strategy's own position against the server-wide `MaxPositionQuantity`, so with offsetting books it

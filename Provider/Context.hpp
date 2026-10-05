@@ -13,6 +13,7 @@
 #include <filesystem>
 #include "Allocate.hpp"
 #include "Timestamp.hpp"
+#include "Clock.hpp"
 #include "Tools.hpp"
 #include <cstdint>
 #include <fcntl.h>
@@ -30,30 +31,6 @@
 namespace Provider
 {
 
-enum ClockMode : uint8_t
-{
-	Simulation,
-	Realtime
-};
-
-class Clock
-{
-	static inline Tools::Timestamp s_utcNow;
-public:
-	static inline ClockMode Mode = ClockMode::Simulation;
-	static inline void SetUtcNow(Tools::Timestamp utcNow)
-	{
-		s_utcNow = utcNow;
-	}
-	static inline Tools::Timestamp GetUtcNow()
-	{
-		if (Mode == ClockMode::Realtime)
-			return Tools::Timestamp::UtcNow();
-
-		return s_utcNow;
-	}
-};
-
 class ContextManager; // Forward declaration
 
 class Context
@@ -62,6 +39,16 @@ public:
 	// The one mount every durable path on this machine hangs off: servers, strategies, venue logs and
 	// session state alike. Named here so no caller ever spells it out again.
 	static inline const std::filesystem::path RootDirectoryPath = "/mnt/S";
+
+	// Every context, server or client, checks this before any shared memory is opened: a server lives under
+	// Servers/<ClockMode>/, so a simulation never attaches to a live server or the reverse.
+	static inline void ThrowIfInvalidServerName(const std::filesystem::path& serverName)
+	{
+		std::string modeStr = Tools::Clock::Mode() == Tools::ClockMode::Simulation ? "Simulation" : "Realtime";
+		std::filesystem::path validDirectoryPath = RootDirectoryPath / "Servers" / modeStr / "";
+		if (!serverName.string().starts_with(validDirectoryPath.string()))
+			throw std::invalid_argument("ServerContext.ThrowIfInvalidServerName(" + serverName.string() + "), serverName is invalid, must start with: " + validDirectoryPath.string());
+	}
 
 	const std::filesystem::path ServerName;
 	const std::filesystem::path LoggingServerName;
@@ -136,7 +123,7 @@ public:
 	// spelling; it lives here because ServerContext is declared first and needs it for strategy 0.
 	static std::filesystem::path GetStrategyDirectoryPath(const std::string& clientName)
 	{
-		std::string modeStr = Clock::Mode == ClockMode::Simulation ? "Simulation" : "Realtime";
+		std::string modeStr = Tools::Clock::Mode() == Tools::ClockMode::Simulation ? "Simulation" : "Realtime";
 		return RootDirectoryPath / "Strategies" / modeStr / clientName;
 	}
 
@@ -188,15 +175,16 @@ protected:
 	// The allocation ThrowIfInstrumentIdOutOfRange tests: ServerHeader.InstrumentIds for the server,
 	// InstrumentIdsByClientId[ClientId] for a client (C# overrides it per context). Set by each derived
 	// constructor; a pointer rather than a virtual keeps the hot-path accessors free of an indirect call.
-	const Tools::Bitset64* _allocatedInstrumentIds = nullptr;
+	const Tools::Bitset64* _instrumentIds = nullptr;
 
 	std::vector<std::unique_ptr<Data::Instrument>> _instruments;
 	std::vector<std::unique_ptr<Position>> _positions;
 
 protected:
 	Context(const std::filesystem::path& serverName, const std::filesystem::path& directoryPath, Tools::Access serverAccess, Tools::Access clientAccess)
-    : 
-    ServerName(serverName),
+    :
+    // First initialiser, ahead of every shared array: a wrong-mode server name throws before anything is opened.
+    ServerName((ThrowIfInvalidServerName(serverName), serverName)),
     LoggingServerName(GetLoggingServerDirectoryPath(ServerName)),
     DirectoryPath(directoryPath),
     ServerAccess(serverAccess),
@@ -412,7 +400,7 @@ public:
 
 	ALWAYS_INLINE void ThrowIfInstrumentIdOutOfRange(int32_t instrumentId)
 	{
-		if (!(*_allocatedInstrumentIds)[instrumentId]) [[unlikely]]
+		if (!(*_instrumentIds)[instrumentId]) [[unlikely]]
 		{
 			throw std::out_of_range(std::string(typeid(*this).name()) + ".ThrowIfInstrumentIdOutOfRange(" + std::to_string(instrumentId) + "), instrumentId has not been allocated.");
 		}
@@ -552,8 +540,7 @@ public:
       InstrumentsDirectoryPath(ServerName / "Instruments"),
       ServerStrategyName(GetStrategyDirectoryPath(ServerName.filename().string()))
 	{
-		ThrowIfInvalidServerName(serverName);
-		_allocatedInstrumentIds = &ServerHeader().GetReadonlyRef().InstrumentIds;
+		_instrumentIds = &ServerHeader().GetReadonlyRef().InstrumentIds;
 
 		std::filesystem::create_directories(ClientsDirectoryPath);
 		std::filesystem::create_directories(InstrumentsDirectoryPath);
@@ -583,18 +570,11 @@ public:
 				std::filesystem::path rateLimitPath = GetRateLimitFilePath(DirectoryPath, coreGroup.CoreGroupName.ToString());
 				Execution::RateLimit rateLimit = std::filesystem::exists(rateLimitPath)
 					? Tools::Json::Deserialize<Execution::RateLimit>(Tools::ReadAllText(rateLimitPath))
-					: (Clock::Mode == ClockMode::Simulation ? Execution::RateLimit::GetMaxLimits(coreGroupId) : Execution::RateLimit::GetMinLimits(coreGroupId));
+					: (Tools::Clock::Mode() == Tools::ClockMode::Simulation ? Execution::RateLimit::GetMaxLimits(coreGroupId) : Execution::RateLimit::GetMinLimits(coreGroupId));
 				rateLimit.RateLimitId = coreGroupId;
 				_rateLimits[coreGroupId].Write(Execution::RollingRateLimit(rateLimit));
 			}
 		}
-	}
-
-	static inline void ThrowIfInvalidServerName(const std::filesystem::path& serverName)
-	{
-		std::filesystem::path validDirectoryPath = GetDirectoryPath("");
-		if (!serverName.string().starts_with(validDirectoryPath.string()))
-			throw std::invalid_argument("ServerContext.ThrowIfInvalidServerName(" + serverName.string() + "), serverName is invalid, must start with: " + validDirectoryPath.string());
 	}
 
 	static inline std::filesystem::path DirectoriesPath()
@@ -604,7 +584,7 @@ public:
 
 	static inline std::filesystem::path GetDirectoryPath(const std::string& serverName)
 	{
-		std::string modeStr = Clock::Mode == ClockMode::Simulation ? "Simulation" : "Realtime";
+		std::string modeStr = Tools::Clock::Mode() == Tools::ClockMode::Simulation ? "Simulation" : "Realtime";
 		return DirectoriesPath() / modeStr / serverName;
 	}
 
@@ -762,7 +742,7 @@ public:
         {
             std::cout << "Context::AllocateInstrument(" <<  symbol << ") Loaded RiskLimit: " << riskLimitLine.value() << std::endl;
         }
-		Execution::RiskLimit riskLimit = riskLimitLine ? Tools::Json::Deserialize<Execution::RiskLimit>(riskLimitLine.value()) : (Clock::Mode == ClockMode::Simulation ? Execution::RiskLimit::GetMaxLimits(instrumentId, Clock::GetUtcNow()) : Execution::RiskLimit::GetMinLimits(instrumentId, Clock::GetUtcNow()));
+		Execution::RiskLimit riskLimit = riskLimitLine ? Tools::Json::Deserialize<Execution::RiskLimit>(riskLimitLine.value()) : (Tools::Clock::Mode() == Tools::ClockMode::Simulation ? Execution::RiskLimit::GetMaxLimits(instrumentId) : Execution::RiskLimit::GetMinLimits(instrumentId));
 		riskLimit.InstrumentId = instrumentId;
         _riskLimits.GetEntry(instrumentId).Write(riskLimit);
 
@@ -818,7 +798,7 @@ public:
 		// A backtest has no operator to un-pause it, and the RiskLayer rejects a paused algo with
 		// AlgoIsPaused. Realtime is forced Paused rather than left to whatever the restored row said:
 		// a persisted Live would otherwise re-arm a strategy at startup with nobody asking for it.
-		positionHeader.AlgoStatus = Clock::Mode == ClockMode::Simulation ? Execution::AlgoStatus::Live : Execution::AlgoStatus::Paused;
+		positionHeader.AlgoStatus = Tools::Clock::Mode() == Tools::ClockMode::Simulation ? Execution::AlgoStatus::Live : Execution::AlgoStatus::Paused;
 
 		GetPositionHeader(clientId, instrumentId).Write(positionHeader);
 
@@ -845,8 +825,7 @@ public:
 	ClientContext(const std::filesystem::path& clientName, const std::filesystem::path& serverName, Tools::Access access) 
         : Context(serverName.string(), clientName, Tools::Access::Read, access), ClientId(GetClientIdFromMap(clientName.string()))
 	{
-		ServerContext::ThrowIfInvalidServerName(serverName);
-		_allocatedInstrumentIds = &_instrumentIdsByClientId[ClientId].GetReadonlyRef();
+		_instrumentIds = &_instrumentIdsByClientId[ClientId].GetReadonlyRef();
 
 		if (clientName.string().find(serverName.string()) != std::string::npos)
 			ServerContext::ThrowIfInvalidServerName(clientName);
@@ -990,7 +969,7 @@ inline void Context::CreatePosition(Data::Instrument& instrument)
 inline Profit Position::GetProfit()
 {
 	if (_headerEntry.IsEmpty())
-		return Profit(Clock::GetUtcNow(), std::nan(""), std::nan(""), 0.0, 0, std::nan(""), std::nan(""));
+		return Profit(Tools::Clock::UtcNow(), std::nan(""), std::nan(""), 0.0, 0, std::nan(""), std::nan(""));
 
 	Execution::PositionHeader positionHeader = _headerEntry.Read();
 	Data::Quote quote
@@ -1003,11 +982,11 @@ inline Profit Position::GetProfit()
 	if (Instrument.TryGetQuote(quote))
 	{
 		double floating = Instrument.GetProfit(positionHeader.AvgPrice, quote.MidPrice(), positionHeader.Quantity);
-		return Profit(Clock::GetUtcNow(), floating + positionHeader.RealizedProfit, floating, positionHeader.RealizedProfit, positionHeader.Quantity, positionHeader.AvgPrice, quote.MidPrice());
+		return Profit(Tools::Clock::UtcNow(), floating + positionHeader.RealizedProfit, floating, positionHeader.RealizedProfit, positionHeader.Quantity, positionHeader.AvgPrice, quote.MidPrice());
 	}
 	else
 	{
-		return Profit(Clock::GetUtcNow(), std::nan(""), std::nan(""), positionHeader.RealizedProfit, positionHeader.Quantity, positionHeader.AvgPrice, std::nan(""));
+		return Profit(Tools::Clock::UtcNow(), std::nan(""), std::nan(""), positionHeader.RealizedProfit, positionHeader.Quantity, positionHeader.AvgPrice, std::nan(""));
 	}
 }
 

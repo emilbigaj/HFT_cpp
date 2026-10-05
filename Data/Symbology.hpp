@@ -168,6 +168,20 @@ public:
 		return _symbol;
 	}
 
+	// C# serializes these get-only properties; JSON never builds a Symbology, so they are write-only.
+	struct glaze
+	{
+		using T = Symbology;
+		static constexpr auto value = glz::object(
+			"InstrumentType", glz::custom<glz::skip{}, &T::InstrumentType>,
+			"Exchange", glz::custom<glz::skip{}, &T::Exchange>,
+			"Root", glz::custom<glz::skip{}, &T::Root>,
+			"Ticker", glz::custom<glz::skip{}, &T::Ticker>,
+			"Symbol", glz::custom<glz::skip{}, &T::Symbol>,
+			"Product", glz::custom<glz::skip{}, &T::Product>,
+			"ShortSymbol", glz::custom<glz::skip{}, &T::ShortSymbol>
+		);
+	};
 };
 
 class FutureSymbology : public Symbology
@@ -192,6 +206,22 @@ public:
 	{
 		return _maturityDate;
 	}
+
+	// C# order: the derived class's properties first, its ShortSymbol override in its own place.
+	struct glaze
+	{
+		using T = FutureSymbology;
+		static constexpr auto value = glz::object(
+			"MaturityDate", glz::custom<glz::skip{}, &T::MaturityDate>,
+			"ShortSymbol", glz::custom<glz::skip{}, &T::ShortSymbol>,
+			"InstrumentType", glz::custom<glz::skip{}, &T::InstrumentType>,
+			"Exchange", glz::custom<glz::skip{}, &T::Exchange>,
+			"Root", glz::custom<glz::skip{}, &T::Root>,
+			"Ticker", glz::custom<glz::skip{}, &T::Ticker>,
+			"Symbol", glz::custom<glz::skip{}, &T::Symbol>,
+			"Product", glz::custom<glz::skip{}, &T::Product>
+		);
+	};
 };
 
 // Legged ticker: the root appears once, up front; leg tokens carry only sign+maturity, e.g.
@@ -243,6 +273,23 @@ public:
 
 	const std::vector<std::unique_ptr<Symbology>>& Symbologies() const { return _symbologies; }
 	const std::vector<int32_t>& Weights() const { return _weights; }
+
+	// Legs are written as plain Symbology, like C#'s List<Symbology>. SpreadSymbology inherits this.
+	struct glaze
+	{
+		using T = LeggedSymbology;
+		static constexpr auto value = glz::object(
+			"Symbologies", glz::custom<glz::skip{}, &T::Symbologies>,
+			"Weights", glz::custom<glz::skip{}, &T::Weights>,
+			"ShortSymbol", glz::custom<glz::skip{}, &T::ShortSymbol>,
+			"InstrumentType", glz::custom<glz::skip{}, &T::InstrumentType>,
+			"Exchange", glz::custom<glz::skip{}, &T::Exchange>,
+			"Root", glz::custom<glz::skip{}, &T::Root>,
+			"Ticker", glz::custom<glz::skip{}, &T::Ticker>,
+			"Symbol", glz::custom<glz::skip{}, &T::Symbol>,
+			"Product", glz::custom<glz::skip{}, &T::Product>
+		);
+	};
 };
 
 class SpreadSymbology final : public LeggedSymbology

@@ -47,6 +47,9 @@ add_library(ToolsLib STATIC
     "BlockingQueue.hpp"
     "Logger.hpp"
     "Telegram.hpp"
+    "Event.hpp"
+    "LockedPriorityQueue.hpp"
+    "Clock.hpp"
     "Empty.cpp"
 )
 

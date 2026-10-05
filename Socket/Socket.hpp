@@ -150,6 +150,7 @@ namespace Socket
 		{
 			using T = SocketHeader;
 			static constexpr auto value = glz::object(
+				"Name", glz::custom<glz::skip{}, &T::Name>,
 				"ServerName", &T::ServerName,
 				"ClientName", &T::ClientName,
 				"Timestamp", &T::Timestamp,
@@ -926,6 +927,12 @@ namespace Socket
 		{
 			if (_socket)
 				_socket->Close();
+		}
+
+		// Park every cursor at the head of the ring: whatever is queued is skipped.
+		inline void Recover()
+		{
+			_socket->Recover();
 		}
 
 		inline void Dispose()

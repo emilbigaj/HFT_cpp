@@ -198,6 +198,24 @@ namespace Provider
 		{
 			return InstrumentIds.Length() * ClientIds.Length();
 		}
+
+		struct glaze
+		{
+			using T = ServerHeader;
+			static constexpr auto value = glz::object(
+				"OrdersCapacity", glz::custom<glz::skip{}, &T::OrdersCapacity>,
+				"LocalPositionsCapacity", glz::custom<glz::skip{}, &T::LocalPositionsCapacity>,
+				"ServerName", &T::ServerName,
+				"Timestamp", &T::Timestamp,
+				"InstrumentsCapacity", &T::InstrumentsCapacity,
+				"InstrumentsCount", &T::InstrumentsCount,
+				"InstrumentIds", &T::InstrumentIds,
+				"ClientIds", &T::ClientIds,
+				"CoreGroupIds", &T::CoreGroupIds,
+				"OrdersPerClient", &T::OrdersPerClient,
+				"Persistance", &T::Persistance
+			);
+		};
 	};
 	static_assert(Tools::PlainOldData<ServerHeader>);
 	// Persistance is the newest wire field; C# asserts the same two numbers at type-init.

@@ -134,6 +134,10 @@ namespace Data
         {
             using T = Quote;
             static constexpr auto value = glz::object(
+                "MicroPrice", glz::custom<glz::skip{}, &T::MicroPrice>,
+                "MidPrice", glz::custom<glz::skip{}, &T::MidPrice>,
+                "BidPrice", glz::custom<glz::skip{}, &T::BidPrice>,
+                "AskPrice", glz::custom<glz::skip{}, &T::AskPrice>,
                 "TickSize", &T::TickSize,
                 "Bid", &T::Bid,
                 "Ask", &T::Ask
@@ -171,6 +175,10 @@ namespace Data
 		Data::TickHeader TickHeader;
 		double Price;
 		uint8_t _reserved[64 - sizeof(Data::TickHeader) - sizeof(double)] = {};
+
+		Settlement() = default;
+		Settlement(int32_t instrumentId, Tools::Timestamp timestamp, double price)
+			: TickHeader{ .TickType = Data::TickType::Settlement, .InstrumentId = instrumentId, .ExchangeTimestamp = timestamp, .SendingTimestamp = timestamp, .NicTimestamp = timestamp }, Price(price) {}
 
 		std::string ToString() const
 		{
@@ -248,25 +256,26 @@ namespace Data
 		
         
 
+        // The levels live behind the struct, so the getters read past it, as C#'s do.
         struct glaze
         {
-            static std::span<const Level> GetBidsSpan(const MarketByPrice& mbp)
+            static std::string BidsAsString(const MarketByPrice& mbp)
             {
-                return std::span<const Level>(GetBidsPtr(&mbp), static_cast<uint32_t>(mbp.BidsCount));
+                return mbp.BidsAsString();
             }
 
-            static std::span<const Level> GetAsksSpan(const MarketByPrice& mbp)
+            static std::string AsksAsString(const MarketByPrice& mbp)
             {
-                return std::span<const Level>(GetAsksPtr(&mbp), static_cast<uint32_t>(mbp.AsksCount));
+                return mbp.AsksAsString();
             }
 
             using T = MarketByPrice;
             static constexpr auto value = glz::object(
+                "BidsAsString", glz::custom<glz::skip{}, &BidsAsString>,
+                "AsksAsString", glz::custom<glz::skip{}, &AsksAsString>,
                 "TickHeader", &T::TickHeader,
                 "BidsCount", &T::BidsCount,
-                "AsksCount", &T::AsksCount,
-                "Bids", [](const T& mbp) { return GetBidsSpan(mbp); },
-                "Asks", [](const T& mbp) { return GetAsksSpan(mbp); }
+                "AsksCount", &T::AsksCount
             );
 	    };
 // ----- Pointer helpers (unsafe equivalence) -----

@@ -274,6 +274,30 @@ public:
         return std::abs(orderTarget.OrderProfile.Quantity) <= GetAbsAllowedOrderQuantity(orderTarget);
     }
 
+    // Lowers a create or amend to the largest quantity within the limits, which ValidateOrder accepts here and on the server
+    // whatever the server has read since; false when nothing workable fits.
+    bool TryClipToRiskLimit(Execution::OrderTarget& orderTarget)
+    {
+        Execution::OrderId orderId = orderTarget.OrderHeader.OrderId;
+        // An amend with 29 targets already in flight would be refused (TooManyActiveTargets): nothing fits until an ack frees one.
+        if (orderTarget.OrderTargetAction != Execution::OrderTargetAction::Create && _context.GetOrderRisk(orderId).GetReadonlyRef().IsFull())
+            return false;
+        const Execution::OrderState& orderState = _context.GetOrderState(orderId).GetReadonlyRef();
+        int32_t absQuantityFilled = orderTarget.OrderTargetAction != Execution::OrderTargetAction::Create && orderState.OrderHeader.OrderId == orderId ? std::abs(orderState.QuantityFilled) : 0;
+
+        // Position room, TryAdd's cap, and the per-order limit ValidateOrder applies to the working quantity on each leg.
+        int64_t absAllowedOrderQuantity = std::min<int64_t>(GetAbsAllowedOrderQuantity(orderTarget, true), Execution::OrderRisk::MaxOrderQuantity);
+        for (const Data::InstrumentLeg& leg : _context.GetInstrument(orderId.InstrumentId()).Legs())
+            absAllowedOrderQuantity = std::min<int64_t>(absAllowedOrderQuantity, absQuantityFilled + static_cast<int64_t>(_context.GetRiskLimit(leg.InstrumentId).GetReadonlyRef().MaxOrderQuantity) / std::abs(leg.Weight));
+
+        // Nothing left to work: an amend down to the filled quantity would be a cancel.
+        if (absAllowedOrderQuantity <= absQuantityFilled)
+            return false;
+        if (std::abs(orderTarget.OrderProfile.Quantity) > absAllowedOrderQuantity)
+            orderTarget.OrderProfile.Quantity = orderTarget.OrderProfile.Sign() * static_cast<int32_t>(absAllowedOrderQuantity);
+        return true;
+    }
+
     ALWAYS_INLINE bool ValidateOrder(const Execution::OrderTarget& orderTarget, Tools::Bitset64& orderRejectedReasons)
     {
         orderRejectedReasons.ClearAll();
@@ -405,9 +429,9 @@ public:
                 bool isReduce = orderTarget.OrderTargetAction == Execution::OrderTargetAction::Reduce && orderTarget.OrderProfile.IsReduceOf(orderState.OrderProfile);
                 if (isCancel || isReduce)
                 {
-                    rollingRateLimit.SendOrder(Clock::GetUtcNow());
+                    rollingRateLimit.SendOrder(Tools::Clock::UtcNow());
                 }
-                else if (!rollingRateLimit.TrySendOrder(Clock::GetUtcNow()))
+                else if (!rollingRateLimit.TrySendOrder(Tools::Clock::UtcNow()))
                 {
                     orderRejectedReasons.Set(static_cast<int32_t>(Execution::OrderRejectedReason::TooManyOrdersPerSecond));
                     return false;
