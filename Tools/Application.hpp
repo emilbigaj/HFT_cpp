@@ -3,6 +3,7 @@
 #include <string>
 #include <functional>
 #include <vector>
+#include <memory>
 #include <mutex>
 #include <algorithm>
 #include <iostream>
@@ -24,10 +25,17 @@ namespace Tools
 			int Priority;
 
 			ExitAction(const std::string& name, int priority, const std::function<void()>& action) : Name(name), Action(action), Priority(priority) {}
+
+			// The owner already released what the action would close: OnExit skips it.
+			void Cancel() { _isCancelled.store(true, std::memory_order_release); }
+			bool IsCancelled() const { return _isCancelled.load(std::memory_order_acquire); }
+
+		private:
+			std::atomic<bool> _isCancelled{ false };
 		};
 
 	private:
-		static inline std::vector<ExitAction> s_actions;
+		static inline std::vector<std::shared_ptr<ExitAction>> s_actions;
 		static inline std::mutex s_mutex;
 		static inline std::atomic<int> s_exiting{ 0 };
 
@@ -72,12 +80,14 @@ namespace Tools
 
 		
 
-		static void AddExitAction(const std::string& name, const std::function<void()>& action)
+		// Adds an action that runs once on application exit. Cancel the returned action once it is no longer needed.
+		static std::shared_ptr<ExitAction> AddExitAction(const std::string& name, const std::function<void()>& action)
 		{
-			AddExitAction(name, 0, action);
+			return AddExitAction(name, 0, action);
 		}
 
-		static void AddExitAction(const std::string& name, int priority, const std::function<void()>& action)
+		// Higher priority runs earlier.
+		static std::shared_ptr<ExitAction> AddExitAction(const std::string& name, int priority, const std::function<void()>& action)
 		{
 			if (name.empty() || name.find_first_not_of(" \t\n\r") == std::string::npos)
 				throw std::invalid_argument("Name cannot be null or whitespace.");
@@ -85,8 +95,10 @@ namespace Tools
 			if (!action)
 				throw std::invalid_argument("Action cannot be null.");
 
+			std::shared_ptr<ExitAction> exitAction = std::make_shared<ExitAction>(name, priority, action);
 			std::lock_guard<std::mutex> lock(s_mutex);
-			s_actions.emplace_back(name, priority, action);
+			s_actions.push_back(exitAction);
+			return exitAction;
 		}
 
 		// Runs the exit actions once; false when another caller already started the shutdown.
@@ -97,32 +109,34 @@ namespace Tools
 
 			std::cout << "Application shutdown initiated. Running cleanup actions...\n";
 
-			std::vector<ExitAction> snapshot;
+			std::vector<std::shared_ptr<ExitAction>> snapshot;
 
 			{
 				std::lock_guard<std::mutex> lock(s_mutex);
 				snapshot = s_actions;
 			}
 
-			std::sort(snapshot.begin(), snapshot.end(), [](const ExitAction& a, const ExitAction& b)
+			std::sort(snapshot.begin(), snapshot.end(), [](const std::shared_ptr<ExitAction>& a, const std::shared_ptr<ExitAction>& b)
 			{
-				return a.Priority > b.Priority;
+				return a->Priority > b->Priority;
 			});
 
-			for (const ExitAction& act : snapshot)
+			for (const std::shared_ptr<ExitAction>& act : snapshot)
 			{
+				if (act->IsCancelled())
+					continue;
 				try
 				{
-					if (act.Action)
-						act.Action();
+					if (act->Action)
+						act->Action();
 				}
 				catch (const std::exception& ex)
 				{
-					std::cerr << "Exit action '" << act.Name << "' failed: " << ex.what() << std::endl;
+					std::cerr << "Exit action '" << act->Name << "' failed: " << ex.what() << std::endl;
 				}
 				catch (...)
 				{
-					std::cerr << "Exit action '" << act.Name << "' failed with unknown error." << std::endl;
+					std::cerr << "Exit action '" << act->Name << "' failed with unknown error." << std::endl;
 				}
 			}
 			return true;

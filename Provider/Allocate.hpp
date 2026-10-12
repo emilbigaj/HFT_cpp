@@ -189,6 +189,9 @@ namespace Provider
 		// WIRE FIELD — the C# side must mirror it byte-for-byte.
 		bool Persistance = true;
 
+		// WIRE FIELD, offset 173: the publishing server's process id, stamped by ServerContext::Connect; a new value means the server restarted.
+		int32_t ServerProcessId = 0;
+
 		int32_t OrdersCapacity() const
 		{
 			return OrdersPerClient * ClientIds.Length();
@@ -213,13 +216,14 @@ namespace Provider
 				"ClientIds", &T::ClientIds,
 				"CoreGroupIds", &T::CoreGroupIds,
 				"OrdersPerClient", &T::OrdersPerClient,
-				"Persistance", &T::Persistance
+				"Persistance", &T::Persistance,
+				"ServerProcessId", &T::ServerProcessId
 			);
 		};
 	};
 	static_assert(Tools::PlainOldData<ServerHeader>);
-	// Persistance is the newest wire field; C# asserts the same two numbers at type-init.
-	static_assert(sizeof(ServerHeader) == 173 && offsetof(ServerHeader, Persistance) == 172);
+	// ServerProcessId is the newest wire field; C# asserts the same size at type-init.
+	static_assert(sizeof(ServerHeader) == 177 && offsetof(ServerHeader, Persistance) == 172 && offsetof(ServerHeader, ServerProcessId) == 173);
 	static_assert(offsetof(AllocateInstrument, ClientId) == 4
 		&& offsetof(AllocateInstrument, InstrumentHeaderId) == 8
 		&& offsetof(AllocateInstrument, InstrumentId) == 12

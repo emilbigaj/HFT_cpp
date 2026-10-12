@@ -465,6 +465,7 @@ public:
 
                 Execution::OrderRisk& orderRisk = _context.GetOrderRisk(orderTarget.OrderHeader.OrderId).GetRef();
 
+                // A slot's row may hold a previous order's, or a previous process's: a Create always starts it empty.
                 if (orderTarget.OrderTargetAction == Execution::OrderTargetAction::Create)
                     orderRisk = Execution::OrderRisk{};
 

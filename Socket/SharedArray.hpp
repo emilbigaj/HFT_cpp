@@ -116,7 +116,7 @@ namespace Socket
 			Protocol::Write(value, _headerPtr, dstLen);
 		}
 
-		// Recovery write for a slot whose client process is confirmed dead (Server::CancelAllOrders):
+		// Recovery write for a slot whose client process is confirmed dead (Server::TryCloseOutOrders):
 		// bypasses the Read guard (mapping is RW, Read is only a tag) and re-bases the seqlock.
 		inline void RecoveryWrite(const T& value)
 		{
@@ -190,12 +190,26 @@ namespace Socket
 				uint8_t* entryPtr = _basePtr + i * _entryLength;
 				_entries.emplace_back(entryPtr, access);
 			}
+
+			// 5. Frame every row: a row edited only under the lock never gets one from Write, and TryRead/Read need it
+			if (access == Tools::Access::Write)
+				StampFrames();
 		}
 
 		~SharedArray()
 		{
 			Dispose();
 		}
+
+	private:
+		// Frames each row (Protocol::Stamp) that a full Write has not.
+		void StampFrames()
+		{
+			for (int32_t index = 0; index < Capacity; index++)
+				Protocol::Stamp(reinterpret_cast<Protocol::Header64*>(_basePtr + static_cast<size_t>(index) * static_cast<size_t>(_entryLength)), TypeSize);
+		}
+
+	public:
 
 		SharedArray(SharedArray&& other) noexcept = default;
 		SharedArray& operator=(SharedArray&& other) noexcept = default;

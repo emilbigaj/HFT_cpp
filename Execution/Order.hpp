@@ -53,7 +53,7 @@ namespace Execution
 	enum class OrderStateReason : uint8_t
 	{
 		Unknown = 0,
-		PendingNew = 1,
+		InFlight = 1,   // sent, not yet acked by the exchange (the server writes it; a walk shows it until the server answers)
 		Acked = 2,
 		Fill = 3,       // partial vs complete lives in OrderStateStatus: Fill+Active / Fill+Done
 		Canceled = 4,   // here onwards -> Done unconditionally
@@ -507,19 +507,10 @@ namespace Execution
             return stringBuilder.str();
         }
 
-		inline static const Tools::Bitset64 OrderDiscarded = []
-		{
-			Tools::Bitset64 b;
-			b.Set(static_cast<int32_t>(OrderRejectedReason::CreateIsActive));
-			b.Set(static_cast<int32_t>(OrderRejectedReason::StateIsDone));
-			b.Set(static_cast<int32_t>(OrderRejectedReason::TargetIsStale));
-			b.Set(static_cast<int32_t>(OrderRejectedReason::CancelIsActive));
-			b.Set(static_cast<int32_t>(OrderRejectedReason::TargetIsActive));
-			b.Set(static_cast<int32_t>(OrderRejectedReason::AlgoIsPaused));
-			b.Set(static_cast<int32_t>(OrderRejectedReason::TooManyOrdersPerSecond));
-			b.Set(static_cast<int32_t>(OrderRejectedReason::TooManyActiveTargets));
-			return b;
-		}();
+		// StateIsDone 40, CreateIsActive 41, CancelIsActive 42, TargetIsActive 43, TargetIsStale 44, TooManyActiveTargets 45,
+		// AlgoIsPaused 46, TooManyOrdersPerSecond 56: the same constant mask as C#.
+		static constexpr uint64_t OrderDiscardedMask = 0x01007F0000000000ULL;
+		inline static const Tools::Bitset64 OrderDiscarded = Tools::Bitset64(OrderDiscardedMask);
 
 		[[nodiscard]] bool IsDiscarded() const
 		{
@@ -545,6 +536,8 @@ namespace Execution
 
 	static_assert(sizeof(OrderRejected) == 52, "OrderRejected must be 52 bytes");
 
+	struct OrderTarget;
+
 	struct OrderState
 	{
 		Data::Header<OrderType> Header = Data::Header<OrderType>(OrderType::OrderState);
@@ -564,6 +557,19 @@ namespace Execution
 		int32_t WorkingQuantity() const
 		{
 			return OrderProfile.Quantity - QuantityFilled;
+		}
+
+		// The state of a Create the exchange has not acked yet: Active, InFlight, nothing filled, Seq 0.
+		static void NewInFlight(const OrderTarget& orderTarget, OrderState& orderState);
+
+		// This state ended by its Create's refusal: Done/Rejected, with the refused order's header and profile.
+		void NewRejected(const OrderRejected& orderRejected, OrderState& rejectedState) const
+		{
+			rejectedState = *this;
+			rejectedState.OrderHeader = orderRejected.OrderHeader;
+			rejectedState.OrderProfile = orderRejected.OrderProfile;
+			rejectedState.OrderStateStatus = Execution::OrderStateStatus::Done;
+			rejectedState.OrderStateReason = Execution::OrderStateReason::Rejected;
 		}
 
 		std::string ToString() const
@@ -595,19 +601,19 @@ namespace Execution
 	struct AheadOfOrder
 	{
 		Data::Header<OrderType> Header = Data::Header<OrderType>(OrderType::AheadOfOrder);
-        int32_t Quantity = 0;
+        int32_t QuantityAhead = 0;
 		uint64_t ClientOrderId = 0;
 		int32_t QuantityBehind = 0;
 
 		AheadOfOrder() = default;
-		AheadOfOrder(uint64_t clientOrderId, int32_t quantity, int32_t quantityBehind) : Quantity(quantity), ClientOrderId(clientOrderId), QuantityBehind(quantityBehind) {}
+		AheadOfOrder(uint64_t clientOrderId, int32_t quantityAhead, int32_t quantityBehind) : QuantityAhead(quantityAhead), ClientOrderId(clientOrderId), QuantityBehind(quantityBehind) {}
 
 		struct glaze
 		{
 			using T = AheadOfOrder;
 			static constexpr auto value = glz::object(
 				"Header", &T::Header,
-				"Quantity", &T::Quantity,
+				"QuantityAhead", &T::QuantityAhead,
 				"ClientOrderId", &T::ClientOrderId,
 				"QuantityBehind", &T::QuantityBehind
 			);
@@ -626,6 +632,17 @@ namespace Execution
 		Execution::OrderTargetAction OrderTargetAction = Execution::OrderTargetAction::Create;
 		Execution::OrderStateStatus OrderTargetStatus = Execution::OrderStateStatus::Active;
 		uint8_t Reserved[1] = { 0 };
+
+		// The reject that refuses this target, for these reasons, from this source.
+		void NewOrderRejected(Tools::Bitset64 orderRejectedReasons, OrderRejectedSource orderRejectedSource, OrderRejected& orderRejected) const
+		{
+			orderRejected = OrderRejected{};
+			orderRejected.OrderHeader = OrderHeader;
+			orderRejected.OrderTargetAction = OrderTargetAction;
+			orderRejected.OrderRejectedSource = orderRejectedSource;
+			orderRejected.OrderProfile = OrderProfile;
+			orderRejected.OrderRejectedReasons = orderRejectedReasons;
+		}
 
 		std::string ToString() const
 		{
@@ -648,6 +665,17 @@ namespace Execution
 	};
 
 	static_assert(sizeof(OrderTarget) == 52, "OrderTarget must be 52 bytes");
+
+	inline void OrderState::NewInFlight(const OrderTarget& orderTarget, OrderState& orderState)
+	{
+		orderState = OrderState{};
+		orderState.OrderHeader = orderTarget.OrderHeader;
+		orderState.OrderHeader.Seq = 0;   // Seq 0 marks a new order the exchange has not acked
+		orderState.OrderProfile = orderTarget.OrderProfile;
+		orderState.TimeInForce = orderTarget.TimeInForce;
+		orderState.OrderStateStatus = Execution::OrderStateStatus::Active;
+		orderState.OrderStateReason = Execution::OrderStateReason::InFlight;
+	}
 
     enum AlgoStatus : uint8_t
     {
@@ -746,7 +774,7 @@ namespace Execution
 		&& offsetof(OrderState, OrderStateStatus) == 49 && offsetof(OrderState, OrderStateReason) == 50
 		&& offsetof(OrderState, QuantityFilled) == 52 && offsetof(OrderState, QuantityAhead) == 56
 		&& offsetof(OrderState, QuantityBehind) == 60);
-	static_assert(offsetof(AheadOfOrder, Quantity) == 4 && offsetof(AheadOfOrder, ClientOrderId) == 8
+	static_assert(offsetof(AheadOfOrder, QuantityAhead) == 4 && offsetof(AheadOfOrder, ClientOrderId) == 8
 		&& offsetof(AheadOfOrder, QuantityBehind) == 16);
 	static_assert(offsetof(OrderTarget, OrderHeader) == 4 && offsetof(OrderTarget, TriggerTimestamp) == 32
 		&& offsetof(OrderTarget, OrderProfile) == 40 && offsetof(OrderTarget, TimeInForce) == 48

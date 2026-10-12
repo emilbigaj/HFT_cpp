@@ -4,6 +4,61 @@ Newest first. Each entry says what changed, why, and what it broke or unblocked.
 
 ---
 
+## Connect handshake, restart admission on the server, close-out of a gone client (C# `0d47822`+`d9fb359`+`b7136e8`, report 2026-10-12)
+
+**FOR C# CLAUDE:** reply in `csharp_alignment_report_2026-10-12.md` (§12 confirmations; note the
+C++ server does NOT rewrite `ServerHeader.Timestamp` every pass).
+
+Ported `cpp_alignment_report_2026-10-12.md` P1–P12, P14–P20 (P13, P21: nothing to do; R1–R8 were
+never ported):
+- **Handshake** (`Socket.hpp`): `ConnectRefusal` -1..-7, `ConnectRefusedException`, `IsClientReady`.
+  The server answers every connect exactly once (`PollLetterBox` + `DecideConnect`, a request's own
+  `ClientId` ignored, `Closing`/`Closed` refused, socket built before `ClientAllocated`),
+  `ReplyToClient` empties a dead client's leftover reply, the listen loop catches and keeps going.
+  `ClientSocket::Connect` returns the id or throws the refusal, retries `Closing`, matches name +
+  timestamp + pid, and a refusal disposes without closing (a refused process must not end the live
+  session under its name). `Application::AddExitAction` returns a cancellable `ExitAction`;
+  `ClientSocket::Dispose` and its destructor cancel the "close at exit" action.
+- **Allocation** (`Context.hpp`, `Server.hpp`): `AllocateClientId` returns `ReservedClientName` /
+  `NoClientIdAvailable` instead of throwing (a throw killed the listen thread); `TryGetClientId`;
+  `LoadClients` throws on a refusal.
+- **Restart admission moves to the server** (`Server.hpp`, `Client.hpp`): `CancelAllOrders` is now
+  `TryCloseOutOrders` (one walk; "working" decided by the state row once it is this order's; an unread
+  Create stamped Done once every CoreGroup thread has passed since the close — the new drain
+  handshake; a torn idle target row repaired). `IsClientReady = TryCloseOutOrders`, so a restart is
+  refused `NotReady` while a previous order still works, and its cancels are re-sent. The server writes
+  each injected cancel to the client's channel (audit); clients ignore `OrderTarget` there. **The
+  client constructor's previous-orders check, 100 ms sleep and `OrderRisk` clear are removed** (the
+  item-2 change of 2026-10-05, superseded by C#); `Recover` stays. `Client::Dispose` no longer refuses
+  with 64 active slots; a throw after `Connect` closes the socket (guard member).
+- **Shared memory** (`Protocol.hpp`, `SharedArray.hpp`): `Protocol::Stamp`; write-capable arrays
+  frame every row, so lock-edited rows (order states, positions) read through `TryRead`. Ring readers
+  no longer latch closed.
+- **Order rows** (`Order.hpp`): `OrderStateReason::PendingNew` → `InFlight` (audit JSON writes the
+  name: lockstep with C#), builders `NewInFlight` / `NewOrderRejected` / `NewRejected`, constant
+  `OrderDiscardedMask`, `AheadOfOrder::Quantity` → `QuantityAhead`.
+- **Leg lookup** (`Context.hpp`): the context that installed `LeggedHeader::GetLegHeader` clears it on
+  destruction (C++ clients have no `ServerContext`, so "first context wins" is kept).
+- **P22, `ServerHeader.ServerProcessId`** (`Allocate.hpp`, `Context.hpp`): new int32 at offset 173,
+  header 173 → 177 bytes (WIRE, lockstep with every C# process). `ServerContext::Connect` stamps
+  `getpid()` when it posts the header. A refused post never overwrites the old header: it reads the
+  posted pid and throws "already running as process <pid>" when that process is alive, otherwise
+  "previous server (process <pid>) has exited, but other processes still map its shared memory".
+  Verified against the real `Connect`: the posted id is this process's, a second post under a live
+  server and a post over a dead run's header both throw their message, and the dead header is kept.
+
+Deploy: in lockstep with C# (connect handshake, `InFlight`); the server before any client that drops
+its startup check. CME needs nothing new from this set beyond the six lines already listed.
+
+Verified: build clean; ExecutionTests, DataTests, ToolsTests pass; JSON harness 0 of 140 differ.
+Scenario program against the real sockets: second connect under a live name refused
+`AlreadyConnected` with the live session still `Open` and delivering, `NotReady` via the hook, an
+allocator refusal delivered as its reason, a reader reading on after a close message, and the stamp
+(lock-edited row reads `New`, unwritten row `Empty`, a second opener leaves the sequence alone).
+`TryCloseOutOrders` / drain not run end to end (needs a full server with a live directory).
+
+---
+
 ## Second shutdown signal no longer aborts the cleanup (2026-10-05)
 
 Found on New Release: `timeout` signals both the program and its process group, so SIGINT arrived twice;

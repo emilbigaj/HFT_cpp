@@ -78,6 +78,16 @@ namespace Socket
 
         // -------- Lock primitives (slot path) --------
 
+        // Writes the frame (Magic, Length) of a slot that lacks it; the Sequence is never touched, so an unwritten slot still reads
+        // Empty and a live slot's lock counter does not move. Constant values: concurrent stampers and writers cannot disagree.
+        static inline void Stamp(Header64* hdr, int32_t length)
+        {
+            if (hdr->Magic.load(std::memory_order_acquire) == s_magic && hdr->Length == length)
+                return;
+            hdr->Length = length;
+            hdr->Magic.store(s_magic, std::memory_order_release);
+        }
+
         static inline void AcquireLock(Header64* hdr)
         {
             uint64_t seq = hdr->Sequence.load(std::memory_order_acquire);

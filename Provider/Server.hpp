@@ -69,6 +69,18 @@ private:
     // CoreGroupId; a set bit is a clientId. Sized to highest CoreGroupId + 1 in the ctor.
     std::vector<Tools::Bitset64> _clientIdsByCoreGroupId;
 
+    // A counter padded to a cache line, so nothing after it shares its line: a drain counter one thread writes must not share another's.
+    struct alignas(64) PaddedCounter
+    {
+        std::atomic<int64_t> Value{ 0 };
+    };
+
+    // Drain handshake (see Spec.md "Client restart"): the listen thread bumps the request at each client close; each CoreGroup
+    // thread, at the end of a pass, acknowledges the request it read, writing only when it moved.
+    PaddedCounter _drainRequest;
+    std::unique_ptr<PaddedCounter[]> _drainAcknowledgedByCoreGroupId;
+    std::vector<int64_t> _drainRequestAtCloseByClientId;   // per client: the request issued at its close (listen thread only)
+
     bool _isDisposed = false;
 
 public:
@@ -133,6 +145,8 @@ public:
         _instrumentData.resize(static_cast<size_t>(serverHeader.InstrumentIds.Length()));
         // +1: channel index == CoreGroupId, so we need slots 0..HighestSet() (matches BuildChannelLengths).
         _clientIdsByCoreGroupId.resize(static_cast<size_t>(serverHeader.CoreGroupIds.HighestSet() + 1));
+        _drainAcknowledgedByCoreGroupId = std::make_unique<PaddedCounter[]>(static_cast<size_t>(serverHeader.CoreGroupIds.HighestSet() + 1));
+        _drainRequestAtCloseByClientId.resize(static_cast<size_t>(serverHeader.ClientIds.Length()));
 
         // One OrderTarget injection queue per EXECUTION CoreGroup (admin carries no order targets).
         for (int32_t coreGroupId : serverHeader.CoreGroupIds)
@@ -149,6 +163,10 @@ public:
 
         _serverSocket.DeallocateClient = [this](int32_t clientId) {
             return _serverContext.DeallocateClient(clientId);
+        };
+
+        _serverSocket.IsClientReady = [this](int32_t clientId) {
+            return IsClientReady(clientId);
         };
 
         _serverSocket.ClientAllocated = [this](const Socket::SocketHeader& socketHeader) { 
@@ -243,6 +261,8 @@ public:
             {
                 Execution::OrderTarget orderTarget = *reinterpret_cast<const Execution::OrderTarget*>(qsrc.data());
                 injected->Dequeue();
+                // A cancel the server sends for a gone client is in no audit otherwise; written before OnOrderTarget so the tap records it ahead of its reject or Done
+                WriteToExecution(orderTarget);
                 OnOrderTarget(orderTarget);
             }
         }
@@ -290,6 +310,11 @@ public:
                 }
             }
         }
+
+        // One cached read per pass; a write only after a client closed: everything this pass read is now handled (see Spec.md)
+        int64_t drainRequest = _drainRequest.Value.load(std::memory_order_acquire);
+        if (drainRequest != _drainAcknowledgedByCoreGroupId[coreGroupId].Value.load(std::memory_order_relaxed))
+            _drainAcknowledgedByCoreGroupId[coreGroupId].Value.store(drainRequest, std::memory_order_release);
     }
 
     // CoreGroup thread only - the row's sole writer. Config fields in place under the seq bump; the
@@ -326,32 +351,62 @@ public:
         WriteToExecution(strategyId, coreGroupId, localPosition);
     }
 
-    void CancelAllOrders(int32_t clientId)
+    // Closes out a gone client's 64 order slots: cancels what is working, marks a Create the server never read Done, repairs a
+    // row left mid-write. Returns true once nothing waits on the exchange (see Spec.md "Client restart"). Listen thread only.
+    bool TryCloseOutOrders(int32_t clientId)
     {
-        // Context keys order rows by OrderId, so build a probe whose GlobalIndex is
-        // (clientId, localIndex) — same row, no extra accessor. Matches C#.
+        bool isClientDrained = IsClientDrained(clientId);
+        bool isClosedOut = true;
         for (int32_t localIndex = 0; localIndex < Execution::OrderIdAllocator::OrdersPerClient; localIndex++)
         {
-            Execution::OrderId probe = Execution::OrderId().ClientId(clientId).LocalIndex(localIndex);
-
-            Socket::SharedArrayEntry<Execution::OrderTarget>& orderTargetEntry = _serverContext.GetOrderTarget(probe);
+            // Step 1: working? The server's row decides once it is about this order, before that the client's row
+            Execution::OrderId orderId = Execution::OrderId().ClientId(clientId).LocalIndex(localIndex);
+            Socket::SharedArrayEntry<Execution::OrderTarget>& orderTargetEntry = _serverContext.GetOrderTarget(orderId);
             if (orderTargetEntry.IsEmpty())
                 continue;
-            Execution::OrderTarget orderTarget = orderTargetEntry.GetReadonlyRef(); // dont lock because client may have crashed mid write
-            const Execution::OrderState& orderState = _serverContext.GetOrderState(probe).GetReadonlyRef();
-            if (orderState.OrderStateStatus == Execution::OrderStateStatus::Active || orderTarget.OrderTargetStatus == Execution::OrderStateStatus::Active)
-            {
-                orderTarget.OrderTargetStatus = Execution::OrderStateStatus::Active;
-                orderTarget.OrderTargetAction = Execution::OrderTargetAction::Cancel;
-                orderTarget.OrderHeader.Seq += 1'000'000;
-                orderTarget.OrderHeader.NicTimestamp = Tools::Clock::UtcNow();
-                // Client process is dead, so the server is the slot's sole writer: stamp the cancel in
-                // so the vendor's replay-on-ack cancels a still-PendingNew order.
-                orderTargetEntry.RecoveryWrite(orderTarget);
-                // Enqueue so an already-working order is cancelled now on its segment thread.
+            Execution::OrderTarget orderTarget = orderTargetEntry.GetReadonlyRef();   // no seqlock: its writer, the client, is gone and may have died mid-write
+            // TryRead waits out a write in progress: the CoreGroup thread may be writing this state right now, and a torn read can skip a live order
+            Execution::OrderState orderState{};
+            _serverContext.GetOrderState(orderId).TryRead(orderState);
+            bool isSameOrder = orderState.OrderHeader.OrderId == orderTarget.OrderHeader.OrderId;
+            // The target cannot decide once the state is this order's: this stamps it Active and nothing stamps it back
+            bool isWorking = isSameOrder ? orderState.OrderStateStatus == Execution::OrderStateStatus::Active : orderTarget.OrderTargetStatus == Execution::OrderStateStatus::Active;
+            bool isStuckInTornWrite = Socket::Protocol::IsWriteInProgress(orderTargetEntry.GetSeq());   // its writer, the client, is gone
+            if (!isWorking && !isStuckInTornWrite)
+                continue;
+
+            // Step 2: stamp the cancel in, Active while the exchange may hold the order, and send it if working (see Spec.md)
+            // Until the client is drained an unread Create may still be on its way out: Active + Cancel lets replay-on-ack cancel it
+            bool isAwaitingExchange = isWorking && (isSameOrder || !isClientDrained);
+            isClosedOut &= !isAwaitingExchange;
+            orderTarget.OrderTargetStatus = isAwaitingExchange ? Execution::OrderStateStatus::Active : Execution::OrderStateStatus::Done;
+            orderTarget.OrderTargetAction = Execution::OrderTargetAction::Cancel;
+            orderTarget.OrderHeader.Seq += 1'000'000;
+            orderTarget.OrderHeader.NicTimestamp = Tools::Clock::UtcNow();
+            orderTargetEntry.RecoveryWrite(orderTarget);
+            // Only a working slot's cancel is sent: a torn idle row's id may name no instrument, and the lookup would throw
+            if (isWorking)
                 EnqueueOrderTarget(orderTarget);
-            }
         }
+        return isClosedOut;
+    }
+
+    // Ready once the client's previous process left nothing working; until then its orders are cancelled again (the cancel
+    // on close can fail, e.g. while iLink is down). Asked only for a name no live process holds.
+    bool IsClientReady(int32_t clientId)
+    {
+        return TryCloseOutOrders(clientId);
+    }
+
+    // Every CoreGroup thread has finished a pass since the client's close: nothing it read from the client is still in flight.
+    bool IsClientDrained(int32_t clientId)
+    {
+        for (int32_t coreGroupId : _serverContext.ServerHeader().GetReadonlyRef().CoreGroupIds)
+        {
+            if (coreGroupId != Socket::SocketChannel::Admin && _drainAcknowledgedByCoreGroupId[coreGroupId].Value.load(std::memory_order_acquire) < _drainRequestAtCloseByClientId[static_cast<size_t>(clientId)])
+                return false;
+        }
+        return true;
     }
 
     // Realtime: the caller wraps each call in try/catch -> AlertManager::OnException and keeps polling; an exception must never end the process.
@@ -465,11 +520,8 @@ public:
             // A refused Create ends its order: the Done (which releases its risk) is published before the reject that explains it.
             if (orderRejected.OrderTargetAction == Execution::OrderTargetAction::Create)
             {
-                Execution::OrderState rejectedState = orderState;
-                rejectedState.OrderHeader = orderRejected.OrderHeader;
-                rejectedState.OrderProfile = orderRejected.OrderProfile;
-                rejectedState.OrderStateStatus = Execution::OrderStateStatus::Done;
-                rejectedState.OrderStateReason = Execution::OrderStateReason::Rejected;
+                Execution::OrderState rejectedState;
+                orderState.NewRejected(orderRejected, rejectedState);
                 OnOrderState(rejectedState);
             }
             orderRejected.OrderHeader.NicTimestamp = Tools::Clock::UtcNow();
@@ -506,27 +558,14 @@ public:
         bool isValid = _riskLayer.ValidateOrder(orderTarget, orderRejectedReasons);
         if (orderTarget.OrderTargetAction == Execution::OrderTargetAction::Create)
         {
-            // PendingNew is visible for the whole round trip to the venue; 0 would show every fresh
+            // InFlight is visible for the whole round trip to the venue; 0 would show every fresh
             // order at the front of the queue. Seed the best estimate the server has - its own book
             // quantity at the order's price on its side - read before the row lock; the ack replaces it.
             const Data::MarketByPrice64& mbp64 = _serverContext.GetMarketByPrice64(orderTarget.OrderHeader.OrderId.InstrumentId()).GetReadonlyRef();
             int32_t quantityAhead = orderTarget.OrderProfile.Side() == Data::Side::Buy ? mbp64.Bids.GetQuantity(orderTarget.OrderProfile.Ticks) : mbp64.Asks.GetQuantity(orderTarget.OrderProfile.Ticks);
             orderStateEntry.AcquireLock();
-            orderState = Execution::OrderState
-            {
-                .Header = Data::Header<Execution::OrderType>(Execution::OrderType::OrderState),
-                .OrderHeader = orderTarget.OrderHeader,
-                .OrderProfile = orderTarget.OrderProfile,
-                .TimeInForce = orderTarget.TimeInForce,
-                .OrderStateStatus = Execution::OrderStateStatus::Active,
-                // Seq 0 already means "not acked"; naming it lets the RiskLayer retire hooks tell
-                // PendingNew from an ack without inferring it from the sequence.
-                .OrderStateReason = Execution::OrderStateReason::PendingNew,
-                .QuantityFilled = 0,
-                .QuantityAhead = quantityAhead,
-                .QuantityBehind = 0,
-            };
-            orderState.OrderHeader.Seq = 0; // indicates new Order but that ordertarget is not acked by exchange
+            Execution::OrderState::NewInFlight(orderTarget, orderState);
+            orderState.QuantityAhead = quantityAhead;
             orderState.OrderHeader.NicTimestamp = Tools::Clock::UtcNow();
             orderStateEntry.ReleaseLock();
             WriteToExecution(orderState);
@@ -540,15 +579,8 @@ public:
         }
         else
 		{
-			Execution::OrderRejected orderRejected
-			{
-				.Header = Data::Header<Execution::OrderType>(Execution::OrderType::OrderRejected),
-				.OrderHeader = orderTarget.OrderHeader,
-				.OrderTargetAction = orderTarget.OrderTargetAction,
-				.OrderRejectedSource = Execution::OrderRejectedSource::Server,
-				.OrderProfile = orderTarget.OrderProfile,
-				.OrderRejectedReasons = orderRejectedReasons,
-			};
+			Execution::OrderRejected orderRejected;
+			orderTarget.NewOrderRejected(orderRejectedReasons, Execution::OrderRejectedSource::Server, orderRejected);
 			OnOrderRejected(orderRejected, "Rejected by Server Risk Layer");
 		}
     }
@@ -881,6 +913,9 @@ public:
 
             Socket::SocketHeader socketHeader = Tools::Json::Deserialize<Socket::SocketHeader>(line);
             socketHeader.ClientId = _serverContext.AllocateClientId(socketHeader);
+            // At startup a refused client is a broken clients file, not a connect to answer: stop loudly
+            if (socketHeader.ClientId < 0)
+                throw std::logic_error("Server.LoadClients: " + socketHeader.ClientName.ToString() + " refused: " + std::string(magic_enum::enum_name(static_cast<Socket::ConnectRefusal>(socketHeader.ClientId))) + ".");
             _serverSocket.CreateDetatchedClient(socketHeader);
             OnClientAllocated(socketHeader);
         }
@@ -973,7 +1008,9 @@ private:
 
     void OnClientClosed(int32_t clientId)
     {
-        CancelAllOrders(clientId);
+        // A full fence: a CoreGroup thread that reads the new request also sees the client Detached
+        _drainRequestAtCloseByClientId[static_cast<size_t>(clientId)] = _drainRequest.Value.fetch_add(1, std::memory_order_seq_cst) + 1;
+        TryCloseOutOrders(clientId);
 
         int32_t coreGroupsIdsCount = static_cast<int32_t>(_clientIdsByCoreGroupId.size());
         for(int32_t coreGroupId = 0; coreGroupId < coreGroupsIdsCount; coreGroupId++)

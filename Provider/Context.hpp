@@ -177,6 +177,8 @@ protected:
 	// constructor; a pointer rather than a virtual keeps the hot-path accessors free of an indirect call.
 	const Tools::Bitset64* _instrumentIds = nullptr;
 
+	bool _isLegHeaderOwner = false;   // this context installed Data::LeggedHeader::GetLegHeader
+
 	std::vector<std::unique_ptr<Data::Instrument>> _instruments;
 	std::vector<std::unique_ptr<Position>> _positions;
 
@@ -242,6 +244,7 @@ protected:
 			{
 				return _instrumentHeaders[instrumentHeaderId].GetReadonlyRef();
 			};
+			_isLegHeaderOwner = true;
 		}
 	}
 
@@ -263,7 +266,12 @@ protected:
 	}
 
 public:
-	virtual ~Context() = default;
+	// The context that installed the leg lookup clears it, so it never calls into a destroyed context (C# ServerContext.Dispose).
+	virtual ~Context()
+	{
+		if (_isLegHeaderOwner)
+			Data::LeggedHeader::GetLegHeader = nullptr;
+	}
 
 	virtual Socket::SharedArrayEntry<Execution::PositionHeader>& GetPositionHeader(int32_t instrumentId) = 0;
 
@@ -313,6 +321,21 @@ public:
 	}
 
 	// One per CoreGroup, server-written (index == CoreGroupId).
+	// Finds a client by its exact name; false when no client has it.
+	bool TryGetClientId(const Tools::String128& clientName, int32_t& clientId)
+	{
+		for (int32_t candidateClientId : ServerHeader().GetReadonlyRef().ClientIds)
+		{
+			if (!_clientSocketHeaders[candidateClientId].IsEmpty() && _clientSocketHeaders[candidateClientId].Read().ClientName == clientName)
+			{
+				clientId = candidateClientId;
+				return true;
+			}
+		}
+		clientId = -1;
+		return false;
+	}
+
 	Socket::SharedArrayEntry<Execution::RollingRateLimit>& GetRateLimit(int32_t coreGroupId)
 	{
 		return _rateLimits[coreGroupId];
@@ -606,9 +629,17 @@ public:
 		// and the RiskLayer's StrategyIdNotAllocated check each test this bit.
 		Provider::ServerHeader reserved = serverHeader;
 		reserved.ClientIds.Set(Execution::OrderIdAllocator::ServerStrategyId);
+		reserved.ServerProcessId = static_cast<int32_t>(getpid());
 
+		// Never overwrite a dead run's header: the server would start on that run's rows and rings (see Spec.md)
 		if (!serverHeaderBox.TryStore(reserved))
-			throw std::runtime_error("ServerContext.Connect(" + serverNameStr + "), Failed to write ServerHeader to shared memory.");
+		{
+			int32_t previousServerProcessId = serverHeaderBox.GetEntry().GetReadonlyRef().ServerProcessId;
+			serverHeaderBox.Dispose();
+			throw std::runtime_error(Tools::IsProcessAlive(previousServerProcessId)
+				? "ServerContext.Connect: " + serverNameStr + " is already running as process " + std::to_string(previousServerProcessId) + "; stop it before starting another"
+				: "ServerContext.Connect: " + serverNameStr + "'s previous server (process " + std::to_string(previousServerProcessId) + ") has exited, but other processes still map its shared memory; stop its clients (Local Mirror, algos, Workspaces) and start again");
+		}
 
 		return serverHeaderBox;
 	}
@@ -639,24 +670,19 @@ public:
         // The server's leaf name is reserved for strategy 0's directory — a client named after the
         // server would share the house book's files. See Spec.md.
         if (socketHeader.ClientName == Tools::String128(ServerStrategyName.string()))
-            throw std::runtime_error("ServerContext.AllocateClientId(" + ServerName.string() + "), client name " + socketHeader.ClientName.ToString() + " collides with the reserved server strategy name.");
+            return static_cast<int32_t>(Socket::ConnectRefusal::ReservedClientName);
 
         Socket::SharedArrayEntry<Provider::ServerHeader>& serverHeaderEntry = ServerHeader();
         Provider::ServerHeader& serverHeader = serverHeaderEntry.GetRef();
         Tools::Bitset64& clientIds = serverHeader.ClientIds;
 
-        for(int32_t i : clientIds)
-        {
-            if (_clientSocketHeaders[i].GetReadonlyRef().ClientName == socketHeader.ClientName)
-                return i;
-        }
-
+        int32_t existingClientId = -1;
+        if (TryGetClientId(socketHeader.ClientName, existingClientId))
+            return existingClientId;
         int32_t clientId = socketHeader.ClientId < 0 ? clientIds.LowestClear() : socketHeader.ClientId;
 
         if (clientId < 0)
-        {
-            throw std::runtime_error("ServerContext.AllocateClientId, Failed allocate clientId.");
-        }
+            return static_cast<int32_t>(Socket::ConnectRefusal::NoClientIdAvailable);
 
         serverHeaderEntry.AcquireLock();
         Socket::SocketHeader socketHeaderCopy = socketHeader;
@@ -857,17 +883,9 @@ public:
 
 	int32_t GetClientIdFromMap(const std::string& clientName)
 	{
-		Tools::String128 nameCopy(clientName);
-		for (int32_t i : ServerHeader().GetReadonlyRef().ClientIds)
-		{
-			if (_clientSocketHeaders[i].IsEmpty())
-				continue;
-
-			Socket::SocketHeader header = _clientSocketHeaders[i].Read();
-
-			if (header.ClientName == nameCopy)
-				return i;
-		}
+		int32_t clientId = -1;
+		if (TryGetClientId(Tools::String128(clientName), clientId))
+			return clientId;
 		throw std::runtime_error(std::string(typeid(*this).name()) + ".GetClientIdFromMap(" + clientName + "), Client not connected to server '" + ServerName.string() + "'.");
 	}
 

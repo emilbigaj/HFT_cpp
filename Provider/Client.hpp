@@ -77,6 +77,26 @@ private:
 public:
 
     const int32_t ClientId;
+
+private:
+    // Once connected, the server holds this name's socket open and answers no second connect under it until it closes: a throw
+    // later in construction must close it, or a retry in the same process is refused AlreadyConnected (see Spec.md "Remote workspaces").
+    // Declared right after ClientId, so on such a throw it is destroyed before the socket and closes it.
+    struct CloseOnThrow
+    {
+        Socket::ClientSocket& Owner;
+        bool IsConstructed = false;
+
+        ~CloseOnThrow()
+        {
+            if (IsConstructed)
+                return;
+            Owner.Close();
+            Owner.Dispose();
+        }
+    } _closeOnThrow;
+
+public:
     Provider::ClientContext ClientContext;
 
 private:
@@ -106,6 +126,7 @@ public:
           _socket(ClientName, ServerName, ReadServerChannelLengths(ServerName), ReadServerChannelLengths(ServerName)),
           _isOrderActive(0ULL),
           ClientId(_socket.Connect()),
+          _closeOnThrow{ _socket },
           ClientContext(ClientName, ServerName, Tools::Access::Write),
           _riskLayer(ClientContext, Execution::OrderRejectedSource::Client),
           _serverMarketsByPrice(ServerName / "MarketsByPrice", ClientContext.ServerHeader().GetReadonlyRef().InstrumentIds.Length(), Tools::Access::Read)
@@ -114,12 +135,9 @@ public:
         ExchangeTimestamp = Tools::Clock::UtcNow();
         NicTimestamp = Tools::Clock::UtcNow();
 
-        // A previous process's Active order would hold room, slots and fills this process never made (see Spec.md).
-        ThrowIfPreviousOrdersActive();
-        // ensures all messages cleared out
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        // Every previous order is Done and already in the position rows WorkingRisk is seeded from: skip what is queued for them.
+        // The server admitted this process only once every previous order was Done (Server::IsClientReady): skip what is queued for them.
         _socket.Recover();
+        _closeOnThrow.IsConstructed = true;
     }
 
     // One strategy run per pass (2026-09-14 report): phase 1 folds everything queued into the
@@ -209,19 +227,6 @@ public:
         OpenInstrumentDataSocket(instrumentId, instrument.Symbol());
         _coreGroupIds.Set(instrument.Header().CoreGroupId);
         return instrument;
-    }
-
-    void ThrowIfPreviousOrdersActive()
-    {
-        for (int32_t localIndex = 0; localIndex < 64; ++localIndex)
-        {
-            Execution::OrderId orderId = Execution::OrderId().ClientId(ClientId).LocalIndex(localIndex);
-            const Execution::OrderState& orderState = ClientContext.GetOrderState(orderId).GetReadonlyRef();
-            if (orderState.OrderStateStatus == Execution::OrderStateStatus::Active)
-                throw std::runtime_error("Order " + orderState.OrderHeader.OrderId.ToString() + " from a previous process is still Active: start again once the server has cancelled it.");
-            // Done: its risk row is the previous process's, so this process starts from an empty one.
-            ClientContext.GetOrderRisk(orderId).GetRef() = Execution::OrderRisk{};
-        }
     }
 
     // Strategy: open the per-instrument ring, drain stale frames (protect against lapping), and seed
@@ -466,14 +471,8 @@ public:
 
     void Reject(const Execution::OrderTarget& orderTarget, Tools::Bitset64 orderRejectedReasons, Execution::OrderRejectedSource orderRejectedSource)
     {
-        Execution::OrderRejected orderRejected
-        {
-            .OrderHeader = orderTarget.OrderHeader,
-            .OrderTargetAction = orderTarget.OrderTargetAction,
-            .OrderRejectedSource = orderRejectedSource,
-            .OrderProfile = orderTarget.OrderProfile,
-            .OrderRejectedReasons = orderRejectedReasons,
-        };
+        Execution::OrderRejected orderRejected;
+        orderTarget.NewOrderRejected(orderRejectedReasons, orderRejectedSource, orderRejected);
 
         if (IsDiscarded(orderRejected))
             return;
@@ -604,6 +603,8 @@ private:
                 OnPositionHeader(rsrc);
                 break;
             }
+            case static_cast<uint8_t>(Execution::OrderType::OrderTarget):   // a cancel the server sent for this client's previous process: recorded by the audit, nothing to apply
+                break;
             default:
                 throw std::runtime_error("Unknown message type: " + std::to_string(type));
         }
@@ -615,9 +616,6 @@ public:
     {
         if (_isDisposed)
             return;
-
-        if (_isOrderActive.IsFull())
-            throw std::runtime_error("Client::Dispose: orders still active");
 
         _isDisposed = true;
 

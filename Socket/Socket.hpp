@@ -190,9 +190,37 @@ namespace Socket
 		Closed = 4
 	};
 
+	// Why a connect was refused: the reply's SocketHeader.ClientId, which is the client's id when 0 or more. Wire values: never renumber.
+	enum class ConnectRefusal : int32_t
+	{
+		NoClientIdAvailable = -1,   // the allocators' existing "no id" return
+		ServerError = -2,
+		AlreadyConnected = -3,
+		Closing = -4,               // the name's previous session is still closing: Connect asks again
+		ReservedClientName = -5,
+		NotReady = -6,              // the server's admission rule refused it for now (Server: orders a previous process left are still working)
+		RemoteDesk = -7,            // a C# Remote Mirror, not a server; a C++ server never returns it
+	};
+
+	// The server's rule for whether a name no live process holds may connect now; false refuses it as NotReady.
+	using IsClientReady = std::function<bool(int32_t clientId)>;
+
+	// A connect the server refused, with its reason.
+	class ConnectRefusedException final : public std::runtime_error
+	{
+	public:
+		const Socket::ConnectRefusal ConnectRefusal;
+
+		ConnectRefusedException(const std::string& message, Socket::ConnectRefusal connectRefusal) : std::runtime_error(message), ConnectRefusal(connectRefusal) {}
+	};
+
 	// Forward declaration of Socket to satisfy C++ scope for static constants
 	class Socket;
 
+	// Reads one ring. It keeps no "closed" state, deliberately: a close message in the ring ends the writer's session, not the
+	// ring, so TryRead returns Closed for that one message and reads on after it, where a reconnect under the same name writes
+	// its next session. Whoever owns a session decides what Closed means: the ServerSocket ends the client's session (its
+	// reads are gated on the client being Open), and an audit tap records straight through (see Spec.md "A reader never latches closed").
 	class ReadOnlySocket
 	{
 	public:
@@ -207,7 +235,6 @@ namespace Socket
 		uint8_t* _endPtr = nullptr;
 		uint64_t _readSeq = 0;
 		std::vector<uint8_t> _buffer;
-		bool _isClosed = false;
 		bool _isDisposed = false;
 
 	public:
@@ -228,11 +255,6 @@ namespace Socket
 			_ownedMemory.emplace(std::move(memory));
 		}
 
-		inline bool IsClosed() const
-		{
-			return _isClosed;
-		}
-
 		inline bool IsDisposed() const
 		{
 			return _isDisposed;
@@ -250,7 +272,6 @@ namespace Socket
 				throw std::runtime_error("ObjectDisposedException");
 
 			Protocol::SkipRing(_readPtr, _startPtr, _endPtr, _readSeq);
-			_isClosed = false;   // the previous session's close message is not ours
 		}
 
 		inline void Reset()
@@ -260,19 +281,12 @@ namespace Socket
 			
 			_readPtr = _startPtr;
 			_readSeq = 0;
-			_isClosed = false;
 		}
 
-		inline void Close()
-		{
-			if (_isDisposed)
-				throw std::runtime_error("ObjectDisposedException");
-			
-			_isClosed = true;
-		}
-
+		// Closed for a close message (that one read only: see the class comment), otherwise the ring's status.
 		inline ReadStatus TryRead(std::span<const uint8_t>& rdst);
 
+		// Closed for a close message (that one read only: see the class comment), otherwise the ring's status.
 		template <typename T> requires Tools::PlainOldData<T>
 		inline ReadStatus TryRead(T& value);
 
@@ -280,8 +294,6 @@ namespace Socket
 		{
 			if (_isDisposed)
 				throw std::runtime_error("ObjectDisposedException");
-			if (_isClosed)
-				return ReadStatus::Closed;
 			
 			return Protocol::GetReadStatusFromRing(reinterpret_cast<Protocol::Header64*>(_readPtr), _startPtr, _endPtr, _readSeq);
 		}
@@ -512,15 +524,11 @@ namespace Socket
 			
 			_isClosed = true;
 
+			// Only the writers close: a close is a message to the other side; a reader keeps no closed state (see ReadOnlySocket)
 			for (auto& writer : _writeOnlySockets)
 			{
 				if (writer)
 					writer->Close();
-			}
-			for (auto& reader : _readOnlySockets)
-			{
-				if (reader)
-					reader->Close();
 			}
 		}
 
@@ -598,22 +606,12 @@ namespace Socket
 	{
 		if (_isDisposed)
 			throw std::runtime_error("ObjectDisposedException");
-		if (_isClosed)
-		{
-			rdst = {};
-			return ReadStatus::Closed;
-		}
 
 		std::span<uint8_t> dst(_buffer);
 		ReadStatus status = Protocol::TryReadFromRing(_readPtr, _startPtr, _endPtr, dst, rdst, _readSeq);
 
-		if (Socket::IsCloseMessage(rdst))
-		{
-			_isClosed = true;
-			return ReadStatus::Closed;
-		}
-
-		return status;
+		// No latch: the close message ends the writer's session, not the ring; the next read continues after it
+		return Socket::IsCloseMessage(rdst) ? ReadStatus::Closed : status;
 	}
 
 	template <typename T> requires Tools::PlainOldData<T>
@@ -621,19 +619,14 @@ namespace Socket
 	{
 		if (_isDisposed)
 			throw std::runtime_error("ObjectDisposedException");
-		if (_isClosed)
-		{
-			value = {};
-			return ReadStatus::Closed;
-		}
 
 		std::span<uint8_t> dst(reinterpret_cast<uint8_t*>(&value), sizeof(T));
 		std::span<const uint8_t> rdst;
 		ReadStatus status = Protocol::TryReadFromRing(_readPtr, _startPtr, _endPtr, dst, rdst, _readSeq);
 
+		// No latch: the close message ends the writer's session, not the ring; the next read continues after it
 		if (Socket::IsCloseMessage(rdst))
 		{
-			_isClosed = true;
 			value = T();
 			return ReadStatus::Closed;
 		}
@@ -822,6 +815,7 @@ namespace Socket
 	private:
 		SocketHeader _socketHeader;
 		std::unique_ptr<Socket> _socket;
+		std::shared_ptr<Tools::Application::ExitAction> _closeOnExit;
 
 	public:
 		ClientSocket(const std::string& clientName, const std::string& serverName, const std::vector<int32_t>& clientToServerLengths, const std::vector<int32_t>& serverToClientLengths) : ClientName(clientName), ServerName(serverName), Name(SocketUtils::GetSocketName(clientName, serverName)), ClientToServerChannelCount(static_cast<int32_t>(clientToServerLengths.size())), ServerToClientChannelCount(static_cast<int32_t>(serverToClientLengths.size()))
@@ -868,7 +862,13 @@ namespace Socket
 			}
 
 			_socket = std::make_unique<Socket>(Name, std::move(sharedMemory), std::move(clientToServer), std::move(serverToClient));
-			Tools::Application::AddExitAction("Close ClientSocket " + Name, [this]() { Close(); });
+			_closeOnExit = Tools::Application::AddExitAction("Close ClientSocket " + Name, [this]() { Close(); });
+		}
+
+		// The exit action captures this: it must never run once the object is gone.
+		~ClientSocket()
+		{
+			_closeOnExit->Cancel();
 		}
 
 		inline bool IsDisposed() const
@@ -881,46 +881,34 @@ namespace Socket
 			return !_socket || _socket->IsClosed();
 		}
 
+		// Asks the server for this client's id; returns it, or throws naming the server's refusal. Waits while no server listens.
 		inline int32_t Connect()
 		{
+			// Step 1: a closed socket cannot connect
 			if (!_socket)
 				throw std::runtime_error("No socket");
 			if (IsClosed())
-				return -1;
+				throw std::logic_error("ClientSocket.Connect: " + ClientName + " is closed.");
 
+			// Step 2: ask until the answer is final. Closing settles within one listen pass (Persistance) or 1 s (without)
 			LetterBox<SocketHeader> clientBox(ClientName, Tools::Access::Read);
 			LetterBox<SocketHeader> serverBox(ServerName, Tools::Access::Write);
-
-			while (!serverBox.TryStore(_socketHeader))
+			int32_t clientId = RequestClientId(clientBox, serverBox);
+			while (clientId == static_cast<int32_t>(ConnectRefusal::Closing))
 			{
-				std::this_thread::sleep_for(std::chrono::milliseconds(1));
+				std::this_thread::sleep_for(std::chrono::milliseconds(100));
+				clientId = RequestClientId(clientBox, serverBox);
 			}
 
-			Tools::Timestamp waitingSince = Tools::Timestamp::UtcNow();
-			SocketHeader reply;
-
-			while (true)
+			// Step 3: refused: release without writing a close. These rings may carry a live process's session under this name
+			if (clientId < 0)
 			{
-				bool peek = clientBox.TryPeek(reply);
-
-				if (peek && reply.ClientName == _socketHeader.ClientName && reply.Timestamp == _socketHeader.Timestamp)
-				{
-					clientBox.TryEmpty(reply);
-					break;
-				}
-
-				Tools::Timestamp now = Tools::Timestamp::UtcNow();
-				if ((now - waitingSince).GetTotalSeconds() > 3)
-				{
-					waitingSince = now;
-					std::cout << ClientName << ": Waiting for server " << ServerName << "..." << std::endl;
-				}
-
-				std::this_thread::sleep_for(std::chrono::milliseconds(1));
+				Dispose();
+				ConnectRefusal connectRefusal = static_cast<ConnectRefusal>(clientId);
+				throw ConnectRefusedException("ClientSocket.Connect: server " + ServerName + " refused " + ClientName + ": " + std::string(magic_enum::enum_name(connectRefusal)) + ".", connectRefusal);
 			}
-
 			std::cout << ClientName << ": Connected." << std::endl;
-			return reply.ClientId;
+			return clientId;
 		}
 
 		inline void Close()
@@ -937,9 +925,43 @@ namespace Socket
 
 		inline void Dispose()
 		{
+			// Once released there is nothing to close at exit; the exit action would also throw on a disposed socket
+			_closeOnExit->Cancel();
 			if (_socket)
 				_socket->Dispose();
 		}
+
+	private:
+		// Posts one request under a fresh timestamp; returns the ClientId of the reply to it.
+		int32_t RequestClientId(LetterBox<SocketHeader>& clientBox, LetterBox<SocketHeader>& serverBox)
+		{
+			// Step 1: stamp and post; the timestamp tells this request's reply from an earlier one's
+			_socketHeader.Timestamp = Tools::Timestamp::UtcNow();
+			while (!serverBox.TryStore(_socketHeader))
+				std::this_thread::sleep_for(std::chrono::milliseconds(1));
+
+			// Step 2: wait for the reply to this request: same name, timestamp and process
+			Tools::Timestamp waitingSince = Tools::Timestamp::UtcNow();
+			SocketHeader reply;
+			while (true)
+			{
+				if (clientBox.TryPeek(reply) && reply.ClientName == _socketHeader.ClientName
+					&& reply.Timestamp == _socketHeader.Timestamp && reply.ClientProcessId == _socketHeader.ClientProcessId)
+				{
+					clientBox.TryEmpty(reply);
+					return reply.ClientId;
+				}
+				Tools::Timestamp now = Tools::Timestamp::UtcNow();
+				if ((now - waitingSince).GetTotalSeconds() > 3)
+				{
+					waitingSince = now;
+					std::cout << ClientName << ": Waiting for server " << ServerName << "..." << std::endl;
+				}
+				std::this_thread::sleep_for(std::chrono::milliseconds(1));
+			}
+		}
+
+	public:
 
 		inline void Write(std::span<const uint8_t> src)
 		{
@@ -1020,6 +1042,7 @@ namespace Socket
 		bool Persistance = false;
 		const int32_t Capacity;
 		const std::string ServerName;
+		// ClientAllocated fires once per socket: at ClientAllocated time the socket exists but no process is attached to it yet.
 		std::function<void(const SocketHeader&)> ClientAllocated;
 		std::function<void(const SocketHeader&)> ClientDeallocated;
 
@@ -1029,6 +1052,8 @@ namespace Socket
 		std::function<void(std::exception&)> Exception;
 		std::function<int32_t(const SocketHeader&)> AllocateClientId;
 		std::function<SocketHeader(int32_t)> DeallocateClient;
+		// Unset means always ready; asked only when no live process holds the name (Detached or Disposed).
+		::Socket::IsClientReady IsClientReady;
 
 	private:
 		LetterBox<SocketHeader> _letterBox;
@@ -1066,8 +1091,18 @@ namespace Socket
 			{
 				while (_isRunning)
 				{
-					PollPids();
-					PollLetterBox();
+					// One bad request or event handler must not end this thread; it is what notices every dead client and cancels its orders
+					try
+					{
+						PollPids();
+						PollLetterBox();
+					}
+					catch (std::exception& exception)
+					{
+						std::cout << ServerName << ".Listen: " << exception.what() << std::endl;
+						if (Exception)
+							Exception(exception);
+					}
 					std::this_thread::sleep_for(std::chrono::milliseconds(1));
 				}
 			});
@@ -1187,12 +1222,7 @@ namespace Socket
 			clientHeader.SetClosedTimestamp(Tools::Timestamp::MaxValue);
 			clientHeader.ClientProcessId = socketHeader.ClientProcessId;
 
-			LetterBox<SocketHeader> clientBox(socketHeader.ClientName.ToString(), Tools::Access::Write);
-
-			while (!clientBox.TryStore(socketHeader))
-			{
-				std::this_thread::sleep_for(std::chrono::milliseconds(1));
-			}
+			ReplyToClient(socketHeader);
 
 			clientHeader.Status.Store(ClientStatus::Open);
 			_clientIds.AtomicSet(socketHeader.ClientId);
@@ -1222,47 +1252,89 @@ namespace Socket
 			std::cout << ServerName << ": " << " Closed id " << clientId << std::endl;
 		}
 
+		// Takes one connect request and answers it exactly once: the client's id, or a negative ConnectRefusal.
 		void PollLetterBox()
 		{
+			// Step 1: take the request
 			SocketHeader socketHeader;
+			if (!_letterBox.TryEmpty(socketHeader))
+				return;
+			std::string clientName = socketHeader.ClientName.ToString();
+			std::cout << "ServerSocket::" << ServerName << ": Received connection request from " << clientName << std::endl;
 
-			if (_letterBox.TryEmpty(socketHeader))
+			// Step 2: decide. A throw used to end the listen thread and leave the client waiting forever; it is answered too
+			try
 			{
-				std::string clientName = socketHeader.ClientName.ToString();
-				std::cout << "ServerSocket::" << ServerName << ": Received connection request from " << clientName << std::endl;
+				DecideConnect(socketHeader);
+			}
+			catch (std::exception& exception)
+			{
+				std::cout << "ServerSocket::" << ServerName << ": Client " << clientName << " connect failed: " << exception.what() << std::endl;
+				if (Exception)
+					Exception(exception);
+				socketHeader.ClientId = static_cast<int32_t>(ConnectRefusal::ServerError);
+			}
 
-				int32_t clientId = AllocateClientId(socketHeader);
-				socketHeader.ClientId = clientId;
+			// Step 3: a refused client is told why; an accepted one is attached, and OpenClient sends its id
+			if (socketHeader.ClientId < 0)
+			{
+				std::cout << "ServerSocket::" << ServerName << ": Client " << clientName << " refused: " << magic_enum::enum_name(static_cast<ConnectRefusal>(socketHeader.ClientId)) << "." << std::endl;
+				ReplyToClient(socketHeader);
+				return;
+			}
+			OpenClient(socketHeader);
+		}
 
-				if (clientId < 0)
-				{
-					std::cout << "ServerSocket::" << ServerName << ": Client " << clientName << " failed to allocate clientId." << std::endl;
-					return;
-				}
-				ClientStatus status = _clientHeaders[static_cast<size_t>(clientId)].Status.State();
+		// Sets ClientId to the client's id, building its socket on its first attach, or to a negative ConnectRefusal.
+		void DecideConnect(SocketHeader& socketHeader)
+		{
+			// Step 1: the name's id. A request never chooses its own id; one that did could take another client's slot
+			socketHeader.ClientId = -1;
+			socketHeader.ClientId = AllocateClientId(socketHeader);
+			if (socketHeader.ClientId < 0)
+				return;
 
-				if (status == ClientStatus::Open)
-				{
-					std::cout << "ServerSocket::" << ServerName << ": Client " << clientName << " is already connected." << std::endl;
-					return;
-				}
-				else if (status == ClientStatus::Closing || status == ClientStatus::Closed)
-				{
-					std::cout << "ServerSocket::" << ServerName << ": Client " << clientName << " is in the process of closing. Try again in a moment." << std::endl;
-					return;
-				}
-				else if (status == ClientStatus::Detached)
-				{
+			// Step 2: one process per name. A close is finished on this thread (PollPids); opening now would swallow it
+			ClientStatus status = _clientHeaders[static_cast<size_t>(socketHeader.ClientId)].Status.State();
+			if (status == ClientStatus::Open)
+			{
+				socketHeader.ClientId = static_cast<int32_t>(ConnectRefusal::AlreadyConnected);
+				return;
+			}
+			if (status == ClientStatus::Closing || status == ClientStatus::Closed)
+			{
+				socketHeader.ClientId = static_cast<int32_t>(ConnectRefusal::Closing);
+				return;
+			}
 
-				}
-				else if (status == ClientStatus::Disposed)
-				{
-					if (ClientAllocated)
-						ClientAllocated(socketHeader);
-					CreateClient(socketHeader);
-				}
+			// Step 3: no live process holds the name; the server may still refuse it for now
+			if (IsClientReady && !IsClientReady(socketHeader.ClientId))
+			{
+				socketHeader.ClientId = static_cast<int32_t>(ConnectRefusal::NotReady);
+				return;
+			}
 
-				OpenClient(socketHeader);
+			// Step 4: a first attach builds the socket, then announces it, as LoadClients does; a Detached client keeps its ring and read cursors
+			if (status == ClientStatus::Disposed)
+			{
+				CreateClient(socketHeader);
+				if (ClientAllocated)
+					ClientAllocated(socketHeader);
+			}
+		}
+
+		// Stores a reply in the client's letterbox, where Connect matches it to its request.
+		static void ReplyToClient(const SocketHeader& socketHeader)
+		{
+			LetterBox<SocketHeader> clientBox(socketHeader.ClientName.ToString(), Tools::Access::Write);
+			SocketHeader leftoverReply;
+			while (!clientBox.TryStore(socketHeader))
+			{
+				// A client that died before reading its reply leaves it behind (Linux keeps the region), and this loop would spin
+				// forever; only this thread stores here, so the box holds that reply or nothing
+				if (clientBox.TryPeek(leftoverReply) && !Tools::IsProcessAlive(leftoverReply.ClientProcessId))
+					clientBox.TryEmpty(leftoverReply);
+				std::this_thread::sleep_for(std::chrono::milliseconds(1));
 			}
 		}
 
