@@ -100,7 +100,7 @@ public:
     Provider::ClientContext ClientContext;
 
 private:
-    // Bound to ClientContext: a client's OrderRisks and WorkingRisks are its own rows.
+    // Bound to ClientContext: a client's WorkingRisks are its own rows; its OrderRisk rows live in the RiskLayer itself.
     Provider::RiskLayer _riskLayer;
     // Read-only view of the server's authoritative book (serverName-keyed), used to seed each
     // instrument's replica once on subscription. The strategy process does not init ContextManager,
@@ -304,6 +304,9 @@ public:
             {
                 const Data::TradingStatusUpdate& tradingStatusUpdate = *reinterpret_cast<const Data::TradingStatusUpdate*>(bytes.data());
                 ClientContext.GetInstrument(instrumentId).OnTradingStatusUpdate(tradingStatusUpdate);
+                // As on the server: the instrument's close starts its fills count again in this client's copy
+                if (tradingStatusUpdate.TradingStatus == Data::TradingStatus::Closed)
+                    _riskLayer.OnSessionClosed(instrumentId);
                 break;
             }
             default:
@@ -474,19 +477,11 @@ public:
         Execution::OrderRejected orderRejected;
         orderTarget.NewOrderRejected(orderRejectedReasons, orderRejectedSource, orderRejected);
 
-        if (IsDiscarded(orderRejected))
+        if (orderRejected.IsDiscarded())
             return;
 
         _socket.Write(ClientContext.GetInstrument(orderRejected.OrderHeader.OrderId.InstrumentId()).Header().CoreGroupId, orderRejected);
         if (OrderRejected) OrderRejected(orderRejected);
-    }
-
-    // Benign rejections are absorbed silently - no alert, no pause, no escalation. The sim-only
-    // session-limit carve-out layers on top of the struct's own reason check.
-    static bool IsDiscarded(const Execution::OrderRejected& orderRejected)
-    {
-        return orderRejected.IsDiscarded()
-            || (Tools::Clock::Mode() == Tools::ClockMode::Simulation && orderRejected.OrderRejectedReasons.Raw() == (1ULL << static_cast<int32_t>(Execution::OrderRejectedReason::TooManyOrdersPerSession)));
     }
 
 private:
@@ -506,7 +501,7 @@ private:
 
         // Non-discarded rejections raise the event regardless of source, so exchange/server
         // rejections severe enough to pause the algo reach the alert layer too.
-        if (IsDiscarded(orderRejected))
+        if (orderRejected.IsDiscarded())
             return;
 
         if (OrderRejected)
@@ -604,6 +599,8 @@ private:
                 break;
             }
             case static_cast<uint8_t>(Execution::OrderType::OrderTarget):   // a cancel the server sent for this client's previous process: recorded by the audit, nothing to apply
+                break;
+            case static_cast<uint8_t>(Execution::OrderType::RiskLimit):     // an edit of this strategy's limit, sent so the audit keeps its file: the row itself is in shared memory
                 break;
             default:
                 throw std::runtime_error("Unknown message type: " + std::to_string(type));

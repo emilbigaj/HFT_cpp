@@ -48,7 +48,7 @@ namespace Data
 		Data::InstrumentType InstrumentType;
 		uint8_t CoreGroupId;
 		Data::TradingStatus TradingStatus;
-		uint8_t Reserved0[1] = {0};
+		int8_t ProductGroupId = 0;   // its row in <server>/MessageEfficiency, set by the server at allocation; -1 until then
 		Tools::String8 Exchange;
 		Tools::String8 Root;
 		double TickSize;
@@ -57,7 +57,7 @@ namespace Data
 		int32_t InstrumentHeaderId;
 		int32_t InstrumentId;
 		int32_t ExchangeInstrumentId;
-		uint8_t Reserved1[4] = {0};
+		Tools::String4 ProductGroupRoot;   // the group CME counts its message efficiency under (MDP3 SecurityGroup, tag 1151), set by whoever builds the header
 		std::string ToString() const
 		{
 			return Tools::Json::Serialize(*this);
@@ -71,6 +71,7 @@ namespace Data
 				"InstrumentType", &T::InstrumentType,
 				"CoreGroupId", &T::CoreGroupId,
 				"TradingStatus", &T::TradingStatus,
+				"ProductGroupId", &T::ProductGroupId,
 				"Exchange", &T::Exchange,
 				"Root", &T::Root,
 				"TickSize", &T::TickSize,
@@ -78,16 +79,17 @@ namespace Data
 				"DisplayFactor", &T::DisplayFactor,
 				"InstrumentHeaderId", &T::InstrumentHeaderId,
 				"InstrumentId", &T::InstrumentId,
-				"ExchangeInstrumentId", &T::ExchangeInstrumentId
+				"ExchangeInstrumentId", &T::ExchangeInstrumentId,
+				"ProductGroupRoot", &T::ProductGroupRoot
 			);
 		};
 	};
 
 	static_assert(sizeof(InstrumentHeader) == 64, "InstrumentHeader size must be 64 bytes");
 	// TradingStatus is the runtime-updated byte at offset 6 (Header 4 | InstrumentType | CoreGroupId),
-	// verified against C# field order - the 09-10 report's "offset 7" counts from 1. The reserved
-	// byte at 7 is where HaltReason goes when it is carried, with no size change.
+	// verified against C# field order - the 09-10 report's "offset 7" counts from 1.
 	static_assert(offsetof(InstrumentHeader, TradingStatus) == 6);
+	static_assert(offsetof(InstrumentHeader, ProductGroupId) == 7 && offsetof(InstrumentHeader, ProductGroupRoot) == 60);
 
 	struct ForexHeader
 	{
@@ -436,6 +438,11 @@ namespace Data
 		const InstrumentHeader& Header() const
 		{
 			return _headerEntry.GetReadonlyRef().AsInstrumentHeader();
+		}
+
+		int32_t ProductGroupId() const
+		{
+			return Header().ProductGroupId;
 		}
 
 		MarketByPrice64 MarketByPriceCopy()

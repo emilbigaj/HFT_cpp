@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <optional>
 #include <string>
 #include <magic_enum.hpp>
 
@@ -17,7 +18,6 @@
 #include "Tick.hpp"
 #include "Bitset.hpp"
 #include "Instrument.hpp"
-#include "RateLimit.hpp"
 
 namespace Execution
 {
@@ -31,6 +31,7 @@ namespace Execution
 		AheadOfOrder = 15,
 		RiskLimit = 16,
 		WorkingRisk = 17,
+		MessageEfficiency = 18,   // a MessageEfficiency row the server posts on its audit channel at a session's close and at shutdown
 	};
 
 	enum class TimeInForce : uint8_t
@@ -112,7 +113,7 @@ namespace Execution
 		PositionExceedsRiskLimit   = 54,
 		NotEnoughMargin        = 55,
 		TooManyOrdersPerSecond = 56,
-		TooManyOrdersPerSession    = 57,
+		TooManyFillsPerSession     = 57,   // the session's fills could pass RiskLimit::MaxFillsPerSession (was TooManyOrdersPerSession, never raised)
 		MessageEfficiencyViolated  = 58,
 		TooManyActiveOrders = 59,
 		NotAuthorizedToTrade = 60, // entitlement/permission wall — stop retrying
@@ -163,8 +164,10 @@ namespace Execution
 		int32_t Position = 0;
 		// One aggregate per side: long signed positive, short signed negative. GetShortQuantityAllowance
 		// and the position test both depend on that, so a delta added here must carry the order's sign.
-		int32_t WorstLongWorkingQuantity = 0;   // >= 0
-		int32_t WorstShortWorkingQuantity = 0;  // <= 0
+		int32_t WorstWorkingLongQuantity = 0;    // >= 0: the most the working buys could still fill
+		int32_t WorstWorkingShortQuantity = 0;   // <= 0: the most the working sells could still fill
+		int32_t FillsThisSession = 0;            // >= 0: |fills| of algo orders, both sides, since the session opened (0 again at its Closed); manual fills never count
+		int32_t WorstWorkingFills = 0;           // >= 0: the most the working algo orders, both sides, could still fill: the fills room's reservation
 
 		std::string ToString() const
 		{
@@ -177,19 +180,21 @@ namespace Execution
 			static constexpr auto value = glz::object(
 				"Header", &T::Header,
 				"Position", &T::Position,
-				"WorstLongWorkingQuantity", &T::WorstLongWorkingQuantity,
-				"WorstShortWorkingQuantity", &T::WorstShortWorkingQuantity
+				"WorstWorkingLongQuantity", &T::WorstWorkingLongQuantity,
+				"WorstWorkingShortQuantity", &T::WorstWorkingShortQuantity,
+				"FillsThisSession", &T::FillsThisSession,
+				"WorstWorkingFills", &T::WorstWorkingFills
 			);
 		};
 	};
 
-	static_assert(sizeof(WorkingRisk) == 16, "WorkingRisk must be 16 bytes");
-	static_assert(offsetof(WorkingRisk, Position) == 4 && offsetof(WorkingRisk, WorstLongWorkingQuantity) == 8
-		&& offsetof(WorkingRisk, WorstShortWorkingQuantity) == 12);
+	static_assert(sizeof(WorkingRisk) == 24, "WorkingRisk must be 24 bytes");
+	static_assert(offsetof(WorkingRisk, Position) == 4 && offsetof(WorkingRisk, WorstWorkingLongQuantity) == 8
+		&& offsetof(WorkingRisk, WorstWorkingShortQuantity) == 12 && offsetof(WorkingRisk, FillsThisSession) == 16 && offsetof(WorkingRisk, WorstWorkingFills) == 20);
 	static_assert(Tools::PlainOldData<WorkingRisk>, "WorkingRisk must be unmanaged");
 
-	// Server-wide config: one row per instrument, applied to every strategy, written on edits only.
-	// The live numbers it is checked against are in WorkingRisk.
+	// Config, written on edits only: the firm's per instrument (ServerRiskLimits), checked by the server, and each strategy's
+	// per instrument (LocalRiskLimits), checked by that strategy's own RiskLayer. The live numbers are in WorkingRisk.
 	struct RiskLimit
 	{
         Data::Header<OrderType> Header = Data::Header<OrderType>(OrderType::RiskLimit);
@@ -197,18 +202,19 @@ namespace Execution
 		Tools::Timestamp Timestamp = Tools::Timestamp::MinValue; // stamped by the server on apply
 		int32_t MaxOrderQuantity = 0;
 		int32_t MaxPositionQuantity = 0;
+		int32_t MaxFillsPerSession = 0;
 
 		RiskLimit() = default;
 		explicit RiskLimit(int32_t instrumentId) : InstrumentId(instrumentId) {}
 
 		[[nodiscard]] int32_t GetLongQuantityAllowance(const WorkingRisk& workingRisk) const
 		{
-			return std::max(0, MaxPositionQuantity - workingRisk.Position - workingRisk.WorstLongWorkingQuantity);
+			return std::max(0, MaxPositionQuantity - workingRisk.Position - workingRisk.WorstWorkingLongQuantity);
 		}
 
 		[[nodiscard]] int32_t GetShortQuantityAllowance(const WorkingRisk& workingRisk) const
 		{
-			return std::min(0, -MaxPositionQuantity - workingRisk.Position - workingRisk.WorstShortWorkingQuantity);
+			return std::min(0, -MaxPositionQuantity - workingRisk.Position - workingRisk.WorstWorkingShortQuantity);
 		}
 
 		static RiskLimit GetMaxLimits(int32_t instrumentId)
@@ -216,6 +222,7 @@ namespace Execution
 			RiskLimit maxLimit(instrumentId);
 			maxLimit.MaxOrderQuantity = std::numeric_limits<int32_t>::max();
 			maxLimit.MaxPositionQuantity = std::numeric_limits<int32_t>::max();
+			maxLimit.MaxFillsPerSession = std::numeric_limits<int32_t>::max();
 			maxLimit.Timestamp = Tools::Clock::UtcNow();
 			return maxLimit;
 		}
@@ -225,8 +232,18 @@ namespace Execution
 			RiskLimit minLimit(instrumentId);
 			minLimit.MaxOrderQuantity = 0;
 			minLimit.MaxPositionQuantity = 0;
+			minLimit.MaxFillsPerSession = 0;
 			minLimit.Timestamp = Tools::Clock::UtcNow();
 			return minLimit;
+		}
+
+		// The file's last saved limit, or with no file the mode's default: Max in a simulation, Min in realtime. Allocation only.
+		static RiskLimit FromFile(const std::string& riskLimitPath, int32_t instrumentId)
+		{
+			std::optional<std::string> riskLimitLine = Tools::ReadLastLine(riskLimitPath);
+			RiskLimit riskLimit = riskLimitLine ? Tools::Json::Deserialize<RiskLimit>(riskLimitLine.value()) : Tools::Clock::Mode() == Tools::ClockMode::Simulation ? GetMaxLimits(instrumentId) : GetMinLimits(instrumentId);
+			riskLimit.InstrumentId = instrumentId;
+			return riskLimit;
 		}
 
 		std::string ToString() const
@@ -242,12 +259,13 @@ namespace Execution
 				"InstrumentId", &T::InstrumentId,
 				"Timestamp", &T::Timestamp,
 				"MaxOrderQuantity", &T::MaxOrderQuantity,
-				"MaxPositionQuantity", &T::MaxPositionQuantity
+				"MaxPositionQuantity", &T::MaxPositionQuantity,
+				"MaxFillsPerSession", &T::MaxFillsPerSession
 			);
 		};
 	};
 
-	static_assert(sizeof(RiskLimit) == 24, "RiskLimit must be 24 bytes");
+	static_assert(sizeof(RiskLimit) == 28, "RiskLimit must be 28 bytes");
 
 	// Per-order-slot reservation state, server-owned: the in-flight target quantities as a compact
 	// scanned array with a cached max, so the worst case an order can still reach is the highest
@@ -764,7 +782,7 @@ namespace Execution
 		&& offsetof(OrderHeader, ExchangeTimestamp) == 12 && offsetof(OrderHeader, NicTimestamp) == 20);
 	static_assert(offsetof(RiskLimit, InstrumentId) == 4 && offsetof(RiskLimit, Timestamp) == 8
 		&& offsetof(RiskLimit, MaxOrderQuantity) == 16
-		&& offsetof(RiskLimit, MaxPositionQuantity) == 20);
+		&& offsetof(RiskLimit, MaxPositionQuantity) == 20 && offsetof(RiskLimit, MaxFillsPerSession) == 24);
 	static_assert(offsetof(OrderRisk, ActiveTargetsCount) == 0 && offsetof(OrderRisk, WorstOrderQuantity) == 2
 		&& offsetof(OrderRisk, AbsAckedOrderQuantity) == 4 && offsetof(OrderRisk, AbsOrderQuantities) == 6);
 	static_assert(offsetof(Fill, OrderHeader) == 4 && offsetof(Fill, FillId) == 32

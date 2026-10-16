@@ -317,38 +317,58 @@ public:
             _drainAcknowledgedByCoreGroupId[coreGroupId].Value.store(drainRequest, std::memory_order_release);
     }
 
-    // CoreGroup thread only - the row's sole writer. Config fields in place under the seq bump; the
-    // working quantities are never touched, so an edit cannot rewind a reservation. No echo to any
-    // client (nothing consumed it), and the REQUEST is not audited - the logging server taps every
-    // client socket in both directions, so it is already logged under the client. The server never
-    // writes .risklimit files: the logging server's audit writer appends the posted row.
+    // CoreGroup thread only - the row's sole writer. Config fields in place under the seq bump; the working quantities live on
+    // WorkingRisk, so an edit cannot rewind a reservation. Strategy 0's (a server workspace's) is the firm's limit. The server
+    // never writes .risklimit files: Logging appends the row put on record.
     void OnControlRiskLimit(const Provider::ControlRiskLimit& controlRiskLimit)
     {
-        Socket::SharedArrayEntry<Execution::RiskLimit>& riskLimitEntry = _serverContext.GetRiskLimit(controlRiskLimit.InstrumentId);
+        // Step 1: the row: the firm's for strategy 0, never a strategy's (the house book's orders are manual, checked by the firm's alone)
+        int32_t strategyId = controlRiskLimit.StrategyId;
+        bool isServerRiskLimit = strategyId == Execution::OrderIdAllocator::ServerStrategyId;
+        Socket::SharedArrayEntry<Execution::RiskLimit>& riskLimitEntry = isServerRiskLimit ? _serverContext.GetRiskLimit(controlRiskLimit.InstrumentId) : _serverContext.GetRiskLimit(strategyId, controlRiskLimit.InstrumentId);
+
+        // Step 2: its config fields
         Execution::RiskLimit& riskLimit = riskLimitEntry.GetRef();
         riskLimitEntry.AcquireLock();
         riskLimit.MaxOrderQuantity = controlRiskLimit.MaxOrderQuantity;
         riskLimit.MaxPositionQuantity = controlRiskLimit.MaxPositionQuantity;
+        riskLimit.MaxFillsPerSession = controlRiskLimit.MaxFillsPerSession;
         riskLimit.Timestamp = Tools::Clock::UtcNow();
         riskLimitEntry.ReleaseLock();
 
-        // Server-wide limit: the posted row is what the logging server appends to the server's .risklimit file.
-        int32_t coreGroupId = _serverContext.GetInstrument(controlRiskLimit.InstrumentId).Header().CoreGroupId;
-        WriteToAudit(coreGroupId, riskLimit);
+        // Step 3: on record, where its file is read back at allocation
+        WriteToRecord(strategyId, _serverContext.GetInstrument(controlRiskLimit.InstrumentId).Header().CoreGroupId, riskLimit);
     }
 
-    
+    // Puts a server-owned row on record: strategy 0's (the server's) on the audit channel, Logging keeping it under <server>; any
+    // other strategy's on its execution channel, Logging's tap keeping it under <strategy>. CoreGroup thread only.
+    template<typename T>
+    void WriteToRecord(int32_t strategyId, int32_t coreGroupId, const T& row)
+    {
+        if (strategyId == Execution::OrderIdAllocator::ServerStrategyId)
+            WriteToAudit(coreGroupId, row);
+        else
+            WriteToExecution(strategyId, coreGroupId, row);
+    }
+
+    // CoreGroup thread only (ReadExecution, Reject): the position row's sole writer alongside OnFill. A strategy's switch is its own
+    // row; strategy 0's (a server workspace's) is the server row, the master switch every algo on the instrument also needs Live.
     void OnControlAlgoStatus(int32_t strategyId, int32_t instrumentId, Execution::AlgoStatus algoStatus)
     {
+        // Step 1: the switch: the master is the server row, never a strategy's (the house book has no algo of its own)
+        bool isMasterSwitch = strategyId == Execution::OrderIdAllocator::ServerStrategyId;
+        Socket::SharedArrayEntry<Execution::PositionHeader>& positionEntry = isMasterSwitch ? _serverContext.GetPositionHeader(instrumentId) : _serverContext.GetPositionHeader(strategyId, instrumentId);
+
+        // Step 2: the row with its new status
         Tools::Timestamp now = Tools::Clock::UtcNow();
-        Socket::SharedArrayEntry<Execution::PositionHeader>& localPositionEntry = _serverContext.GetPositionHeader(strategyId, instrumentId);
-        Execution::PositionHeader localPosition = localPositionEntry.GetReadonlyRef();
-        localPosition.OrderHeader.ExchangeTimestamp = now;
-        localPosition.OrderHeader.NicTimestamp = now;
-        localPosition.AlgoStatus = algoStatus;
-        localPositionEntry.Write(localPosition);
-        int32_t coreGroupId = _serverContext.GetInstrument(instrumentId).Header().CoreGroupId;
-        WriteToExecution(strategyId, coreGroupId, localPosition);
+        Execution::PositionHeader positionHeader = positionEntry.GetReadonlyRef();
+        positionHeader.OrderHeader.ExchangeTimestamp = now;
+        positionHeader.OrderHeader.NicTimestamp = now;
+        positionHeader.AlgoStatus = algoStatus;
+        positionEntry.Write(positionHeader);
+
+        // Step 3: on record as a fill's rows are
+        WriteToRecord(strategyId, _serverContext.GetInstrument(instrumentId).Header().CoreGroupId, positionHeader);
     }
 
     // Closes out a gone client's 64 order slots: cancels what is working, marks a Create the server never read Done, repairs a
@@ -538,7 +558,7 @@ public:
     void Reject(const Execution::OrderRejected& orderRejected, const std::string& message)
     { 
         WriteToExecution(orderRejected);
-        if (Client::IsDiscarded(orderRejected))
+        if (orderRejected.IsDiscarded())
             return;
         // A manual order is not the algo's: its refusal is reported but never pauses the strategy it books to.
         if (orderRejected.OrderHeader.OrderId.IsAlgoOrder())
@@ -765,6 +785,40 @@ public:
         Data::InstrumentHeader128& instrumentHeader = _serverContext.GetInstrumentHeader(instrumentHeaderId).GetRef();
         instrumentHeader.AsInstrumentHeader().TradingStatus = tradingStatusUpdate.TradingStatus;
         WriteToInstrumentData(tradingStatusUpdate);
+
+        // The exchange closing the instrument ends its session: its product group's message-efficiency day and its fills count
+        if (tradingStatusUpdate.TradingStatus == Data::TradingStatus::Closed)
+        {
+            EndMessageEfficiencyDay(instrumentHeader.AsInstrumentHeader(), tradingStatusUpdate);
+            _riskLayer.OnSessionClosed(tradingStatusUpdate.TickHeader.InstrumentId);
+        }
+    }
+
+    // Starts the next message-efficiency day of this instrument's product group; in Realtime the day that ended is posted on the
+    // audit channel and Logging appends it to the group's file. CoreGroup thread: no I/O.
+    void EndMessageEfficiencyDay(const Data::InstrumentHeader& instrumentHeader, const Data::TradingStatusUpdate& tradingStatusUpdate)
+    {
+        Execution::MessageEfficiency& messageEfficiency = _serverContext.GetMessageEfficiency(instrumentHeader.ProductGroupId).GetRef();
+        Execution::MessageEfficiency endedMessageEfficiency = messageEfficiency;
+        Tools::DateTime local = Tools::Session::CME().ConvertToLocal(tradingStatusUpdate.TickHeader.ExchangeTimestamp);
+        // Why only on a change: every instrument of the group closes; the first ends the day, the rest find it already ended
+        if (messageEfficiency.Reset(local) && Tools::Clock::Mode() == Tools::ClockMode::Realtime)
+            WriteToAudit(instrumentHeader.CoreGroupId, endedMessageEfficiency);
+    }
+
+    // Posts every product group's message-efficiency row on the audit channel at shutdown; Logging appends each to its group's file,
+    // read back when the group is next allocated. Call before the audit link closes: Logging drains it on close.
+    void PostMessageEfficiencies()
+    {
+        int32_t productGroupCount = _serverContext.ServerHeader().GetReadonlyRef().InstrumentIds.Length();
+        for (int32_t productGroupId = 0; productGroupId < productGroupCount; productGroupId++)
+        {
+            Socket::SharedArrayEntry<Execution::MessageEfficiency>& messageEfficiencyEntry = _serverContext.GetMessageEfficiency(productGroupId);
+            if (messageEfficiencyEntry.IsEmpty())
+                return;
+            // Why a plain read: a strategy that died mid-write would make a seqlocked read spin for ever and hang the close
+            WriteToAudit(Socket::SocketChannel::Admin, messageEfficiencyEntry.GetReadonlyRef());
+        }
     }
 
     // Opens (once) the per-instrument broadcast ring this server writes market data to.
@@ -894,6 +948,9 @@ public:
                 instrumentData->Dispose();
         }
 
+        // Why after the server socket: its admin thread, the admin channel's only other writer, has stopped
+        if (Tools::Clock::Mode() == Tools::ClockMode::Realtime)
+            PostMessageEfficiencies();
         _audit.Dispose();
         _loggingServer.Dispose();
         // _serverContext and _serverHeaderBox are RAII here; C# disposes them explicitly.

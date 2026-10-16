@@ -1,8 +1,11 @@
 //BEGIN_FILE HFT/Provider/RiskLayer.hpp
 #pragma once
 
+#include <vector>
+
 #include "Context.hpp"
 #include "Order.hpp"
+#include "RateLimit.hpp"
 #include "Bitset.hpp"
 #include "Tools.hpp"
 #include <cmath>
@@ -16,8 +19,11 @@ namespace Provider
 class RiskLayer
 {
 private:
-    // The server's context on the server, the client's own on a client: OrderRisks and WorkingRisks are per context.
+    // The server's context on the server, the client's own on a client: the WorkingRisk and RiskLimit rows checked are per context.
     Provider::Context& _context;
+    // Per order slot (OrderId::GlobalIndex): its in-flight quantities and worst case. Only this RiskLayer reads or writes them and
+    // no other process needs them, so they live here, not in shared memory; allocated at startup, zero = nothing in flight.
+    std::vector<Execution::OrderRisk> _orderRisks;
     // CLIENT-side only: the high-water mark of this client's own allocations. Valid there because
     // validation runs at send time on one thread, so validation order IS allocation order. The
     // server must NOT run this check: ids come from one per-client counter but travel on per-core-
@@ -29,9 +35,17 @@ private:
 
 public:
     RiskLayer(Provider::Context& context, Execution::OrderRejectedSource orderRejectedSource)
-    : _context(context), _orderRejectedSource(orderRejectedSource)
+    : _context(context), _orderRisks(static_cast<size_t>(context.ServerHeader().GetReadonlyRef().OrdersCapacity())), _orderRejectedSource(orderRejectedSource)
     {
     }
+
+private:
+    ALWAYS_INLINE Execution::OrderRisk& GetOrderRisk(Execution::OrderId orderId)
+    {
+        return _orderRisks[static_cast<size_t>(orderId.GlobalIndex())];
+    }
+
+public:
 
     ALWAYS_INLINE Tools::Bitset64 ValidateClient(int32_t clientId, int32_t strategyId)
     {
@@ -151,7 +165,7 @@ public:
     // magnitude delta (negative = release) to each leg's side of exposure. legSide = orderSide *
     // sign(weight) - the sign is applied exactly ONCE, here; signing anywhere else squares it away
     // and drives the short aggregate positive (see Spec.md).
-    ALWAYS_INLINE void ApplyWorstWorkingQuantityDelta(Execution::OrderId orderId, int32_t orderSideSign, int32_t magnitudeDelta)
+    ALWAYS_INLINE void ApplyWorstQuantityDelta(Execution::OrderId orderId, int32_t orderSideSign, int32_t magnitudeDelta)
     {
         if (magnitudeDelta == 0)
             return;
@@ -164,8 +178,9 @@ public:
             Socket::SharedArrayEntry<Execution::WorkingRisk>& workingRiskEntry = _context.GetWorkingRisk(leg.InstrumentId);
             Execution::WorkingRisk& workingRisk = workingRiskEntry.GetRef();
             workingRiskEntry.AcquireLock();
-            workingRisk.WorstLongWorkingQuantity += legSide > 0 ? legMagnitudeDelta : 0;
-            workingRisk.WorstShortWorkingQuantity -= legSide < 0 ? legMagnitudeDelta : 0;
+            workingRisk.WorstWorkingLongQuantity += legSide > 0 ? legMagnitudeDelta : 0;
+            workingRisk.WorstWorkingShortQuantity -= legSide < 0 ? legMagnitudeDelta : 0;
+            workingRisk.WorstWorkingFills += orderId.IsAlgoOrder() ? legMagnitudeDelta : 0;
             workingRiskEntry.ReleaseLock();
         }
     }
@@ -179,7 +194,7 @@ public:
         // "Acceptance before trade").
         if (orderState.OrderStateReason == Execution::OrderStateReason::Acked)
         {
-            Execution::OrderRisk& orderRisk = _context.GetOrderRisk(orderState.OrderHeader.OrderId).GetRef();
+            Execution::OrderRisk& orderRisk = GetOrderRisk(orderState.OrderHeader.OrderId);
             Data::Side side = orderState.OrderProfile.Side();
 
             int32_t worstOrderQuantityBefore = orderRisk.GetAbsWorstOrderQuantity();
@@ -187,11 +202,11 @@ public:
             int32_t worstOrderQuantityAfter = orderRisk.GetAbsWorstOrderQuantity();
             int32_t worstOrderQuantityDelta = worstOrderQuantityAfter - worstOrderQuantityBefore;
 
-            ApplyWorstWorkingQuantityDelta(orderState.OrderHeader.OrderId, side == Data::Side::Buy ? 1 : -1, worstOrderQuantityDelta);
+            ApplyWorstQuantityDelta(orderState.OrderHeader.OrderId, side == Data::Side::Buy ? 1 : -1, worstOrderQuantityDelta);
         }
         else if (orderState.OrderStateStatus == Execution::OrderStateStatus::Done)
         {
-            Execution::OrderRisk& orderRisk = _context.GetOrderRisk(orderState.OrderHeader.OrderId).GetRef();
+            Execution::OrderRisk& orderRisk = GetOrderRisk(orderState.OrderHeader.OrderId);
             Data::Side side = orderState.OrderProfile.Side();
 
             int32_t worstOrderQuantity = orderRisk.GetAbsWorstOrderQuantity();
@@ -199,7 +214,7 @@ public:
 
             orderRisk = Execution::OrderRisk{};
 
-            ApplyWorstWorkingQuantityDelta(orderState.OrderHeader.OrderId, side == Data::Side::Buy ? 1 : -1, -released);
+            ApplyWorstQuantityDelta(orderState.OrderHeader.OrderId, side == Data::Side::Buy ? 1 : -1, -released);
         }
     }
 
@@ -211,8 +226,10 @@ public:
     {
         int32_t instrumentId = fill.OrderHeader.OrderId.InstrumentId();
         Socket::SharedArrayEntry<Execution::WorkingRisk>& workingRiskEntry = _context.GetWorkingRisk(instrumentId);
+        Execution::WorkingRisk& workingRisk = workingRiskEntry.GetRef();
         workingRiskEntry.AcquireLock();
-        workingRiskEntry.GetRef().Position += fill.Quantity;
+        workingRisk.Position += fill.Quantity;
+        workingRisk.FillsThisSession += fill.OrderHeader.OrderId.IsAlgoOrder() ? std::abs(fill.Quantity) : 0;
         workingRiskEntry.ReleaseLock();
 
         // A legged instrument's own fill is accounting only (volume/position view on the spread row); risk lives on the
@@ -220,7 +237,7 @@ public:
         if (!isReserved || _context.GetInstrument(instrumentId).IsLegged())
             return;
 
-        ApplyWorstWorkingQuantityDelta(fill.OrderHeader.OrderId, fill.Sign(), -std::abs(fill.Quantity));
+        ApplyWorstQuantityDelta(fill.OrderHeader.OrderId, fill.Sign(), -std::abs(fill.Quantity));
     }
 
     ALWAYS_INLINE void OnOrderRejected(const Execution::OrderRejected& orderRejected)
@@ -229,7 +246,7 @@ public:
         if (orderRejected.OrderRejectedSource == _orderRejectedSource || orderRejected.OrderTargetAction == Execution::OrderTargetAction::Cancel)
             return;
 
-        Execution::OrderRisk& orderRisk = _context.GetOrderRisk(orderRejected.OrderHeader.OrderId).GetRef();
+        Execution::OrderRisk& orderRisk = GetOrderRisk(orderRejected.OrderHeader.OrderId);
         Data::Side side = orderRejected.OrderProfile.Side();
 
         int32_t worstOrderQuantityBefore = orderRisk.GetAbsWorstOrderQuantity();
@@ -237,29 +254,30 @@ public:
         int32_t worstOrderQuantityAfter = orderRisk.GetAbsWorstOrderQuantity();
         int32_t worstOrderQuantityDelta = worstOrderQuantityAfter - worstOrderQuantityBefore;
 
-        ApplyWorstWorkingQuantityDelta(orderRejected.OrderHeader.OrderId, side == Data::Side::Buy ? 1 : -1, worstOrderQuantityDelta);
+        ApplyWorstQuantityDelta(orderRejected.OrderHeader.OrderId, side == Data::Side::Buy ? 1 : -1, worstOrderQuantityDelta);
     }
 
-    // The largest |order quantity| (filled included) this order may carry and still pass the position check: its current
-    // worst plus the room left on every leg. Past the limit ValidateOrder lets it keep its worst (a cut always passes);
-    // isWithinLimit cuts it back to what fits the limit instead, which the server always accepts (see Spec.md).
-    ALWAYS_INLINE int32_t GetAbsAllowedOrderQuantity(const Execution::OrderTarget& orderTarget, bool isWithinLimit = false)
+    // The largest |order quantity| (filled included) this order may carry and still pass one limit: its current worst plus the
+    // room left on every leg, the position's or (isFillsRoom, algo orders only) the session's fills', where every working algo lot
+    // on both sides may fill. Past the limit ValidateOrder lets it keep its worst (a cut always passes); isWithinLimit cuts it back to what fits
+    // the limit instead, which the server always accepts (see Spec.md).
+    ALWAYS_INLINE int32_t GetAbsAllowedOrderQuantity(const Execution::OrderTarget& orderTarget, bool isFillsRoom, bool isWithinLimit = false)
     {
         // A Create's row still holds the previous order's values until ValidateOrder resets it.
         int32_t worstOrderQuantity = orderTarget.OrderTargetAction == Execution::OrderTargetAction::Create ? 0
-            : _context.GetOrderRisk(orderTarget.OrderHeader.OrderId).GetReadonlyRef().GetAbsWorstOrderQuantity();
+            : GetOrderRisk(orderTarget.OrderHeader.OrderId).GetAbsWorstOrderQuantity();
         int32_t sign = orderTarget.OrderProfile.Sign();
         int64_t absAllowedOrderQuantity = std::numeric_limits<int32_t>::max();
 
         for (const Data::InstrumentLeg& leg : _context.GetInstrument(orderTarget.OrderHeader.OrderId.InstrumentId()).Legs())
         {
-            // legSide = orderSide * sign(weight), as in ApplyWorstWorkingQuantityDelta: a buy calendar reserves the back leg SHORT.
+            // legSide = orderSide * sign(weight), as in ApplyWorstQuantityDelta: a buy calendar reserves the back leg SHORT.
             int32_t legSide = sign * ((leg.Weight > 0) - (leg.Weight < 0));
             const Execution::RiskLimit& riskLimit = _context.GetRiskLimit(leg.InstrumentId).GetReadonlyRef();
             const Execution::WorkingRisk& workingRisk = _context.GetWorkingRisk(leg.InstrumentId).GetReadonlyRef();
-            int64_t room = legSide > 0
-                ? static_cast<int64_t>(riskLimit.MaxPositionQuantity) - workingRisk.Position - workingRisk.WorstLongWorkingQuantity
-                : static_cast<int64_t>(riskLimit.MaxPositionQuantity) + workingRisk.Position + workingRisk.WorstShortWorkingQuantity;
+            int64_t room = isFillsRoom ? static_cast<int64_t>(riskLimit.MaxFillsPerSession) - workingRisk.FillsThisSession - workingRisk.WorstWorkingFills
+                : legSide > 0 ? static_cast<int64_t>(riskLimit.MaxPositionQuantity) - workingRisk.Position - workingRisk.WorstWorkingLongQuantity
+                : static_cast<int64_t>(riskLimit.MaxPositionQuantity) + workingRisk.Position + workingRisk.WorstWorkingShortQuantity;
             // Past the limit nothing may grow: keep the worst, or within the limit cut by the overshoot rounded up to whole orders.
             int64_t absWeight = std::abs(leg.Weight);
             int64_t roomOrderQuantity = room >= 0 ? room / absWeight : isWithinLimit ? -((absWeight - 1 - room) / absWeight) : 0;
@@ -268,10 +286,19 @@ public:
         return static_cast<int32_t>(absAllowedOrderQuantity);
     }
 
-    // ValidateOrder's position check: what TryAdd would add must fit the room on every leg.
-    ALWAYS_INLINE bool IsWithinRiskLimit(const Execution::OrderTarget& orderTarget)
+    // ValidateOrder's position and fills checks: what TryAdd would add must fit that room on every leg.
+    ALWAYS_INLINE bool IsWithinRiskLimit(const Execution::OrderTarget& orderTarget, bool isFillsRoom)
     {
-        return std::abs(orderTarget.OrderProfile.Quantity) <= GetAbsAllowedOrderQuantity(orderTarget);
+        return std::abs(orderTarget.OrderProfile.Quantity) <= GetAbsAllowedOrderQuantity(orderTarget, isFillsRoom);
+    }
+
+    // The instrument's session closed: its fills count starts again, as message efficiency's day does. The WorkingRisk row's writer only.
+    void OnSessionClosed(int32_t instrumentId)
+    {
+        Socket::SharedArrayEntry<Execution::WorkingRisk>& workingRiskEntry = _context.GetWorkingRisk(instrumentId);
+        workingRiskEntry.AcquireLock();
+        workingRiskEntry.GetRef().FillsThisSession = 0;
+        workingRiskEntry.ReleaseLock();
     }
 
     // Lowers a create or amend to the largest quantity within the limits, which ValidateOrder accepts here and on the server
@@ -280,13 +307,13 @@ public:
     {
         Execution::OrderId orderId = orderTarget.OrderHeader.OrderId;
         // An amend with 29 targets already in flight would be refused (TooManyActiveTargets): nothing fits until an ack frees one.
-        if (orderTarget.OrderTargetAction != Execution::OrderTargetAction::Create && _context.GetOrderRisk(orderId).GetReadonlyRef().IsFull())
+        if (orderTarget.OrderTargetAction != Execution::OrderTargetAction::Create && GetOrderRisk(orderId).IsFull())
             return false;
         const Execution::OrderState& orderState = _context.GetOrderState(orderId).GetReadonlyRef();
         int32_t absQuantityFilled = orderTarget.OrderTargetAction != Execution::OrderTargetAction::Create && orderState.OrderHeader.OrderId == orderId ? std::abs(orderState.QuantityFilled) : 0;
 
         // Position room, TryAdd's cap, and the per-order limit ValidateOrder applies to the working quantity on each leg.
-        int64_t absAllowedOrderQuantity = std::min<int64_t>(GetAbsAllowedOrderQuantity(orderTarget, true), Execution::OrderRisk::MaxOrderQuantity);
+        int64_t absAllowedOrderQuantity = std::min<int64_t>(std::min(GetAbsAllowedOrderQuantity(orderTarget, false, true), GetAbsAllowedOrderQuantity(orderTarget, true, true)), Execution::OrderRisk::MaxOrderQuantity);
         for (const Data::InstrumentLeg& leg : _context.GetInstrument(orderId.InstrumentId()).Legs())
             absAllowedOrderQuantity = std::min<int64_t>(absAllowedOrderQuantity, absQuantityFilled + static_cast<int64_t>(_context.GetRiskLimit(leg.InstrumentId).GetReadonlyRef().MaxOrderQuantity) / std::abs(leg.Weight));
 
@@ -399,10 +426,9 @@ public:
                 }
             }
 
-            const Execution::PositionHeader& localPosition = _context.GetPositionHeader(orderTarget.OrderHeader.OrderId.StrategyId(), orderTarget.OrderHeader.OrderId.InstrumentId()).GetReadonlyRef();
-
+            // Why both switches: the strategy's own, and the server's master for the instrument (see Spec.md "Algo pause")
             bool isCancel = orderTarget.OrderTargetAction == Execution::OrderTargetAction::Cancel;
-            if (!isCancel && orderTarget.OrderHeader.OrderId.IsAlgoOrder() && localPosition.AlgoStatus == Execution::AlgoStatus::Paused)
+            if (!isCancel && orderTarget.OrderHeader.OrderId.IsAlgoOrder() && !_context.IsAlgoLive(orderTarget.OrderHeader.OrderId.StrategyId(), orderTarget.OrderHeader.OrderId.InstrumentId()))
             {
                 orderRejectedReasons.Set(static_cast<int32_t>(Execution::OrderRejectedReason::AlgoIsPaused));
                 return false;
@@ -457,13 +483,19 @@ public:
                 }
 
                 // Phase 1 - pure: check every leg, write nothing.
-                if (!IsWithinRiskLimit(orderTarget))
+                if (!IsWithinRiskLimit(orderTarget, false))
                 {
                     orderRejectedReasons.Set(static_cast<int32_t>(Execution::OrderRejectedReason::PositionExceedsRiskLimit));
                     return false;
                 }
+                // Why algo only: a manual order is how an operator exits an algo that used up the fills, so it must never be refused for them
+                if (orderTarget.OrderHeader.OrderId.IsAlgoOrder() && !IsWithinRiskLimit(orderTarget, true))
+                {
+                    orderRejectedReasons.Set(static_cast<int32_t>(Execution::OrderRejectedReason::TooManyFillsPerSession));
+                    return false;
+                }
 
-                Execution::OrderRisk& orderRisk = _context.GetOrderRisk(orderTarget.OrderHeader.OrderId).GetRef();
+                Execution::OrderRisk& orderRisk = GetOrderRisk(orderTarget.OrderHeader.OrderId);
 
                 // A slot's row may hold a previous order's, or a previous process's: a Create always starts it empty.
                 if (orderTarget.OrderTargetAction == Execution::OrderTargetAction::Create)
@@ -479,7 +511,7 @@ public:
                     return false;
                 }
                 int32_t worstMagnitudeDelta = orderRisk.GetAbsWorstOrderQuantity() - worstOrderQuantityBefore;
-                ApplyWorstWorkingQuantityDelta(orderTarget.OrderHeader.OrderId, orderTarget.OrderProfile.Sign(), worstMagnitudeDelta);
+                ApplyWorstQuantityDelta(orderTarget.OrderHeader.OrderId, orderTarget.OrderProfile.Sign(), worstMagnitudeDelta);
             }
         }
         catch (const std::exception& ex)

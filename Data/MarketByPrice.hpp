@@ -146,6 +146,13 @@ namespace Data
 			bool isNewZero = quantity == 0;
 			bool isBetter = bestOffset < 0;
 
+			// Why: nothing is better than the best, so deleting it changes nothing; within the window its slot holds a worse level
+			if (isBetter && isNewZero)
+			{
+				delta = 0;
+				return false;
+			}
+
 			if (!isBetter && bestOffset >= Capacity)
 			{
 				delta = 0;
@@ -154,12 +161,6 @@ namespace Data
 
 			if (isBetter && bestOffset <= -Capacity)
 			{
-				if (isNewZero)
-				{
-					delta = 0;
-					return false;
-				}
-
 				_bitset.ClearAll();
 				_bestTicks = ticks;
 				_quantities[_bestIndex] = quantity;

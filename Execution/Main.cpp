@@ -35,8 +35,8 @@ int main()
     CHECK(sizeof(Execution::OrderRejected) == 52);
     CHECK(sizeof(Execution::OrderTarget) == 52);
     CHECK(sizeof(Execution::PositionHeader) == 57);
-    CHECK(sizeof(Execution::RiskLimit) == 24);
-    CHECK(sizeof(Execution::WorkingRisk) == 16);
+    CHECK(sizeof(Execution::RiskLimit) == 28);
+    CHECK(sizeof(Execution::WorkingRisk) == 24);
     CHECK(sizeof(Execution::OrderRisk) == 64);
     CHECK(Execution::OrderRisk::MaxActiveTargets == 29);
     CHECK(sizeof(Execution::AheadOfOrder) == 20);

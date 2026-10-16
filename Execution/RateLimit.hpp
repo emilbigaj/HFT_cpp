@@ -5,13 +5,133 @@
 #include <cstdint>
 #include <string>
 
+#include <cmath>
+
+#include "DateTime.hpp"
 #include "Json.hpp"
+#include "Order.hpp"
+#include "String.hpp"
 #include "Timestamp.hpp"
 #include "Tools.hpp"
 
 namespace Execution
 {
 #pragma pack(push, 1)
+	struct MessageEfficiencyTier
+	{
+		int32_t DailyRawMessages = 0;
+		int32_t Benchmark = 0;
+
+		std::string ToString() const
+		{
+			return Tools::Json::Serialize(*this);
+		}
+
+		struct glaze
+		{
+			using T = MessageEfficiencyTier;
+			static constexpr auto value = glz::object(
+				"DailyRawMessages", &T::DailyRawMessages,
+				"Benchmark", &T::Benchmark
+			);
+		};
+	};
+	static_assert(sizeof(MessageEfficiencyTier) == 8);
+
+	// One product group's CME messaging-efficiency day: a shared row in <server>/MessageEfficiency, indexed by
+	// InstrumentHeader::ProductGroupId. The server claims and loads it at allocation, ends the day on Closed and posts it on
+	// its audit channel; C# strategies count into it. C++ only reads and writes the row: it never counts.
+	struct MessageEfficiency
+	{
+		Data::Header<OrderType> Header = Data::Header<OrderType>(OrderType::MessageEfficiency);   //  0, 4   the server posts the row itself on its audit channel
+		Tools::DateTime TradeDate;                                                                 //  4, 8
+		Tools::TimeSpan TradeTime;                                                                 // 12, 8
+		MessageEfficiencyTier Tier0;                                                               // 20, 8
+		MessageEfficiencyTier Tier1;                                                               // 28, 8
+		MessageEfficiencyTier Tier2;                                                               // 36, 8
+		MessageEfficiencyTier Tier3;                                                               // 44, 8
+		Tools::String4 ProductGroupRoot;                                                           // 52, 4
+		int32_t ProductGroupId = -1;                                                               // 56, 4
+		int32_t RawMessages = 0;                                                                   // 60, 4
+		double WeightedMessages = 0;                                                               // 64, 8
+		double InverseQuantityTraded = 1;                                                          // 72, 8
+		int32_t QuantityTraded = 0;                                                                // 80, 4
+
+		// Starts the next day once dateTime reaches the day's end; true when it did.
+		bool Reset(Tools::DateTime dateTime)
+		{
+			Tools::DateTime tradeDateTime = TradeDate.Add(TradeTime);
+			if (dateTime >= tradeDateTime)
+			{
+				TradeDate = dateTime.Date().AddDays(1);
+				RawMessages = 0;
+				WeightedMessages = 0;
+				QuantityTraded = 0;
+				InverseQuantityTraded = 1;
+				return true;
+			}
+			return false;
+		}
+
+		double Efficiency() const
+		{
+			return WeightedMessages * InverseQuantityTraded;
+		}
+
+		void OnFill(int32_t quantity)
+		{
+			QuantityTraded += std::abs(quantity);
+			InverseQuantityTraded = 1.0 / QuantityTraded;
+		}
+
+		// Permissive default (simulation): tiers so high every message is allowed.
+		static MessageEfficiency GetMaxLimits(Tools::String4 productGroupRoot)
+		{
+			MessageEfficiency messageEfficiency;
+			messageEfficiency.ProductGroupRoot = productGroupRoot;
+			messageEfficiency.Tier0 = messageEfficiency.Tier1 = messageEfficiency.Tier2 = messageEfficiency.Tier3 = MessageEfficiencyTier{ .DailyRawMessages = INT32_MAX, .Benchmark = INT32_MAX };
+			return messageEfficiency;
+		}
+
+		// Restrictive default (live until configured): zero tiers block every message.
+		static MessageEfficiency GetMinLimits(Tools::String4 productGroupRoot)
+		{
+			MessageEfficiency messageEfficiency;
+			messageEfficiency.ProductGroupRoot = productGroupRoot;
+			messageEfficiency.Tier0 = messageEfficiency.Tier1 = messageEfficiency.Tier2 = messageEfficiency.Tier3 = MessageEfficiencyTier{ .DailyRawMessages = 0, .Benchmark = 0 };
+			return messageEfficiency;
+		}
+
+		std::string ToString() const
+		{
+			return Tools::Json::Serialize(*this);
+		}
+
+		struct glaze
+		{
+			using T = MessageEfficiency;
+			static constexpr auto value = glz::object(
+				"Efficiency", glz::custom<glz::skip{}, &T::Efficiency>,
+				"Header", &T::Header,
+				"TradeDate", &T::TradeDate,
+				"TradeTime", &T::TradeTime,
+				"Tier0", &T::Tier0,
+				"Tier1", &T::Tier1,
+				"Tier2", &T::Tier2,
+				"Tier3", &T::Tier3,
+				"ProductGroupRoot", &T::ProductGroupRoot,
+				"ProductGroupId", &T::ProductGroupId,
+				"RawMessages", &T::RawMessages,
+				"WeightedMessages", &T::WeightedMessages,
+				"InverseQuantityTraded", &T::InverseQuantityTraded,
+				"QuantityTraded", &T::QuantityTraded
+			);
+		};
+	};
+	static_assert(Tools::PlainOldData<MessageEfficiency>);
+	static_assert(sizeof(MessageEfficiency) == 84 && offsetof(MessageEfficiency, TradeDate) == 4 && offsetof(MessageEfficiency, ProductGroupRoot) == 52
+		&& offsetof(MessageEfficiency, QuantityTraded) == 80, "MessageEfficiency must match the C# row (84 bytes)");
+
 	struct RateLimit
 	{
 		Tools::Duration Duration = Tools::Duration::FromNanoseconds(0); //  0, 8

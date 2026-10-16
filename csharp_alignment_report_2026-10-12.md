@@ -63,3 +63,102 @@ never call into a dead context.
 - **P13:** the C++ client never wipes its audit folder, and C++ has no manual client.
 - **P21:** C++ sanitises region names with the same rule (`[A-Za-z0-9_.-]`, else `_`) and does not
   otherwise validate client names.
+
+## 5. 2026-10-13: P23, P24, C15–C17 and the extended P22 note
+
+Ported against C# `194f8cf`. Nothing here asks C# to change code.
+
+| Item | C++ form |
+|---|---|
+| P23 | `SideByPrice64::TrySetQuantity`: the new "better and zero: no-op" check before the far-worse check; the far-better branch's own zero check is deleted. Scenario 19 and a 200-run server/replica fuzz pass; the same fuzz diverges without the fix |
+| P24 | Ported in full, reversing the 2026-10-05 item 8 ("C#-only"). `InstrumentHeader::ProductGroupId` (int8 @7) and `ProductGroupRoot` (String4 @60), both in the JSON at C#'s positions; `OrderType::MessageEfficiency = 18`; `MessageEfficiencyTier` and the 84-byte `MessageEfficiency` row in `Execution/RateLimit.hpp` (asserted); `ServerContext::AllocateProductGroupId` (private, called from `AllocateInstrument`; `OnInstrumentHeader` sets -1); `Server::EndMessageEfficiencyDay` on `Closed`; `Server::PostMessageEfficiencies` in `Dispose` before the audit link closes, Realtime only. The array is mapped writable by the server and `<server>/MessageEfficiency` is created with the other folders |
+| C15, C16, C17 | Nothing to port. The C++ server keeps its alert link named `<server>.alert` (`AlertManager`: `DirectoryPath + ".alert"`), so the Local Mirror's `<server>/LocalMirror.alert` does not collide |
+| P22 (extended) | The Local Mirror start belongs in CME's `main`, after `LoadClients`/`LoadInstruments`. CME does not start it today; that is the user's call, not an HFT change |
+
+**C++ forms that differ in shape, not behaviour:**
+
+- .NET's `DateTime` and `TimeSpan` have no C++ equivalent, so `Tools/DateTime.hpp` adds 8-byte `Tools::DateTime`
+  (ticks plus the 2 Kind bits, compared on ticks) and `Tools::TimeSpan` (ticks). They write and read the same
+  text as System.Text.Json and the C# `TimeSpanJsonConverter`. A `DateTime` with an offset suffix (Kind Local)
+  is refused on read; C# writes none to the files C++ reads.
+- `Tools/Session.hpp` ports only `Session.CME.ConvertToLocal(Timestamp)` (America/Chicago through the C++
+  tz database).
+- **Decided by the user (2026-10-13): only C# uses message efficiency.** C++ reads and writes the row (the server claims,
+  loads, resets and posts it), but never counts. This answers the report's "A C++ strategy, if there is one, does the
+  same": it does not. `CanSend`/`Send`/`TrySend`, `CMEGetWeightedMessage` and `SessionManager` are not ported, and the
+  C++ `Client` calls neither `Send` nor `OnFill` on the row. Nothing for C# to change.
+- `RateLimit.hpp` includes `Order.hpp` for `OrderType` (C++ needs the declaration first); `Order.hpp` no
+  longer includes `RateLimit.hpp`.
+
+**Verified:** the JSON harness shows 0 of 159 files differing. The new samples are the row (a fractional `TradeDate`), max/min limits,
+CME local time in summer (CDT) and winter (CST), a UTC `DateTime` ("Z"), `Reset` on a fresh row (true, then false,
+then true a day later), and loading a pre-rename line (`ProductGroup` key, no `Header`) and a fractional date. Against the
+real `ServerContext`: MNQ and NQ share row 0; M2K (RY) and ES claim rows 1 and 2; ES loads its tiers from a pre-rename
+file while root, id and day are the server's; an empty `ProductGroupRoot` throws the C# message. The `Closed` handler and
+the shutdown post were not run end to end: they need a full server with Logging.
+
+**Deploy (L10):** the C++ server needs `ProductGroupRoot` on every header it allocates, so CME must set it from
+tag 1151 when it builds headers (`SecDef/SecDefFile.hpp` `FillCommon`; it already parses the tag). The C++ server, CME
+and the C# processes on the box deploy together.
+
+## 6. 2026-10-15: P25, P26, P27
+
+Ported against C# `8b0f60f`. Nothing here asks C# to change code.
+
+| Item | C++ form |
+|---|---|
+| P25 | `Context::IsAlgoLive` and `GetServerPositionHeader`; `ServerPositionHeaders` is mapped by every context (it was `ServerContext`-only); `RiskLayer::ValidateOrder` checks both switches; `Server::OnControlAlgoStatus` turns the server row for strategy 0; `Server::WriteToRecord`; the master is set `Live` in `ServerContext::AllocateInstrument` |
+| P26 | `RiskLimit::MaxFillsPerSession` (28 bytes), `WorkingRisk::WorstLongQuantity`/`WorstShortQuantity`/`FillsThisSession` (20 bytes), `ControlRiskLimit::MaxFillsPerSession`, all asserted and in the JSON; reason 57 `TooManyFillsPerSession`; `RiskLayer::OnFill` counts, `OnSessionClosed` zeroes (server and client, on `Closed`); fills room in `ValidateOrder` after the position room and in `TryClipToRiskLimit`. The C++ client's simulation-only discard of 57 is deleted, as in C# |
+| P27 | Regions `ServerRiskLimits` (renamed) and `LocalRiskLimits` [client, instrument]; `ControlRiskLimit::StrategyId` @8 (28 bytes); `Context::GetRiskLimit(instrumentId)` is virtual (firm's on the server, the strategy's on a client); `GetRiskLimit(clientId, instrumentId)`, `GetServerRiskLimit`, `RiskLimit::FromFile`; the strategy's row is loaded in `ServerContext::AllocateInstrument(clientId, ...)`; the client ignores a `RiskLimit` (16) on its execution channel |
+
+**Not ported, no C++ caller:** `Position::IsAlgoLive` (C++ has no algo layer; a C++ algo would call `Context::IsAlgoLive`),
+and the C17 GUI helpers (`OrderState::NewCancel`, `Instrument::TicksToPriceString`/`PriceFormat`, `Context::DirectoryName`,
+`TryReadMarketByPrice64`). C++ already spells `TickDecimals` correctly.
+
+**Verified:** the JSON harness shows 0 of 159 files differing; the samples now carry `MaxFillsPerSession`, the renamed `WorkingRisk` fields with
+`FillsThisSession`, `ControlRiskLimit.StrategyId`, and reason 57 in an `OrderRejected` (its name and `IsDiscarded` false
+match). Against the real `ServerContext` and `RiskLayer`: a firm line without the field loads 0; the server's
+`GetRiskLimit` is the firm's row; a strategy's row loads from `<strategy>/RiskLimits`; the master starts `Live` over a
+`Paused` position file; master `Paused` makes `IsAlgoLive` false and leaves the strategy's row `Live`; with limit 10 and
+4/4 working, a buy of 3 fails the fills room and passes the position room, and a buy of 2 passes; fills of 4 and -2 count 6, and
+`OnSessionClosed` zeroes the count, not the position. `Server::OnControlAlgoStatus`/`OnControlRiskLimit` were not run end
+to end. CME builds against it unchanged.
+
+## 7. 2026-10-16: P26 updated (a manual order is never limited by fills)
+
+Ported against C# `edf71e4`. Nothing here asks C# to change code.
+
+- `WorkingRisk`, 24 bytes (asserted, in the JSON): `WorstWorkingLongQuantity` @8, `WorstWorkingShortQuantity` @12, `FillsThisSession` @16,
+  `WorstWorkingFills` @20.
+- `RiskLayer::ApplyWorstQuantityDelta` adds an algo order's delta to `WorstWorkingFills`; `OnFill` counts algo fills only; the
+  fills room is `MaxFillsPerSession - FillsThisSession - WorstWorkingFills`; `ValidateOrder` checks it for algo orders only.
+- **Verified:** the JSON harness shows 0 of 159 files differing. Against the real `ServerContext`/`RiskLayer`: the report's scenario (limit 10, 4/4
+  working: a buy of 3 refused on fills and 2 accepted) still holds with `WorstWorkingFills` 8; a manual fill moves the position and
+  leaves `FillsThisSession` unchanged; with the algo's fills at the limit it has no room, and a manual resting buy of 50 (which
+  reserves only `WorstWorkingLongQuantity`) leaves the algo's fills room as it was. CME builds against it unchanged.
+
+## 8. 2026-10-16: P28 (strategy exposure rows under the server's name)
+
+Ported against C# `d4f6402`. Nothing here asks C# to change code.
+
+- Regions `<server>/ServerWorkingRisks` (per instrument, the server's) and `<server>/LocalWorkingRisks` (per strategy and
+  instrument, mapped writable by the server and by the client) replace the per-directory `WorkingRisks`.
+  `Context::GetWorkingRisk(instrumentId)` is virtual: `ServerWorkingRisks[instrumentId]` on the server (range-checked),
+  `LocalWorkingRisks[clientId, instrumentId]` on a client.
+- `ServerContext::AllocateInstrument(clientId, instrumentId)` seeds `LocalWorkingRisks[clientId, instrumentId]` with the strategy's
+  position; the C++ client already reseeds its row at start, as C#'s does.
+- `GetServerRiskLimit` and `GetServerPositionHeader` are deleted, as in C#; the server calls its own `GetRiskLimit` and
+  `GetPositionHeader`.
+- Not ported, C#-only: `Application.DetachConsole`, the Publish packages, `WorkspaceConfig`.
+- **Verified:** against the real `ServerContext`, the strategy's `LocalWorkingRisks` row is written at allocation and `ServerWorkingRisks`
+  holds the firm's row; the rest of the P25–P27 test still passes; JSON harness shows 0 of 159 files differing; CME builds unchanged.
+
+## 9. 2026-10-16: P29, C18
+
+Ported against C# `a80baf2`. Nothing here asks C# to change code.
+
+- **P29: ported.** The C++ `RiskLayer` keeps `std::vector<OrderRisk>` (`OrdersCapacity` rows, by `OrderId::GlobalIndex`, zero at
+  start) behind a private `GetOrderRisk`. The `<directory>/OrderRisks` region and `Context::GetOrderRisk` are deleted. Logic unchanged.
+- **C18: nothing to port.** The C++ client keeps its own book replica in `<client>/MarketsByPrice`; `<server>/MarketsByPrice` is
+  unchanged.
+- **Verified:** the build is clean; the JSON harness shows 0 of 159 files differing; the P24–P28 `ServerContext`/`RiskLayer` tests still pass; CME builds unchanged.

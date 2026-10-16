@@ -101,16 +101,18 @@ namespace Provider
 	static_assert(Tools::PlainOldData<ControlAlgoStatus>);
 	static_assert(sizeof(ControlAlgoStatus) == 17, "ControlAlgoStatus must be 17 bytes");
 
-	// Operator request to change an instrument's risk limits. Sent on the instrument's CoreGroup
-	// EXECUTION channel (not admin), so the CoreGroup thread - the RiskLimit row's sole writer -
-	// applies it. A client never sends a RiskLimit row; the request carries only the two maxima.
+	// Operator request to change a risk limit: the firm's (StrategyId 0) or a strategy's. Sent on the instrument's CoreGroup
+	// EXECUTION channel (not admin), so the CoreGroup thread - every RiskLimit row's sole writer - applies it. The server owns
+	// every limit row and a client never sends one; the request carries only the config fields.
 	struct ControlRiskLimit final
 	{
 		Data::Header<ControlType> Header = Data::Header<ControlType>(ControlType::RiskLimit);
 		int32_t ClientId = -1;
+		int32_t StrategyId = -1;   // the row edited: 0 the firm's, otherwise that strategy's
 		int32_t InstrumentId = -1;
 		int32_t MaxOrderQuantity = 0;
 		int32_t MaxPositionQuantity = 0;
+		int32_t MaxFillsPerSession = 0;
 
 		std::string ToString() const
 		{
@@ -123,14 +125,17 @@ namespace Provider
 			static constexpr auto value = glz::object(
 				"Header", &T::Header,
 				"ClientId", &T::ClientId,
+				"StrategyId", &T::StrategyId,
 				"InstrumentId", &T::InstrumentId,
 				"MaxOrderQuantity", &T::MaxOrderQuantity,
-				"MaxPositionQuantity", &T::MaxPositionQuantity
+				"MaxPositionQuantity", &T::MaxPositionQuantity,
+				"MaxFillsPerSession", &T::MaxFillsPerSession
 			);
 		};
 	};
 	static_assert(Tools::PlainOldData<ControlRiskLimit>);
-	static_assert(sizeof(ControlRiskLimit) == 20, "ControlRiskLimit must be 20 bytes");
+	static_assert(sizeof(ControlRiskLimit) == 28, "ControlRiskLimit must be 28 bytes");
+	static_assert(offsetof(ControlRiskLimit, StrategyId) == 8 && offsetof(ControlRiskLimit, MaxFillsPerSession) == 24);
 
 	// One row per CoreGroup in the server-written CoreGroups shared array (index == CoreGroupId):
 	// the group's name and the cores its threads pin to. Loaded from <server>/CoreGroups/

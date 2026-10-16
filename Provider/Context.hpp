@@ -3,6 +3,7 @@
 
 #include "OrderIdAllocator.hpp"
 #include "Order.hpp"
+#include "RateLimit.hpp"
 
 #include "SeqLock.hpp"
 #include "Socket.hpp"
@@ -14,6 +15,7 @@
 #include "Allocate.hpp"
 #include "Timestamp.hpp"
 #include "Clock.hpp"
+#include "Session.hpp"
 #include "Tools.hpp"
 #include <cstdint>
 #include <fcntl.h>
@@ -104,6 +106,11 @@ public:
 		return directoryPath / "RiskLimits" / (symbol + ".risklimit");
 	}
 
+	static std::filesystem::path GetMessageEfficiencyFilePath(const std::filesystem::path& directoryPath, const std::string& productGroupRoot)
+	{
+		return directoryPath / "MessageEfficiency" / (productGroupRoot + ".messageefficiency");
+	}
+
 	static std::filesystem::path GetRateLimitFilePath(const std::filesystem::path& directoryPath, const std::string& coreGroupName)
 	{
 		return directoryPath / "RateLimits" / (coreGroupName + ".ratelimit");
@@ -131,6 +138,7 @@ public:
 	const std::filesystem::path PositionsDirectoryPath;
 	const std::filesystem::path AlertsDirectoryPath;
 	const std::filesystem::path RiskLimitsDirectoryPath;
+	const std::filesystem::path MessageEfficiencyDirectoryPath;
 	const std::filesystem::path RateLimitsDirectoryPath;
 	const std::filesystem::path CoreGroupsDirectoryPath;
 	const std::filesystem::path AuditDirectoryPath;
@@ -153,24 +161,31 @@ protected:
 	Socket::SharedArray<Data::MarketByPrice64> _marketsByPrice;
 
 	// execution
-	Socket::SharedArray<Execution::RiskLimit> _riskLimits;
+	Socket::SharedArray<Execution::RiskLimit> _serverRiskLimits;   // per instrument: the firm's limit, every order the server reads
+	// One row per product group (index == InstrumentHeader::ProductGroupId): the server claims, loads and ends each
+	// group's day; strategies count into it.
+	Socket::SharedArray<Execution::MessageEfficiency> _messageEfficiency;
 	// One row per CoreGroup, server-written. RollingRateLimit today; another model would be a
 	// different 64-byte view of the same row, cast by the caller (see Spec.md "Order rate limit").
 	Socket::SharedArray<Execution::RollingRateLimit> _rateLimits;
 	// One row per CoreGroup, server-written from its .coregroup file: the name and the core ids.
 	Socket::SharedArray<Provider::CoreGroup> _coreGroups;
 	Socket::SharedArray<Execution::OrderState> _orderStates;
-	// Reserved exposure per order slot, keyed by OrderId::GlobalIndex. Per context like the book: the
-	// server's covers every order, a client's only its own, and each has a single writer (its RiskLayer).
-	Socket::SharedArray<Execution::OrderRisk> _orderRisks;
 	Socket::SharedArray<Execution::OrderTarget> _orderTargets;
 	
 	// positions
 	Socket::SharedArray<Execution::PositionHeader> _localPositionHeaders;
 
-	// Last of the base arrays so the ids before it keep their mirror order. Per context like the book:
-	// the server's covers every order on the instrument, a client's only its own.
-	Socket::SharedArray<Execution::WorkingRisk> _workingRisks;
+	// Per instrument: every order on it, written by the server's RiskLayer (the firm's exposure).
+	Socket::SharedArray<Execution::WorkingRisk> _serverWorkingRisks;
+
+	// Per instrument: every strategy's fills summed; its AlgoStatus is the master switch every algo on the instrument checks.
+	Socket::SharedArray<Execution::PositionHeader> _serverPositionHeaders;
+	// Per strategy and instrument: the strategy's limit, its own RiskLayer's. The server loads and edits every row.
+	Socket::SharedArray<Execution::RiskLimit> _localRiskLimits;
+	// Per strategy and instrument: its own orders, written by that strategy's RiskLayer. Under the server's name so the Mirror
+	// copies them to a remote desk.
+	Socket::SharedArray<Execution::WorkingRisk> _localWorkingRisks;
 
 	// The allocation ThrowIfInstrumentIdOutOfRange tests: ServerHeader.InstrumentIds for the server,
 	// InstrumentIdsByClientId[ClientId] for a client (C# overrides it per context). Set by each derived
@@ -195,6 +210,7 @@ protected:
     PositionsDirectoryPath(directoryPath / "Positions"),
     AlertsDirectoryPath(directoryPath / "Alerts"),
     RiskLimitsDirectoryPath(directoryPath / "RiskLimits"),
+    MessageEfficiencyDirectoryPath(directoryPath / "MessageEfficiency"),
     RateLimitsDirectoryPath(directoryPath / "RateLimits"),
     CoreGroupsDirectoryPath(directoryPath / "CoreGroups"),
     AuditDirectoryPath(GetAuditDirectoryPath(directoryPath)),
@@ -207,14 +223,20 @@ protected:
     _instrumentIdsByClientId(serverName / "InstrumentIdsByClientId", ServerHeader().GetReadonlyRef().ClientIds.Length(), ServerAccess),
     _clientIdsByInstrumentId(serverName / "ClientIdsByInstrumentId", ServerHeader().GetReadonlyRef().InstrumentIds.Length(), ServerAccess),
     _marketsByPrice(directoryPath / "MarketsByPrice", ServerHeader().GetReadonlyRef().InstrumentIds.Length(), (directoryPath == serverName) ? serverAccess : clientAccess),
-    _riskLimits(serverName / "RiskLimits", ServerHeader().GetReadonlyRef().InstrumentIds.Length(), ServerAccess),
+    _serverRiskLimits(serverName / "ServerRiskLimits", ServerHeader().GetReadonlyRef().InstrumentIds.Length(), ServerAccess),
+    // Why writable on both sides: the server claims, loads and ends each group's day; strategies count into it
+    _messageEfficiency(serverName / "MessageEfficiency", ServerHeader().GetReadonlyRef().InstrumentIds.Length(), ServerAccess == Tools::Access::Write ? Tools::Access::Write : ClientAccess),
     _rateLimits(serverName / "RateLimits", ServerHeader().GetReadonlyRef().CoreGroupIds.Length(), ServerAccess),
     _coreGroups(serverName / "CoreGroups", ServerHeader().GetReadonlyRef().CoreGroupIds.Length(), ServerAccess),
     _orderStates(serverName / "OrderStates", ServerHeader().GetReadonlyRef().OrdersCapacity(), ServerAccess, false),
-    _orderRisks(directoryPath / "OrderRisks", ServerHeader().GetReadonlyRef().OrdersCapacity(), (directoryPath == serverName) ? serverAccess : clientAccess, false),
     _orderTargets(serverName / "OrderTargets", ServerHeader().GetReadonlyRef().OrdersCapacity(), ClientAccess, false),
     _localPositionHeaders(serverName / "LocalPositionHeaders", ServerHeader().GetReadonlyRef().LocalPositionsCapacity(), ServerAccess, false),
-    _workingRisks(directoryPath / "WorkingRisks", ServerHeader().GetReadonlyRef().InstrumentIds.Length(), (directoryPath == serverName) ? serverAccess : clientAccess)
+    _serverWorkingRisks(serverName / "ServerWorkingRisks", ServerHeader().GetReadonlyRef().InstrumentIds.Length(), ServerAccess),
+    // Why every context: its AlgoStatus is the master switch each algo checks
+    _serverPositionHeaders(serverName / "ServerPositionHeaders", ServerHeader().GetReadonlyRef().InstrumentIds.Length(), ServerAccess),
+    _localRiskLimits(serverName / "LocalRiskLimits", ServerHeader().GetReadonlyRef().LocalPositionsCapacity(), ServerAccess, false),
+    // Why writable on both sides: the server seeds each row at allocation, the strategy moves it
+    _localWorkingRisks(serverName / "LocalWorkingRisks", ServerHeader().GetReadonlyRef().LocalPositionsCapacity(), ServerAccess == Tools::Access::Write ? Tools::Access::Write : ClientAccess, false)
 	{
         std::cout << Tools::GetTypeName(typeid(*this)) << "(" << serverName << ", " << directoryPath.string() << ", "
                   << static_cast<int>(serverAccess) << ", " << static_cast<int>(clientAccess) << ")" << std::endl;
@@ -223,6 +245,7 @@ protected:
         std::filesystem::create_directories(PositionsDirectoryPath);
         std::filesystem::create_directories(AlertsDirectoryPath);
         std::filesystem::create_directories(RiskLimitsDirectoryPath);
+        std::filesystem::create_directories(MessageEfficiencyDirectoryPath);
         std::filesystem::create_directories(RateLimitsDirectoryPath);
         std::filesystem::create_directories(CoreGroupsDirectoryPath);
         std::filesystem::create_directories(AuditDirectoryPath);
@@ -282,11 +305,19 @@ public:
 		return _localPositionHeaders[localPositionIndex];
 	}
 
+	// An algo may trade the instrument only while both switches are Live: its strategy's row and the server's, the master switch
+	// a server workspace turns (see Spec.md "Algo pause"). Hot path: two plain byte reads.
+	ALWAYS_INLINE bool IsAlgoLive(int32_t strategyId, int32_t instrumentId)
+	{
+		return GetPositionHeader(strategyId, instrumentId).GetReadonlyRef().AlgoStatus == Execution::AlgoStatus::Live
+			&& _serverPositionHeaders[instrumentId].GetReadonlyRef().AlgoStatus == Execution::AlgoStatus::Live;
+	}
+
     virtual bool TryGetInstrumentId(int32_t instrumentIndex, int32_t& instrumentId) = 0;
 	virtual Tools::Bitset64 InstrumentIds() = 0;
 
 	// OrderStates and OrderTargets are ONE server-wide array (keyed by serverName), so every context is
-	// a view over the same storage; OrderRisks is this context's own copy. These used to be virtual, with ClientContext reading the argument
+	// a view over the same storage (OrderRisk rows live in each RiskLayer, not here). These used to be virtual, with ClientContext reading the argument
 	// as a local index and ServerContext as a global one - same signature, two meanings, so a caller
 	// holding a base Context could not know which to pass. Keyed by the id there is only one
 	// meaning: OrderId already carries clientId and localIndex, so GlobalIndex is exact and no
@@ -301,24 +332,22 @@ public:
 		return _orderTargets[orderId.GlobalIndex()];
 	}
 
-	Socket::SharedArrayEntry<Execution::OrderRisk>& GetOrderRisk(Execution::OrderId orderId)
+	// This context's own limit, the one its RiskLayer checks: the firm's on the server, the strategy's on a client (see Spec.md "Strategy risk limits").
+	virtual Socket::SharedArrayEntry<Execution::RiskLimit>& GetRiskLimit(int32_t instrumentId) = 0;
+
+	// Any strategy's limit on the instrument: the server loads and edits them; read-only on a client.
+	Socket::SharedArrayEntry<Execution::RiskLimit>& GetRiskLimit(int32_t clientId, int32_t instrumentId)
 	{
-		return _orderRisks[orderId.GlobalIndex()];
+		return _localRiskLimits[GetLocalPositionIndex(clientId, instrumentId)];
 	}
 
-	// server level - shared over all clients
-	Socket::SharedArrayEntry<Execution::RiskLimit>& GetRiskLimit(int32_t instrumentId)
+	Socket::SharedArrayEntry<Execution::MessageEfficiency>& GetMessageEfficiency(int32_t productGroupId)
 	{
-		ThrowIfInstrumentIdOutOfRange(instrumentId);
-		return _riskLimits[instrumentId];
+		return _messageEfficiency[productGroupId];
 	}
 
-	// This context's own: the server's or this client's (see _workingRisks).
-	Socket::SharedArrayEntry<Execution::WorkingRisk>& GetWorkingRisk(int32_t instrumentId)
-	{
-		ThrowIfInstrumentIdOutOfRange(instrumentId);
-		return _workingRisks[instrumentId];
-	}
+	// This context's own exposure, the one its RiskLayer moves and checks: the firm's on the server, the strategy's on a client.
+	virtual Socket::SharedArrayEntry<Execution::WorkingRisk>& GetWorkingRisk(int32_t instrumentId) = 0;
 
 	// One per CoreGroup, server-written (index == CoreGroupId).
 	// Finds a client by its exact name; false when no client has it.
@@ -522,8 +551,6 @@ protected:
 
 class ServerContext : public Context
 {
-	Socket::SharedArray<Execution::PositionHeader> _serverPositionHeaders;
-
 public:
 
 	// Server-only: the client and instrument allocations the server replays at startup. A client
@@ -558,7 +585,6 @@ public:
 
 	ServerContext(const std::filesystem::path& serverName, Tools::Access access)
     : Context(serverName.string(), serverName, access, Tools::Access::Read),
-      _serverPositionHeaders(ServerName / "ServerPositionHeaders", ServerHeader().GetReadonlyRef().InstrumentIds.Length(), ServerAccess),
       ClientsDirectoryPath(ServerName / "Clients"),
       InstrumentsDirectoryPath(ServerName / "Instruments"),
       ServerStrategyName(GetStrategyDirectoryPath(ServerName.filename().string()))
@@ -652,6 +678,20 @@ public:
 		return _serverPositionHeaders[instrumentId];
 	}
 
+	using Context::GetRiskLimit;
+
+	Socket::SharedArrayEntry<Execution::RiskLimit>& GetRiskLimit(int32_t instrumentId) override
+	{
+		ThrowIfInstrumentIdOutOfRange(instrumentId);
+		return _serverRiskLimits[instrumentId];
+	}
+
+	Socket::SharedArrayEntry<Execution::WorkingRisk>& GetWorkingRisk(int32_t instrumentId) override
+	{
+		ThrowIfInstrumentIdOutOfRange(instrumentId);
+		return _serverWorkingRisks[instrumentId];
+	}
+
 	Tools::Bitset64 InstrumentIds() override
 	{
 		Provider::ServerHeader serverHeader = ServerHeader().GetReadonlyRef();
@@ -725,6 +765,7 @@ public:
 
         Data::InstrumentHeader& header = header128.AsInstrumentHeader();
         header.InstrumentId = -1;
+        header.ProductGroupId = -1;
         header.InstrumentHeaderId = serverHeader.InstrumentsCount;
         Socket::SharedArrayEntry<Data::InstrumentHeader128> header128Entry = _instrumentHeaders[header.InstrumentHeaderId];
         header128Entry.Write(header128);
@@ -761,16 +802,7 @@ public:
 
 		std::unique_ptr<Data::Symbology> symbology = header128.Symbology();
 
-		std::string symbol = symbology->Symbol();
-		std::string riskLimitPath = GetRiskLimitsFilePath(DirectoryPath, symbol);
-		std::optional<std::string> riskLimitLine = Tools::ReadLastLine(riskLimitPath);
-        if (riskLimitLine.has_value())
-        {
-            std::cout << "Context::AllocateInstrument(" <<  symbol << ") Loaded RiskLimit: " << riskLimitLine.value() << std::endl;
-        }
-		Execution::RiskLimit riskLimit = riskLimitLine ? Tools::Json::Deserialize<Execution::RiskLimit>(riskLimitLine.value()) : (Tools::Clock::Mode() == Tools::ClockMode::Simulation ? Execution::RiskLimit::GetMaxLimits(instrumentId) : Execution::RiskLimit::GetMinLimits(instrumentId));
-		riskLimit.InstrumentId = instrumentId;
-        _riskLimits.GetEntry(instrumentId).Write(riskLimit);
+		_serverRiskLimits.GetEntry(instrumentId).Write(Execution::RiskLimit::FromFile(GetRiskLimitsFilePath(DirectoryPath, symbology->Symbol()).string(), instrumentId));
 
 		std::string positionPath = GetPositionFilePath(DirectoryPath, symbology->Symbol()).string();
 		std::optional<std::string> positionLine = Tools::ReadLastLine(positionPath);
@@ -778,9 +810,12 @@ public:
 		// Server-wide row: no owning order; a template id (Generation 0) carries the ids.
 		// Client 0 stands in for the old -1 sentinel (-1 is unrepresentable in 6 bits) - display/JSON-only change.
 		positionHeader.OrderHeader.OrderId = Execution::OrderId().InstrumentId(instrumentId);
+		// Why whatever the file says: the master switch is a kill switch, Live at every start until a server workspace pauses it
+		positionHeader.AlgoStatus = Execution::AlgoStatus::Live;
 		_serverPositionHeaders[instrumentId].Write(positionHeader);
-		_workingRisks[instrumentId].Write(Execution::WorkingRisk{ .Position = positionHeader.Quantity });
+		_serverWorkingRisks[instrumentId].Write(Execution::WorkingRisk{ .Position = positionHeader.Quantity });
 
+		header.ProductGroupId = static_cast<int8_t>(AllocateProductGroupId(header));   // Why a byte fits: one row per instrument id, at most 64
 		header.InstrumentId = instrumentId;
 		serverHeader.InstrumentIds.Set(instrumentId);
 
@@ -789,6 +824,38 @@ public:
 		return instrumentId;
 	}
 
+private:
+	// Returns the message-efficiency row of this instrument's product group, claiming the first empty row and loading the group's
+	// file into it on the group's first instrument. Admin thread, at allocation only.
+	int32_t AllocateProductGroupId(const Data::InstrumentHeader& header)
+	{
+		// Step 1: an instrument of a group already claimed shares its row
+		Tools::String4 productGroupRoot = header.ProductGroupRoot;
+		if (productGroupRoot.ToString().empty())
+			throw std::runtime_error("ServerContext::AllocateProductGroupId: instrument header " + std::to_string(header.InstrumentHeaderId) + " (" + header.Root.ToString() + ") has no ProductGroupRoot, must have one; the feed or simulator that builds the header sets it");
+		int32_t productGroupCount = ServerHeader().GetReadonlyRef().InstrumentIds.Length();
+		int32_t productGroupId = 0;
+		for (; productGroupId < productGroupCount && !_messageEfficiency[productGroupId].IsEmpty(); productGroupId++)
+		{
+			if (_messageEfficiency[productGroupId].GetReadonlyRef().ProductGroupRoot == productGroupRoot)
+				return productGroupId;
+		}
+		if (productGroupId == productGroupCount)
+			throw std::runtime_error("ServerContext::AllocateProductGroupId: " + productGroupRoot.ToString() + " needs a row, but all " + std::to_string(productGroupCount) + " are taken; raise InstrumentIds' capacity");
+
+		// Step 2: the group's first instrument claims the next row and loads the group's last day from its file
+		std::optional<std::string> messageEfficiencyLine = Tools::ReadLastLine(GetMessageEfficiencyFilePath(DirectoryPath, productGroupRoot.ToString()).string());
+		Execution::MessageEfficiency messageEfficiency = messageEfficiencyLine ? Tools::Json::Deserialize<Execution::MessageEfficiency>(messageEfficiencyLine.value()) : Tools::Clock::Mode() == Tools::ClockMode::Simulation ? Execution::MessageEfficiency::GetMaxLimits(productGroupRoot) : Execution::MessageEfficiency::GetMinLimits(productGroupRoot);
+		if (Tools::Clock::Mode() == Tools::ClockMode::Simulation)
+			messageEfficiency.TradeDate = Tools::DateTime::MinValue();
+		messageEfficiency.ProductGroupRoot = productGroupRoot;
+		messageEfficiency.ProductGroupId = productGroupId;
+		messageEfficiency.Reset(Tools::Session::CME().ConvertToLocal(Tools::Clock::UtcNow()));
+		_messageEfficiency.GetEntry(productGroupId).Write(messageEfficiency);
+		return productGroupId;
+	}
+
+public:
 	void AllocateInstrument(int32_t clientId, int32_t instrumentId)
 	{
 		int32_t instrumentHeaderId = GetInstrumentHeaderIdByInstrumentId(instrumentId).GetReadonlyRef();
@@ -827,6 +894,9 @@ public:
 		positionHeader.AlgoStatus = Tools::Clock::Mode() == Tools::ClockMode::Simulation ? Execution::AlgoStatus::Live : Execution::AlgoStatus::Paused;
 
 		GetPositionHeader(clientId, instrumentId).Write(positionHeader);
+		// Why the server seeds it too: the row is then readable (a remote desk's Risk Limits) before the strategy first runs; the strategy reseeds it at its start
+		_localWorkingRisks[GetLocalPositionIndex(clientId, instrumentId)].Write(Execution::WorkingRisk{ .Position = positionHeader.Quantity });
+		GetRiskLimit(clientId, instrumentId).Write(Execution::RiskLimit::FromFile(GetRiskLimitsFilePath(clientName, symbology->Symbol()).string(), instrumentId));
 
 		Socket::SharedArrayEntry<Tools::Bitset64>& instrumentIdsEntry = GetInstrumentIdsByClientId(clientId);
 		Socket::SharedArrayEntry<Tools::Bitset64>& clientIdsEntry = GetClientIdsByInstrumentId(instrumentId);
@@ -896,6 +966,18 @@ public:
 	{
 		int32_t localPositionIndex = GetLocalPositionIndex(ClientId, instrumentId);
 		return _localPositionHeaders[localPositionIndex];
+	}
+
+	using Context::GetRiskLimit;
+
+	Socket::SharedArrayEntry<Execution::RiskLimit>& GetRiskLimit(int32_t instrumentId) override
+	{
+		return GetRiskLimit(ClientId, instrumentId);
+	}
+
+	Socket::SharedArrayEntry<Execution::WorkingRisk>& GetWorkingRisk(int32_t instrumentId) override
+	{
+		return _localWorkingRisks[GetLocalPositionIndex(ClientId, instrumentId)];
 	}
 
 	Tools::Bitset64 InstrumentIds() override
