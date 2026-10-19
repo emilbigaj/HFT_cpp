@@ -102,7 +102,7 @@ public:
 
     static inline const Provider::ServerHeader DefaultServerHeader =
     {
-        .ServerName = Tools::String128("ServerName"),
+        .ServerName = Tools::String256("ServerName"),
         .Timestamp = Tools::Timestamp(0),
         .InstrumentsCapacity = 4096,
         .InstrumentsCount = 0,

@@ -93,8 +93,8 @@ namespace Socket
 #pragma pack(push, 1)
 	struct SocketHeader
 	{
-		Tools::String128 ServerName;
-		Tools::String128 ClientName;
+		Tools::String256 ServerName;   // 256 bytes since 2026-10-20: names are full folder paths
+		Tools::String256 ClientName;
 		Tools::Timestamp Timestamp;
 		int32_t ClientId = -1;
 		int32_t ClientProcessId = 0;
@@ -170,15 +170,15 @@ namespace Socket
 	};
 #pragma pack(pop)
 
-	static_assert(sizeof(SocketHeader) == 344);
-	static_assert(offsetof(SocketHeader, ClientName) == 128);
-	static_assert(offsetof(SocketHeader, Timestamp) == 256);
-	static_assert(offsetof(SocketHeader, ClientId) == 264);
-	static_assert(offsetof(SocketHeader, ClientProcessId) == 268);
-	static_assert(offsetof(SocketHeader, ClientToServerChannelCount) == 272);
-	static_assert(offsetof(SocketHeader, ServerToClientChannelCount) == 276);
-	static_assert(offsetof(SocketHeader, ClientToServerLengths) == 280);
-	static_assert(offsetof(SocketHeader, ServerToClientLengths) == 312);
+	static_assert(sizeof(SocketHeader) == 600);
+	static_assert(offsetof(SocketHeader, ClientName) == 256);
+	static_assert(offsetof(SocketHeader, Timestamp) == 512);
+	static_assert(offsetof(SocketHeader, ClientId) == 520);
+	static_assert(offsetof(SocketHeader, ClientProcessId) == 524);
+	static_assert(offsetof(SocketHeader, ClientToServerChannelCount) == 528);
+	static_assert(offsetof(SocketHeader, ServerToClientChannelCount) == 532);
+	static_assert(offsetof(SocketHeader, ClientToServerLengths) == 536);
+	static_assert(offsetof(SocketHeader, ServerToClientLengths) == 568);
 	static_assert(Tools::PlainOldData<SocketHeader>);
 
 	enum class ClientStatus : uint8_t

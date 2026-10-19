@@ -40,7 +40,7 @@ namespace Provider
 	{
 		Data::Header<AllocateType> Header = Data::Header<AllocateType>(AllocateType::Client);
 		int32_t ClientId = 0;
-		Tools::String128 ClientName;
+		Tools::String256 ClientName;
 
 		std::string ToString() const
 		{
@@ -175,7 +175,7 @@ namespace Provider
 
 	struct ServerHeader final
 	{
-		Tools::String128 ServerName;
+		Tools::String256 ServerName;   // 256 bytes since 2026-10-20 (was 128): names are full folder paths
 		Tools::Timestamp Timestamp;
 		int32_t InstrumentsCapacity = 4096;
 		int32_t InstrumentsCount = 0;
@@ -194,7 +194,7 @@ namespace Provider
 		// WIRE FIELD — the C# side must mirror it byte-for-byte.
 		bool Persistance = true;
 
-		// WIRE FIELD, offset 173: the publishing server's process id, stamped by ServerContext::Connect; a new value means the server restarted.
+		// WIRE FIELD, offset 301: the publishing server's process id, stamped by ServerContext::Connect; a new value means the server restarted.
 		int32_t ServerProcessId = 0;
 
 		int32_t OrdersCapacity() const
@@ -228,7 +228,7 @@ namespace Provider
 	};
 	static_assert(Tools::PlainOldData<ServerHeader>);
 	// ServerProcessId is the newest wire field; C# asserts the same size at type-init.
-	static_assert(sizeof(ServerHeader) == 177 && offsetof(ServerHeader, Persistance) == 172 && offsetof(ServerHeader, ServerProcessId) == 173);
+	static_assert(sizeof(ServerHeader) == 305 && offsetof(ServerHeader, Persistance) == 300 && offsetof(ServerHeader, ServerProcessId) == 301);
 	static_assert(offsetof(AllocateInstrument, ClientId) == 4
 		&& offsetof(AllocateInstrument, InstrumentHeaderId) == 8
 		&& offsetof(AllocateInstrument, InstrumentId) == 12

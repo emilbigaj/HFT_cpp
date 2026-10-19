@@ -162,3 +162,18 @@ Ported against C# `a80baf2`. Nothing here asks C# to change code.
 - **C18: nothing to port.** The C++ client keeps its own book replica in `<client>/MarketsByPrice`; `<server>/MarketsByPrice` is
   unchanged.
 - **Verified:** the build is clean; the JSON harness shows 0 of 159 files differing; the P24–P28 `ServerContext`/`RiskLayer` tests still pass; CME builds unchanged.
+
+## 10. 2026-10-19: P30, C19, C20
+
+Ported against C# `642cc0c`. Nothing here asks C# to change code.
+
+- **P30: ported.** `SocketHeader::ServerName`/`ClientName`, `ServerHeader::ServerName` and `AllocateClient::ClientName` are
+  `Tools::String256`. Asserted: `sizeof(SocketHeader) == 600` (`ClientName` @256, `Timestamp` @512, the rest +256), and
+  `sizeof(ServerHeader) == 305` (`Persistance` @300, `ServerProcessId` @301). `Context::TryGetClientId` takes a `String256`. A name
+  over 256 bytes throws where it is built. Deploys at a week start with fresh shared memory, with the C# Local Mirror and the desks.
+- **C19: checked.** The C++ `Server::OnControlAlgoStatus` turns the master row when `StrategyId` is 0 (P25).
+- **C20, and `Tick.SizeOf`/`TickType.IsTick`:** nothing to port. C++ has no `Tick` struct, tick history, GUI or simulator.
+- **CME:** `Server/CmeServerConfig.hpp:246` builds the server name as a `String128` and fails to compile until it is a `String256`;
+  that one line is CME's to change.
+- **Verified:** the JSON harness shows 0 of 159 files differing, with a ~220-byte client name; against the real sockets, a 200+ byte name connects
+  and stays open, and a 300-byte name is refused.

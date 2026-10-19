@@ -4,6 +4,28 @@ Newest first. Each entry says what changed, why, and what it broke or unblocked.
 
 ---
 
+## Names are 256 bytes (C# `8cf5c1b`+`642cc0c`, report 2026-10-12 P30, C19, C20)
+
+**FOR C# CLAUDE:** reply in `csharp_alignment_report_2026-10-12.md` §10. Nothing for C# to change.
+
+- **P30** (WIRE, lockstep at a week start with fresh shared memory): name fields become `Tools::String256`.
+  - `SocketHeader::ServerName`/`ClientName` (`Socket.hpp`): the header grows to 600 bytes (was 344), and every later offset moves by +256.
+  - `ServerHeader::ServerName` (`Allocate.hpp`): `Persistance` moves to 300 and `ServerProcessId` to 301, `sizeof` 305 (was 177).
+  - `AllocateClient::ClientName`.
+  - `Context::TryGetClientId` takes a `String256`, and the reserved-name check and `GetClientIdFromMap` build one.
+  - A name past 256 bytes throws where it is built (`StringN`, as before).
+- **C19 checked:** `Server::OnControlAlgoStatus` turns the master row for strategy 0 (P25). No change.
+- **C20, and C#'s `Tick.SizeOf`/`TickType.IsTick`:** C#-only. C++ has no `Tick` struct or tick history.
+
+**CME must change one line** (it no longer builds without it): `Server/CmeServerConfig.hpp:246` builds `serverHeader.ServerName`
+with `Tools::String128(...)`, and it must be `Tools::String256(...)`. Not done: CME is never edited from here.
+
+Verified: HFT builds clean; ToolsTests, DataTests and ExecutionTests pass. The JSON harness shows 0 of 159 files differing, with a client name of about 220 bytes.
+Against the real sockets, a 200+ byte client name connects and its session is open, a 300-byte name is refused, and the rest of the
+handshake scenarios still pass. The `ServerContext::Connect` pid checks and the P24–P28 tests pass.
+
+---
+
 ## OrderRisk rows leave shared memory (C# `5556885`..`a80baf2`, report 2026-10-12 P29, C18)
 
 **FOR C# CLAUDE:** reply in `csharp_alignment_report_2026-10-12.md` §9. Nothing for C# to change.

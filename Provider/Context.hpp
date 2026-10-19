@@ -351,7 +351,7 @@ public:
 
 	// One per CoreGroup, server-written (index == CoreGroupId).
 	// Finds a client by its exact name; false when no client has it.
-	bool TryGetClientId(const Tools::String128& clientName, int32_t& clientId)
+	bool TryGetClientId(const Tools::String256& clientName, int32_t& clientId)
 	{
 		for (int32_t candidateClientId : ServerHeader().GetReadonlyRef().ClientIds)
 		{
@@ -709,7 +709,7 @@ public:
     {       
         // The server's leaf name is reserved for strategy 0's directory — a client named after the
         // server would share the house book's files. See Spec.md.
-        if (socketHeader.ClientName == Tools::String128(ServerStrategyName.string()))
+        if (socketHeader.ClientName == Tools::String256(ServerStrategyName.string()))
             return static_cast<int32_t>(Socket::ConnectRefusal::ReservedClientName);
 
         Socket::SharedArrayEntry<Provider::ServerHeader>& serverHeaderEntry = ServerHeader();
@@ -954,7 +954,7 @@ public:
 	int32_t GetClientIdFromMap(const std::string& clientName)
 	{
 		int32_t clientId = -1;
-		if (TryGetClientId(Tools::String128(clientName), clientId))
+		if (TryGetClientId(Tools::String256(clientName), clientId))
 			return clientId;
 		throw std::runtime_error(std::string(typeid(*this).name()) + ".GetClientIdFromMap(" + clientName + "), Client not connected to server '" + ServerName.string() + "'.");
 	}
