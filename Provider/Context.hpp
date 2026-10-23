@@ -152,7 +152,7 @@ protected:
 	Socket::SharedArray<Socket::SocketHeader> _clientSocketHeaders;
 
 	// instruments
-	Socket::SharedArray<Data::InstrumentHeader128> _instrumentHeaders;
+	Socket::SharedArray<Data::InstrumentHeader256> _instrumentHeaders;
 	Socket::SharedArray<int32_t> _instrumentHeaderIdByInstrumentId;
 	
 	// subscriptions
@@ -332,6 +332,68 @@ public:
 		return _orderTargets[orderId.GlobalIndex()];
 	}
 
+	// Calls onOrder(state, target) for every working order, optionally of one instrument (-1: all) and one strategy (-1: all), as C#'s
+	// EnumerateOrders walks them. An order counts once the server's state row is about it and not Done; before that only a Create
+	// of inFlightClientId that is still in flight counts (with an InFlight state), so another client's order shows once the server has it.
+	template <typename OnOrder>
+	void EnumerateOrders(int32_t instrumentId, int32_t strategyId, int32_t inFlightClientId, OnOrder&& onOrder)
+	{
+		int32_t lastGlobalOrderIndex = Execution::OrderIdAllocator::GetLastGlobalIndex(ServerHeader().GetReadonlyRef().ClientIds.Length() - 1);
+		for (int32_t globalOrderIndex = 0; globalOrderIndex <= lastGlobalOrderIndex; globalOrderIndex++)
+		{
+			// Why: by the target row: a Create the server has not answered yet has no state row in a fresh slot
+			Socket::SharedArrayEntry<Execution::OrderTarget>& targetEntry = _orderTargets[globalOrderIndex];
+			if (targetEntry.IsEmpty())
+				continue;
+			Socket::SharedArrayEntry<Execution::OrderState>& stateEntry = _orderStates[globalOrderIndex];
+			const Execution::OrderState& state = stateEntry.GetReadonlyRef();
+			const Execution::OrderTarget& target = targetEntry.GetReadonlyRef();
+
+			Execution::OrderState currentState;
+			Execution::OrderTarget currentTarget;
+			bool isListed = false;
+			while (true)
+			{
+				uint64_t stateSeq0 = stateEntry.GetSeq();
+				uint64_t targetSeq0 = targetEntry.GetSeq();
+
+				// Why: skipped this walk, not retried: a live writer finishes in nanoseconds, but a row a dead client left mid-write would spin this forever
+				if (Socket::Protocol::IsWriteInProgress(stateSeq0) || Socket::Protocol::IsWriteInProgress(targetSeq0))
+					break;
+
+				if ((instrumentId != -1 && target.OrderHeader.OrderId.InstrumentId() != instrumentId)
+					|| (strategyId != -1 && target.OrderHeader.OrderId.StrategyId() != strategyId)
+					|| target.OrderHeader.OrderId == Execution::OrderId())
+					break;
+
+				// Why: until the server's row is about this order, the client's row says whether one is in flight
+				bool isSameOrder = state.OrderHeader.OrderId == target.OrderHeader.OrderId;
+				bool isDone = isSameOrder ? state.OrderStateStatus == Execution::OrderStateStatus::Done
+					: target.OrderTargetStatus != Execution::OrderStateStatus::Active || target.OrderHeader.OrderId.ClientId() != inFlightClientId;
+				if (isDone)
+				{
+					if (stateSeq0 != stateEntry.GetSeq() || targetSeq0 != targetEntry.GetSeq())
+						continue;
+					break;
+				}
+
+				currentTarget = target;
+				if (isSameOrder)
+					currentState = state;
+				else
+					Execution::OrderState::NewInFlight(currentTarget, currentState);
+
+				if (stateSeq0 == stateEntry.GetSeq() && targetSeq0 == targetEntry.GetSeq())
+				{
+					isListed = true;
+					break;
+				}
+			}
+			if (isListed)
+				onOrder(currentState, currentTarget);
+		}
+	}
+
 	// This context's own limit, the one its RiskLayer checks: the firm's on the server, the strategy's on a client (see Spec.md "Strategy risk limits").
 	virtual Socket::SharedArrayEntry<Execution::RiskLimit>& GetRiskLimit(int32_t instrumentId) = 0;
 
@@ -395,7 +457,7 @@ public:
 	}
 
 	// Common shared memory accessors
-	Socket::SharedArrayEntry<Data::InstrumentHeader128>& GetInstrumentHeader(int32_t instrumentHeaderId)
+	Socket::SharedArrayEntry<Data::InstrumentHeader256>& GetInstrumentHeader(int32_t instrumentHeaderId)
 	{
 		ThrowIfInstrumentHeaderIdOutOfRange(instrumentHeaderId);
 		return _instrumentHeaders[instrumentHeaderId];
@@ -496,20 +558,20 @@ protected:
         if (_instruments[static_cast<size_t>(instrumentId)])
             return;
 
-		Socket::SharedArrayEntry<Data::InstrumentHeader128>& header128Entry = GetInstrumentHeader(instrumentHeaderId);
-		const Data::InstrumentHeader& instrHeader = header128Entry.GetReadonlyRef().AsInstrumentHeader();
+		Socket::SharedArrayEntry<Data::InstrumentHeader256>& header256Entry = GetInstrumentHeader(instrumentHeaderId);
+		const Data::InstrumentHeader& instrHeader = header256Entry.GetReadonlyRef().AsInstrumentHeader();
 
 		Socket::SharedArrayEntry<Data::MarketByPrice64>& mbpEntry = _marketsByPrice[instrumentId];
 		std::unique_ptr<Data::Instrument> instrument = nullptr;
 
 		if (instrHeader.InstrumentType == Data::InstrumentType::Future)
 		{
-			instrument = std::make_unique<class Data::Future>(instrumentId, header128Entry.Cast<Data::FutureHeader>(), mbpEntry);
+			instrument = std::make_unique<class Data::Future>(instrumentId, header256Entry.Cast<Data::FutureHeader>(), mbpEntry);
 		}
 		else if (instrHeader.InstrumentType == Data::InstrumentType::Spread)
 		{
 			// Legs reference sibling headers; long = the positive-weight leg (2-leg spreads only: Client::GetInstrument refuses any other shape).
-			Data::LeggedHeader leggedHeader = header128Entry.GetReadonlyRef().AsLegged();
+			Data::LeggedHeader leggedHeader = header256Entry.GetReadonlyRef().AsLegged();
 			class Data::Future* longLeg = nullptr;
 			class Data::Future* shortLeg = nullptr;
 			for (const Data::LegHeader& legHeader : leggedHeader.Legs())
@@ -523,11 +585,11 @@ protected:
 			// C# throws here too: Spread's constructor dereferences both legs.
 			if (!longLeg || !shortLeg)
 				throw std::runtime_error(std::string(typeid(*this).name()) + ".CreateInstrument(" + std::to_string(instrumentId) + "), spread header must carry one positive and one negative leg.");
-			instrument = std::make_unique<class Data::Spread>(instrumentId, header128Entry.Cast<Data::LeggedHeader>(), mbpEntry, *longLeg, *shortLeg);
+			instrument = std::make_unique<class Data::Spread>(instrumentId, header256Entry.Cast<Data::LeggedHeader>(), mbpEntry, *longLeg, *shortLeg);
 		}
 		else if (instrHeader.InstrumentType == Data::InstrumentType::Forex)
 		{
-			instrument = std::make_unique<class Data::Forex>(instrumentId, header128Entry.Cast<Data::ForexHeader>(), mbpEntry);
+			instrument = std::make_unique<class Data::Forex>(instrumentId, header256Entry.Cast<Data::ForexHeader>(), mbpEntry);
 		}
 		else
 		{
@@ -544,8 +606,8 @@ protected:
     int32_t GetInstrumentId(int32_t instrumentHeaderId) 
     {
 		ThrowIfInstrumentHeaderIdOutOfRange(instrumentHeaderId);
-		const Data::InstrumentHeader128& header128 = _instrumentHeaders[instrumentHeaderId].GetReadonlyRef();
-		return header128.AsInstrumentHeader().InstrumentId;
+		const Data::InstrumentHeader256& header256 = _instrumentHeaders[instrumentHeaderId].GetReadonlyRef();
+		return header256.AsInstrumentHeader().InstrumentId;
 	}
 };
 
@@ -756,19 +818,19 @@ public:
 		return true;
 	}
 
-    void OnInstrumentHeader(Data::InstrumentHeader128& header128)
+    void OnInstrumentHeader(Data::InstrumentHeader256& header256)
     {
         Socket::SharedArrayEntry<Provider::ServerHeader> serverHeaderEntry = ServerHeader();
         Provider::ServerHeader& serverHeader = serverHeaderEntry.GetRef();
         if (serverHeader.InstrumentsCount >= serverHeader.InstrumentsCapacity)
             throw std::out_of_range("Server::OnInstrumentHeader: InstrumentsCount(" + std::to_string(serverHeader.InstrumentsCount) + ") >= InstrumentsCapacity(" + std::to_string(serverHeader.InstrumentsCapacity) + ")");
 
-        Data::InstrumentHeader& header = header128.AsInstrumentHeader();
+        Data::InstrumentHeader& header = header256.AsInstrumentHeader();
         header.InstrumentId = -1;
         header.ProductGroupId = -1;
         header.InstrumentHeaderId = serverHeader.InstrumentsCount;
-        Socket::SharedArrayEntry<Data::InstrumentHeader128> header128Entry = _instrumentHeaders[header.InstrumentHeaderId];
-        header128Entry.Write(header128);
+        Socket::SharedArrayEntry<Data::InstrumentHeader256> header256Entry = _instrumentHeaders[header.InstrumentHeaderId];
+        header256Entry.Write(header256);
 
         serverHeaderEntry.AcquireLock();
         serverHeader.InstrumentsCount++;
@@ -779,9 +841,9 @@ public:
 	{
 		Socket::SharedArrayEntry<Provider::ServerHeader> serverHeaderEntry = ServerHeader();
 		Provider::ServerHeader& serverHeader = serverHeaderEntry.GetRef();
-		Socket::SharedArrayEntry<Data::InstrumentHeader128>& header128Entry = GetInstrumentHeader(instrumentHeaderId);
-		Data::InstrumentHeader128& header128 = header128Entry.GetRef();
-		Data::InstrumentHeader& header = header128.AsInstrumentHeader();
+		Socket::SharedArrayEntry<Data::InstrumentHeader256>& header256Entry = GetInstrumentHeader(instrumentHeaderId);
+		Data::InstrumentHeader256& header256 = header256Entry.GetRef();
+		Data::InstrumentHeader& header = header256.AsInstrumentHeader();
 
 		int32_t instrumentId = header.InstrumentId;
 		if (instrumentId >= 0 && GetInstrumentHeaderIdByInstrumentId(instrumentId).GetReadonlyRef() == instrumentHeaderId)
@@ -800,7 +862,7 @@ public:
 		_clientIdsByInstrumentId[instrumentId].Write(Tools::Bitset64{});
 		_instrumentHeaderIdByInstrumentId[instrumentId].Write(instrumentHeaderId);
 
-		std::unique_ptr<Data::Symbology> symbology = header128.Symbology();
+		std::unique_ptr<Data::Symbology> symbology = header256.Symbology();
 
 		_serverRiskLimits.GetEntry(instrumentId).Write(Execution::RiskLimit::FromFile(GetRiskLimitsFilePath(DirectoryPath, symbology->Symbol()).string(), instrumentId));
 
@@ -872,8 +934,8 @@ public:
 		if (GetInstrumentIdsByClientId(clientId).GetReadonlyRef()[instrumentId])
 			return;
 
-		Data::InstrumentHeader128& header128 = GetInstrumentHeader(instrumentHeaderId).GetRef();
-		std::unique_ptr<Data::Symbology> symbology = header128.Symbology();
+		Data::InstrumentHeader256& header256 = GetInstrumentHeader(instrumentHeaderId).GetRef();
+		std::unique_ptr<Data::Symbology> symbology = header256.Symbology();
 
 		// Strategy 0 has no socket to take a name from; its book lives at ServerStrategyName (see Spec.md).
 		std::string clientName = clientId == Execution::OrderIdAllocator::ServerStrategyId

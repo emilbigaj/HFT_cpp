@@ -31,7 +31,7 @@ public:
         Tools::Clock::SetMode(Tools::ClockMode::Simulation);
     }
 
-    Data::InstrumentHeader128 GetInstrumentHeader()
+    Data::InstrumentHeader256 GetInstrumentHeader()
     {
         std::string exchange = "XCME";
         std::string root = "6E";
@@ -40,20 +40,20 @@ public:
 
         for(int instrumentHeaderId = 0; instrumentHeaderId < _client.ClientContext.ServerHeader().GetReadonlyRef().InstrumentsCount; instrumentHeaderId++)
         {
-            Data::InstrumentHeader128 header128 = _client.ClientContext.GetInstrumentHeader(instrumentHeaderId).Read();
-            Data::InstrumentHeader& header = header128.AsInstrumentHeader();
+            Data::InstrumentHeader256 header256 = _client.ClientContext.GetInstrumentHeader(instrumentHeaderId).Read();
+            Data::InstrumentHeader& header = header256.AsInstrumentHeader();
 
             // A realtime context holds spreads and unfilled slots too; AsFuture on those is a bad cast.
             if (header.InstrumentType != Data::InstrumentType::Future)
                 continue;
 
-            Data::FutureHeader& future = header128.AsFuture();
+            Data::FutureHeader& future = header256.AsFuture();
 
             if(header.Exchange == "XCME" && header.Root == "6E")
             {
                 if (future.MaturityDate >= expiry)
                 {
-                    return header128;
+                    return header256;
                 }
             }
         }
@@ -63,7 +63,7 @@ public:
 
     void BuildStrategy()
     {
-        Data::InstrumentHeader128 instrumentHeader128 = GetInstrumentHeader();
+        Data::InstrumentHeader256 instrumentHeader128 = GetInstrumentHeader();
 
         Data::Instrument& instrument = _client.GetInstrument(instrumentHeader128.AsInstrumentHeader().InstrumentHeaderId);
 

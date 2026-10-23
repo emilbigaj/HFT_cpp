@@ -177,3 +177,58 @@ Ported against C# `642cc0c`. Nothing here asks C# to change code.
   that one line is CME's to change.
 - **Verified:** the JSON harness shows 0 of 159 files differing, with a ~220-byte client name; against the real sockets, a 200+ byte name connects
   and stays open, and a 300-byte name is refused.
+
+## 11. 2026-10-19: P31, and the client audit-folder note
+
+Ported against C# `5497ba0`. Nothing here asks C# to change code.
+
+- **P31: ported.** `Server::ReadExecution`'s `ControlType::AlgoStatus` case calls `CancelAlgoOrders(strategyId, instrumentId)`
+  after `OnControlAlgoStatus` when the status is `Paused`. It walks the instrument's orders (every strategy's for strategy 0, that strategy's
+  otherwise) and cancels only the algo ones, using `OrderState::NewCancel()` with
+  `Seq` = target seq + `OrderTarget::s_foreignCancelSeqJump` (1,000,000) and `NicTimestamp` = now. It sends each cancel through
+  `SendServerOrderTarget` (written to the owner's execution channel, then `OnOrderTarget`), which the injected-cancel drain now
+  uses too. `TryCloseOutOrders` uses the named constant. A reject's pause still calls `OnControlAlgoStatus` alone. The walk is
+  the new `Context::EnumerateOrders(instrumentId, strategyId, inFlightClientId, onOrder)`, with the same rules as C#'s
+  `OrderEnumerator` (callback form; no allocation).
+- **Client audit folder:** nothing to drop. The C++ client never creates `<name>/Audit` before `Connect`; its `ClientContext`
+  creates its folders after the server accepts it.
+- **Verified:** against the real `ServerContext` with eight hand-written orders, the selection is exactly as C#'s verify describes: a master Pause
+  takes every strategy's working algo orders, a strategy's Pause takes only that strategy's, and Done, unread, other-instrument
+  and manual orders (a GUI's booked to a strategy, the house book's) are never taken; each cancel carries seq + 1,000,000.
+  The full server path was not run end to end. JSON harness shows 0 of 159 files differing; CME builds.
+
+## 12. 2026-10-19: P32, C21
+
+Ported against C# `91d7805`. Nothing here asks C# to change code.
+
+- **P32: the row is ported.** `MessageEfficiency::TierEMT` (was `Tier0`, offset 20), `EMTWeightedMessages` @84, 92 bytes (asserted).
+  `Reset` zeroes `EMTWeightedMessages`. `EMTEfficiency()` is written second in the JSON, after `Efficiency`, and never read.
+  `GetMinLimits` gives `TierEMT` 1,000,000 / 500 and leaves the other tiers 0.
+- **Counting is not ported:** `CanSend`, `Send`, `GetMEPTier`, the tier helpers (`IsApplied`, `IsWithin`, `GetWarningRatio`,
+  `GetMEPWarningRatio`) and the weighter. The user decided on 2026-10-13 that only C# uses message efficiency; C++ only
+  reads and writes the row (the server claims, loads, resets and posts it). The report's "call the weights directly in C++ too"
+  therefore has no C++ call site.
+- **C21:** nothing to port (C# display only).
+- **Verified:** the JSON harness shows 0 of 161 files differing, against `91d7805`. It covers the new `GetMinLimits`, an old `"Tier0"` line (it loads `TierEMT` 0
+  on both sides), and the report's new-form line (`EMTEfficiency` written equal). The P24 `ServerContext` test passes on the 92-byte row; CME builds.
+
+## 13. 2026-10-22: P33–P36, C22–C25
+
+Ported against C# `d7f8ea6`. Nothing here asks C# to change code.
+
+- **P33: ported.** `Data::InstrumentHeader` is 128 bytes (`TradingStatusTimestamp` @64, 56 reserved), `InstrumentHeader256` (renamed
+  as in C#) is 256, `LeggedHeader` 192, and type-specific fields start at 128; all asserted, JSON identical. `Server::OnTradingStatusUpdate`
+  stores the time, then the status (`std::atomic_ref` release store), only on a change. `NotInSessionInFlight = 47`, discard mask
+  `0x0100FF0000000000`. `RiskLayer::GetNotInSessionReason`, `NotInSessionInFlightWindow` = 1 s. `Server::OnOrderRejected`
+  rewrites per bit (`Bitset64::Replace`). C++ readers take references into the row, never a copy they point into.
+- **P34: ported.** The per-update `ServerHeader.Timestamp` store is deleted. The C++ side had found the same line in a
+  cache-contention review the day before.
+- **P35: ported.** `RiskLayer::MaySend`; the server's create check uses it.
+- **P36: ported.** `ServerSocket::PollLetterBox` peeks, decides, then empties the letterbox before the refusal reply or `OpenClient`.
+- **C23 check (CME):** iLink order reports carry `TransactTime` in `OrderHeader.ExchangeTimestamp`, and MDP incremental book ticks carry the
+  event's `TransactTime`. Two recovery paths, a snapshot-recovered book and the removals-only reset, carry the packet's `SendingTime`; a
+  quote after a recovery may hold until the next incremental.
+- **CME:** the `NotInSession` mapping is already in place. CME still has to rename `InstrumentHeader128` to `InstrumentHeader256` before it builds.
+- **Verified:** the JSON harness shows 0 of 161 files differing. Against the real `ServerContext`/`RiskLayer`: the window (47 at 0.5 s and at exactly 1 s, 50 at 1.5 s),
+  the session rule (a create in Auction passes, Halted/Unknown refuse it, the full `MaySend` table), and the rewrite of
+  `OrderNotFound|NotInSession` to `StateIsDone|NotInSessionInFlight`, discarded. The real-socket handshake still passes with the peek.

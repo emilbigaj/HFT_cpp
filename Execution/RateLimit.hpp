@@ -46,7 +46,7 @@ namespace Execution
 		Data::Header<OrderType> Header = Data::Header<OrderType>(OrderType::MessageEfficiency);   //  0, 4   the server posts the row itself on its audit channel
 		Tools::DateTime TradeDate;                                                                 //  4, 8
 		Tools::TimeSpan TradeTime;                                                                 // 12, 8
-		MessageEfficiencyTier Tier0;                                                               // 20, 8
+		MessageEfficiencyTier TierEMT;                                                             // 20, 8   CME's iLink session Excessive Messaging Threshold, judged on EMTWeightedMessages (was Tier0)
 		MessageEfficiencyTier Tier1;                                                               // 28, 8
 		MessageEfficiencyTier Tier2;                                                               // 36, 8
 		MessageEfficiencyTier Tier3;                                                               // 44, 8
@@ -56,6 +56,7 @@ namespace Execution
 		double WeightedMessages = 0;                                                               // 64, 8
 		double InverseQuantityTraded = 1;                                                          // 72, 8
 		int32_t QuantityTraded = 0;                                                                // 80, 4
+		double EMTWeightedMessages = 0;                                                            // 84, 8   the EMT's score: as WeightedMessages, without the overnight discount
 
 		// Starts the next day once dateTime reaches the day's end; true when it did.
 		bool Reset(Tools::DateTime dateTime)
@@ -66,6 +67,7 @@ namespace Execution
 				TradeDate = dateTime.Date().AddDays(1);
 				RawMessages = 0;
 				WeightedMessages = 0;
+				EMTWeightedMessages = 0;
 				QuantityTraded = 0;
 				InverseQuantityTraded = 1;
 				return true;
@@ -76,6 +78,11 @@ namespace Execution
 		double Efficiency() const
 		{
 			return WeightedMessages * InverseQuantityTraded;
+		}
+
+		double EMTEfficiency() const
+		{
+			return EMTWeightedMessages * InverseQuantityTraded;
 		}
 
 		void OnFill(int32_t quantity)
@@ -89,16 +96,16 @@ namespace Execution
 		{
 			MessageEfficiency messageEfficiency;
 			messageEfficiency.ProductGroupRoot = productGroupRoot;
-			messageEfficiency.Tier0 = messageEfficiency.Tier1 = messageEfficiency.Tier2 = messageEfficiency.Tier3 = MessageEfficiencyTier{ .DailyRawMessages = INT32_MAX, .Benchmark = INT32_MAX };
+			messageEfficiency.TierEMT = messageEfficiency.Tier1 = messageEfficiency.Tier2 = messageEfficiency.Tier3 = MessageEfficiencyTier{ .DailyRawMessages = INT32_MAX, .Benchmark = INT32_MAX };
 			return messageEfficiency;
 		}
 
-		// Restrictive default (live until configured): zero tiers block every message.
+		// Realtime default for a group with no file: no MEP program (tiers of 0), and CME's EMT, which applies to every group.
 		static MessageEfficiency GetMinLimits(Tools::String4 productGroupRoot)
 		{
 			MessageEfficiency messageEfficiency;
 			messageEfficiency.ProductGroupRoot = productGroupRoot;
-			messageEfficiency.Tier0 = messageEfficiency.Tier1 = messageEfficiency.Tier2 = messageEfficiency.Tier3 = MessageEfficiencyTier{ .DailyRawMessages = 0, .Benchmark = 0 };
+			messageEfficiency.TierEMT = MessageEfficiencyTier{ .DailyRawMessages = 1'000'000, .Benchmark = 500 };
 			return messageEfficiency;
 		}
 
@@ -112,10 +119,11 @@ namespace Execution
 			using T = MessageEfficiency;
 			static constexpr auto value = glz::object(
 				"Efficiency", glz::custom<glz::skip{}, &T::Efficiency>,
+				"EMTEfficiency", glz::custom<glz::skip{}, &T::EMTEfficiency>,
 				"Header", &T::Header,
 				"TradeDate", &T::TradeDate,
 				"TradeTime", &T::TradeTime,
-				"Tier0", &T::Tier0,
+				"TierEMT", &T::TierEMT,
 				"Tier1", &T::Tier1,
 				"Tier2", &T::Tier2,
 				"Tier3", &T::Tier3,
@@ -124,13 +132,15 @@ namespace Execution
 				"RawMessages", &T::RawMessages,
 				"WeightedMessages", &T::WeightedMessages,
 				"InverseQuantityTraded", &T::InverseQuantityTraded,
-				"QuantityTraded", &T::QuantityTraded
+				"QuantityTraded", &T::QuantityTraded,
+				"EMTWeightedMessages", &T::EMTWeightedMessages
 			);
 		};
 	};
 	static_assert(Tools::PlainOldData<MessageEfficiency>);
-	static_assert(sizeof(MessageEfficiency) == 84 && offsetof(MessageEfficiency, TradeDate) == 4 && offsetof(MessageEfficiency, ProductGroupRoot) == 52
-		&& offsetof(MessageEfficiency, QuantityTraded) == 80, "MessageEfficiency must match the C# row (84 bytes)");
+	static_assert(sizeof(MessageEfficiency) == 92 && offsetof(MessageEfficiency, TradeDate) == 4 && offsetof(MessageEfficiency, TierEMT) == 20
+		&& offsetof(MessageEfficiency, ProductGroupRoot) == 52 && offsetof(MessageEfficiency, QuantityTraded) == 80 && offsetof(MessageEfficiency, EMTWeightedMessages) == 84,
+		"MessageEfficiency must match the C# row (92 bytes)");
 
 	struct RateLimit
 	{

@@ -1255,9 +1255,9 @@ namespace Socket
 		// Takes one connect request and answers it exactly once: the client's id, or a negative ConnectRefusal.
 		void PollLetterBox()
 		{
-			// Step 1: take the request
+			// Step 1: read the request, left posted until it is answered. Why: a listener that dies deciding leaves it for the next one (see Spec.md)
 			SocketHeader socketHeader;
-			if (!_letterBox.TryEmpty(socketHeader))
+			if (!_letterBox.TryPeek(socketHeader))
 				return;
 			std::string clientName = socketHeader.ClientName.ToString();
 			std::cout << "ServerSocket::" << ServerName << ": Received connection request from " << clientName << std::endl;
@@ -1275,7 +1275,9 @@ namespace Socket
 				socketHeader.ClientId = static_cast<int32_t>(ConnectRefusal::ServerError);
 			}
 
-			// Step 3: a refused client is told why; an accepted one is attached, and OpenClient sends its id
+			// Step 3: emptied first, so no request is answered twice; a refused client is told why, an accepted one is attached and OpenClient sends its id
+			SocketHeader postedRequest;
+			_letterBox.TryEmpty(postedRequest);
 			if (socketHeader.ClientId < 0)
 			{
 				std::cout << "ServerSocket::" << ServerName << ": Client " << clientName << " refused: " << magic_enum::enum_name(static_cast<ConnectRefusal>(socketHeader.ClientId)) << "." << std::endl;

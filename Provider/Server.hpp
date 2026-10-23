@@ -261,9 +261,7 @@ public:
             {
                 Execution::OrderTarget orderTarget = *reinterpret_cast<const Execution::OrderTarget*>(qsrc.data());
                 injected->Dequeue();
-                // A cancel the server sends for a gone client is in no audit otherwise; written before OnOrderTarget so the tap records it ahead of its reject or Done
-                WriteToExecution(orderTarget);
-                OnOrderTarget(orderTarget);
+                SendServerOrderTarget(orderTarget);
             }
         }
 
@@ -302,6 +300,9 @@ public:
                     {
                         const Provider::ControlAlgoStatus& controlAlgoStatus = *reinterpret_cast<const Provider::ControlAlgoStatus*>(rdst.data());
                         OnControlAlgoStatus(controlAlgoStatus.StrategyId, controlAlgoStatus.InstrumentId, controlAlgoStatus.AlgoStatus);
+                        // Why: a user's pause stops the algo's orders now, not on its next tick; a reject's pause (above) leaves them to the algo
+                        if (controlAlgoStatus.AlgoStatus == Execution::AlgoStatus::Paused)
+                            CancelAlgoOrders(controlAlgoStatus.StrategyId, controlAlgoStatus.InstrumentId);
                         break;
                     }
                     default:
@@ -371,6 +372,33 @@ public:
         WriteToRecord(strategyId, _serverContext.GetInstrument(instrumentId).Header().CoreGroupId, positionHeader);
     }
 
+    // Cancels the working algo orders a user's pause stops: the master switch every strategy's on the instrument, a strategy's
+    // switch that strategy's. Algo orders only: a manual order (a GUI's, the house book's) is never touched. CoreGroup thread only.
+    void CancelAlgoOrders(int32_t strategyId, int32_t instrumentId)
+    {
+        bool isMasterSwitch = strategyId == Execution::OrderIdAllocator::ServerStrategyId;
+        _serverContext.EnumerateOrders(instrumentId, isMasterSwitch ? -1 : strategyId, -1, [this](const Execution::OrderState& orderState, const Execution::OrderTarget& orderTarget)
+        {
+            // Step 1: orders the server has and still works (an unread Create is refused AlgoIsPaused when it arrives), the algo's own only
+            if (!orderState.OrderHeader.OrderId.IsAlgoOrder())
+                return;
+
+            // Step 2: a cancel numbered past the algo's own seqs, as a GUI's cancel of an algo order is (see Spec.md "Manual orders")
+            Execution::OrderTarget cancelOrderTarget = orderState.NewCancel();
+            cancelOrderTarget.OrderHeader.Seq = orderTarget.OrderHeader.Seq + Execution::OrderTarget::s_foreignCancelSeqJump;
+            cancelOrderTarget.OrderHeader.NicTimestamp = Tools::Clock::UtcNow();
+            SendServerOrderTarget(cancelOrderTarget);
+        });
+    }
+
+    // Sends a target the server itself originates (a gone client's close-out, a user's pause). CoreGroup thread only.
+    // Why: in no audit otherwise; written before OnOrderTarget so the tap records it ahead of its reject or Done
+    void SendServerOrderTarget(const Execution::OrderTarget& orderTarget)
+    {
+        WriteToExecution(orderTarget);
+        OnOrderTarget(orderTarget);
+    }
+
     // Closes out a gone client's 64 order slots: cancels what is working, marks a Create the server never read Done, repairs a
     // row left mid-write. Returns true once nothing waits on the exchange (see Spec.md "Client restart"). Listen thread only.
     bool TryCloseOutOrders(int32_t clientId)
@@ -401,7 +429,7 @@ public:
             isClosedOut &= !isAwaitingExchange;
             orderTarget.OrderTargetStatus = isAwaitingExchange ? Execution::OrderStateStatus::Active : Execution::OrderStateStatus::Done;
             orderTarget.OrderTargetAction = Execution::OrderTargetAction::Cancel;
-            orderTarget.OrderHeader.Seq += 1'000'000;
+            orderTarget.OrderHeader.Seq += Execution::OrderTarget::s_foreignCancelSeqJump;
             orderTarget.OrderHeader.NicTimestamp = Tools::Clock::UtcNow();
             orderTargetEntry.RecoveryWrite(orderTarget);
             // Only a working slot's cancel is sent: a torn idle row's id may name no instrument, and the lookup would throw
@@ -459,7 +487,7 @@ public:
         }
     }
 
-    void OnInstrumentHeader(Data::InstrumentHeader128& instrumentHeader128)
+    void OnInstrumentHeader(Data::InstrumentHeader256& instrumentHeader128)
     {
         _serverContext.OnInstrumentHeader(instrumentHeader128);
     }
@@ -519,21 +547,17 @@ public:
         return existingOrderState;
     }
 
-    static constexpr uint64_t _orderNotFound = 1ULL << static_cast<int32_t>(Execution::OrderRejectedReason::OrderNotFound);
-
     // The entry point for every refused target, the server's own (OnOrderTarget) and the exchange's (see Spec.md).
     Execution::OrderRejected OnOrderRejected(Execution::OrderRejected& orderRejected, const std::string& message)
     {
         Socket::SharedArrayEntry<Execution::OrderState>& orderStateEntry = _serverContext.GetOrderState(orderRejected.OrderHeader.OrderId);
         Execution::OrderState& orderState = orderStateEntry.GetRef();
 
-        // The exchange saying "no such order" for a slot we already know is finished is not news, and
-        // it must not pause the algo. Restate it as StateIsDone, which OrderDiscarded covers.
-        if (orderState.OrderStateStatus == Execution::OrderStateStatus::Done
-            && orderRejected.OrderRejectedReasons.Raw() == _orderNotFound)
-        {
-            orderRejected.OrderRejectedReasons = Tools::Bitset64(1ULL << static_cast<int32_t>(Execution::OrderRejectedReason::StateIsDone));
-        }
+        // Why per reason: a refusal made only of races (a done order's OrderNotFound, an in-flight NotInSession) is discarded (see Spec.md)
+        if (orderState.OrderStateStatus == Execution::OrderStateStatus::Done)
+            orderRejected.OrderRejectedReasons.Replace(static_cast<int32_t>(Execution::OrderRejectedReason::OrderNotFound), static_cast<int32_t>(Execution::OrderRejectedReason::StateIsDone));
+        Execution::OrderRejectedReason notInSessionReason = RiskLayer::GetNotInSessionReason(_serverContext.GetInstrument(orderRejected.OrderHeader.OrderId.InstrumentId()).Header());
+        orderRejected.OrderRejectedReasons.Replace(static_cast<int32_t>(Execution::OrderRejectedReason::NotInSession), static_cast<int32_t>(notInSessionReason));
 
         if (orderState.OrderHeader.OrderId == orderRejected.OrderHeader.OrderId)
         {
@@ -616,9 +640,9 @@ public:
         int32_t instrumentId = _serverContext.AllocateInstrument(allocateInstrument.InstrumentHeaderId);
         allocateInstrument.InstrumentId = instrumentId;
 
-        Data::InstrumentHeader128& header128 = _serverContext.GetInstrumentHeader(allocateInstrument.InstrumentHeaderId).GetRef();
-        allocateInstrument.Symbol = header128.Symbology()->ToString();
-        allocateInstrument.ExchangeInstrumentId = header128.AsInstrumentHeader().ExchangeInstrumentId;
+        Data::InstrumentHeader256& header256 = _serverContext.GetInstrumentHeader(allocateInstrument.InstrumentHeaderId).GetRef();
+        allocateInstrument.Symbol = header256.Symbology()->ToString();
+        allocateInstrument.ExchangeInstrumentId = header256.AsInstrumentHeader().ExchangeInstrumentId;
 
         if (_instrumentData[static_cast<size_t>(instrumentId)])
             return instrumentId; // already attached + seeded
@@ -642,11 +666,11 @@ public:
         // them and throws otherwise. Each leg is fully client-allocated too (the client tracks leg
         // positions and fills), but only the SPREAD - the instrument the client asked for - echoes
         // an admin reply: the client's GetInstrument handshake reads exactly one. See Spec.md.
-        const Data::InstrumentHeader128& header128 = _serverContext.GetInstrumentHeader(allocateInstrument.InstrumentHeaderId).GetReadonlyRef();
-        if (header128.AsInstrumentHeader().InstrumentType == Data::InstrumentType::Spread)
+        const Data::InstrumentHeader256& header256 = _serverContext.GetInstrumentHeader(allocateInstrument.InstrumentHeaderId).GetReadonlyRef();
+        if (header256.AsInstrumentHeader().InstrumentType == Data::InstrumentType::Spread)
         {
             Provider::AllocateInstrument allocateLegInstrument = allocateInstrument;
-            Data::LeggedHeader leggedHeader = header128.AsLegged();
+            Data::LeggedHeader leggedHeader = header256.AsLegged();
             for (const Data::LegHeader& legHeader : leggedHeader.Legs())
             {
                 allocateLegInstrument.InstrumentHeaderId = legHeader.InstrumentHeaderId;
@@ -782,14 +806,20 @@ public:
     void OnTradingStatusUpdate(const Data::TradingStatusUpdate& tradingStatusUpdate)
     {
         int32_t instrumentHeaderId = _serverContext.GetInstrumentHeaderIdByInstrumentId(tradingStatusUpdate.TickHeader.InstrumentId).GetReadonlyRef();
-        Data::InstrumentHeader128& instrumentHeader = _serverContext.GetInstrumentHeader(instrumentHeaderId).GetRef();
-        instrumentHeader.AsInstrumentHeader().TradingStatus = tradingStatusUpdate.TradingStatus;
+        Data::InstrumentHeader256& instrumentHeader = _serverContext.GetInstrumentHeader(instrumentHeaderId).GetRef();
+        Data::InstrumentHeader& header = instrumentHeader.AsInstrumentHeader();
+        if (header.TradingStatus != tradingStatusUpdate.TradingStatus)
+        {
+            // Why: the time before the status, so a reader that sees the new status sees its time (see Spec.md)
+            header.TradingStatusTimestamp = tradingStatusUpdate.TickHeader.ExchangeTimestamp;
+            std::atomic_ref<Data::TradingStatus>(header.TradingStatus).store(tradingStatusUpdate.TradingStatus, std::memory_order_release);
+        }
         WriteToInstrumentData(tradingStatusUpdate);
 
         // The exchange closing the instrument ends its session: its product group's message-efficiency day and its fills count
         if (tradingStatusUpdate.TradingStatus == Data::TradingStatus::Closed)
         {
-            EndMessageEfficiencyDay(instrumentHeader.AsInstrumentHeader(), tradingStatusUpdate);
+            EndMessageEfficiencyDay(header, tradingStatusUpdate);
             _riskLayer.OnSessionClosed(tradingStatusUpdate.TickHeader.InstrumentId);
         }
     }
@@ -886,8 +916,6 @@ public:
 
         if (!isDeltas)
             return;
-
-        _serverContext.ServerHeader().GetRef().Timestamp = marketByPrice.TickHeader.NicTimestamp;
 
         if (_instrumentData[static_cast<size_t>(instrumentId)])
             _instrumentData[static_cast<size_t>(instrumentId)]->Write(std::span<const uint8_t>(deltaSpan.data(), deltaSpan.size()));

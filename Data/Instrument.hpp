@@ -58,6 +58,8 @@ namespace Data
 		int32_t InstrumentId;
 		int32_t ExchangeInstrumentId;
 		Tools::String4 ProductGroupRoot;   // the group CME counts its message efficiency under (MDP3 SecurityGroup, tag 1151), set by whoever builds the header
+		Tools::Timestamp TradingStatusTimestamp = Tools::Timestamp(0);   // @64: exchange time TradingStatus last changed; MinValue never. Server only, written before TradingStatus
+		uint8_t _reserved[56] = {};
 		std::string ToString() const
 		{
 			return Tools::Json::Serialize(*this);
@@ -80,16 +82,17 @@ namespace Data
 				"InstrumentHeaderId", &T::InstrumentHeaderId,
 				"InstrumentId", &T::InstrumentId,
 				"ExchangeInstrumentId", &T::ExchangeInstrumentId,
-				"ProductGroupRoot", &T::ProductGroupRoot
+				"ProductGroupRoot", &T::ProductGroupRoot,
+				"TradingStatusTimestamp", &T::TradingStatusTimestamp
 			);
 		};
 	};
 
-	static_assert(sizeof(InstrumentHeader) == 64, "InstrumentHeader size must be 64 bytes");
+	static_assert(sizeof(InstrumentHeader) == 128, "InstrumentHeader size must be 128 bytes");
 	// TradingStatus is the runtime-updated byte at offset 6 (Header 4 | InstrumentType | CoreGroupId),
 	// verified against C# field order - the 09-10 report's "offset 7" counts from 1.
 	static_assert(offsetof(InstrumentHeader, TradingStatus) == 6);
-	static_assert(offsetof(InstrumentHeader, ProductGroupId) == 7 && offsetof(InstrumentHeader, ProductGroupRoot) == 60);
+	static_assert(offsetof(InstrumentHeader, ProductGroupId) == 7 && offsetof(InstrumentHeader, ProductGroupRoot) == 60 && offsetof(InstrumentHeader, TradingStatusTimestamp) == 64);
 
 	struct ForexHeader
 	{
@@ -149,7 +152,7 @@ namespace Data
 		};
 	};
 
-	struct InstrumentHeader128;
+	struct InstrumentHeader256;
 
 	struct LegHeader
 	{
@@ -169,7 +172,7 @@ namespace Data
 
 	struct LeggedHeader
 	{
-		// 128-byte overlay budget: InstrumentHeader 64 + Multiplier 8 + LegCount 4 + reserved 4 + 6*8 legs = 124.
+		// 256-byte overlay budget: InstrumentHeader 128 + Multiplier 8 + LegCount 4 + reserved 4 + 6*8 legs = 192.
 		Data::InstrumentHeader InstrumentHeader;
 		double Multiplier;   // VESTIGIAL: spreads have no multiplier (legs carry them);
 		                     // field kept for byte parity until a coordinated layout trim
@@ -185,7 +188,7 @@ namespace Data
 		}
 
 		// Legs reference sibling headers by id; the context hooks this, like InstrumentDetails.GetLeg.
-		static inline std::function<InstrumentHeader128(int32_t)> GetLegHeader;
+		static inline std::function<InstrumentHeader256(int32_t)> GetLegHeader;
 
 		std::unique_ptr<Data::SpreadSymbology> Symbology() const;
 
@@ -212,9 +215,9 @@ namespace Data
 		};
 	};
 
-	struct InstrumentHeader128
+	struct InstrumentHeader256
 	{
-		InstrumentHeader128() : Raw{} 
+		InstrumentHeader256() : Raw{} 
 		{
 		}
 
@@ -223,7 +226,7 @@ namespace Data
 			ForexHeader Forex;
 			FutureHeader Future;
 			LeggedHeader Legged;
-			uint8_t Raw[128];
+			uint8_t Raw[256];
 		};
 
 		InstrumentHeader& AsInstrumentHeader()
@@ -293,13 +296,14 @@ namespace Data
 		void ThrowIfNot(Data::InstrumentType instrumentType) const
 		{
 			if (Base.InstrumentType != instrumentType)
-				throw std::logic_error("InstrumentHeader128: overlay read as the wrong instrument type.");
+				throw std::logic_error("InstrumentHeader256: overlay read as the wrong instrument type.");
 		}
 	};
 
-	static_assert(sizeof(InstrumentHeader128) == 128, "InstrumentHeader128 size must be 128 bytes");
-	static_assert(Tools::PlainOldData<InstrumentHeader128>, "InstrumentHeader128 must be POD");
-	static_assert(sizeof(LeggedHeader) <= sizeof(InstrumentHeader128), "LeggedHeader must fit within InstrumentHeader128");
+	static_assert(sizeof(InstrumentHeader256) == 256, "InstrumentHeader256 size must be 256 bytes");
+	static_assert(sizeof(LeggedHeader) == 192 && offsetof(FutureHeader, Multiplier) == 128 && offsetof(ForexHeader, BaseCurrency) == 128, "type-specific fields follow the 128-byte InstrumentHeader");
+	static_assert(Tools::PlainOldData<InstrumentHeader256>, "InstrumentHeader256 must be POD");
+	static_assert(sizeof(LeggedHeader) <= sizeof(InstrumentHeader256), "LeggedHeader must fit within InstrumentHeader256");
 
 	// Symbology built from the legs (maturity-ascending, signed-weight tokens), resolved through
 	// the GetLegHeader hook the context installs.
@@ -331,12 +335,12 @@ namespace Data
 	class Instrument
 	{
 	protected:
-		Socket::SharedArrayEntry<InstrumentHeader128> _headerEntry;
+		Socket::SharedArrayEntry<InstrumentHeader256> _headerEntry;
 		Socket::SharedArrayEntry<MarketByPrice64> _mbpEntry;
         std::unique_ptr<Data::Symbology> _symbology;
         double _multiplier = 1.0;
 
-		Instrument(int32_t id, Socket::SharedArrayEntry<InstrumentHeader128> headerEntry, Socket::SharedArrayEntry<MarketByPrice64> mbpEntry)
+		Instrument(int32_t id, Socket::SharedArrayEntry<InstrumentHeader256> headerEntry, Socket::SharedArrayEntry<MarketByPrice64> mbpEntry)
         : _headerEntry(headerEntry),
           _mbpEntry(mbpEntry),
           InstrumentId(id),
@@ -608,7 +612,7 @@ namespace Data
 	public:
 
 
-		Future(int32_t id, Socket::SharedArrayEntry<Data::FutureHeader> headerEntry, Socket::SharedArrayEntry<MarketByPrice64> mbpEntry) : Instrument(id, headerEntry.Cast<InstrumentHeader128>(), mbpEntry)
+		Future(int32_t id, Socket::SharedArrayEntry<Data::FutureHeader> headerEntry, Socket::SharedArrayEntry<MarketByPrice64> mbpEntry) : Instrument(id, headerEntry.Cast<InstrumentHeader256>(), mbpEntry)
 		{
 			_symbology = FutureHeader().Symbology();
 			_multiplier = FutureHeader().Multiplier;
@@ -628,7 +632,7 @@ namespace Data
 	class Forex final : public Instrument
 	{
 	public:
-		Forex(int32_t id, Socket::SharedArrayEntry<Data::ForexHeader> headerEntry, Socket::SharedArrayEntry<MarketByPrice64> mbpEntry) : Instrument(id, headerEntry.Cast<InstrumentHeader128>(), mbpEntry)
+		Forex(int32_t id, Socket::SharedArrayEntry<Data::ForexHeader> headerEntry, Socket::SharedArrayEntry<MarketByPrice64> mbpEntry) : Instrument(id, headerEntry.Cast<InstrumentHeader256>(), mbpEntry)
 		{
 			_symbology = ForexHeader().Symbology();
 			_multiplier = 1.0;
@@ -660,7 +664,7 @@ namespace Data
 		const Future& _short;
 
 	public:
-		Spread(int32_t id, Socket::SharedArrayEntry<Data::LeggedHeader> headerEntry, Socket::SharedArrayEntry<MarketByPrice64> mbpEntry, const Future& longFuture, const Future& shortFuture) : Instrument(id, headerEntry.Cast<Data::InstrumentHeader128>(), mbpEntry), _long(longFuture), _short(shortFuture)
+		Spread(int32_t id, Socket::SharedArrayEntry<Data::LeggedHeader> headerEntry, Socket::SharedArrayEntry<MarketByPrice64> mbpEntry, const Future& longFuture, const Future& shortFuture) : Instrument(id, headerEntry.Cast<Data::InstrumentHeader256>(), mbpEntry), _long(longFuture), _short(shortFuture)
 		{
 			_symbology = Legged().Symbology();
 			_legs = { Data::InstrumentLeg{ longFuture.InstrumentId, 1 }, Data::InstrumentLeg{ shortFuture.InstrumentId, -1 } };

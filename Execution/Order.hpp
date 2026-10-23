@@ -104,6 +104,7 @@ namespace Execution
 		TargetIsStale          = 44,
 		TooManyActiveTargets   = 45,
 		AlgoIsPaused           = 46,
+		NotInSessionInFlight   = 47,   // NotInSession within RiskLayer::NotInSessionInFlightWindow of the status change: sent before the change was known
 
 		// ---- 50..59: Risk and business limits ----
 		NotInSession           = 50,
@@ -527,7 +528,7 @@ namespace Execution
 
 		// StateIsDone 40, CreateIsActive 41, CancelIsActive 42, TargetIsActive 43, TargetIsStale 44, TooManyActiveTargets 45,
 		// AlgoIsPaused 46, TooManyOrdersPerSecond 56: the same constant mask as C#.
-		static constexpr uint64_t OrderDiscardedMask = 0x01007F0000000000ULL;
+		static constexpr uint64_t OrderDiscardedMask = 0x0100FF0000000000ULL;
 		inline static const Tools::Bitset64 OrderDiscarded = Tools::Bitset64(OrderDiscardedMask);
 
 		[[nodiscard]] bool IsDiscarded() const
@@ -579,6 +580,9 @@ namespace Execution
 
 		// The state of a Create the exchange has not acked yet: Active, InFlight, nothing filled, Seq 0.
 		static void NewInFlight(const OrderTarget& orderTarget, OrderState& orderState);
+
+		// The target that cancels this order: its header and profile, action Cancel.
+		OrderTarget NewCancel() const;
 
 		// This state ended by its Create's refusal: Done/Rejected, with the refused order's header and profile.
 		void NewRejected(const OrderRejected& orderRejected, OrderState& rejectedState) const
@@ -642,6 +646,8 @@ namespace Execution
 
 	struct OrderTarget
 	{
+		static constexpr int32_t s_foreignCancelSeqJump = 1'000'000;   // a cancel sent by someone other than the order's owner jumps past the owner's own seqs
+
 		Data::Header<OrderType> Header = Data::Header<OrderType>(OrderType::OrderTarget);
 		Execution::OrderHeader OrderHeader;
 		Tools::Timestamp TriggerTimestamp;
@@ -693,6 +699,15 @@ namespace Execution
 		orderState.TimeInForce = orderTarget.TimeInForce;
 		orderState.OrderStateStatus = Execution::OrderStateStatus::Active;
 		orderState.OrderStateReason = Execution::OrderStateReason::InFlight;
+	}
+
+	inline OrderTarget OrderState::NewCancel() const
+	{
+		OrderTarget cancelOrderTarget{};
+		cancelOrderTarget.OrderHeader = OrderHeader;
+		cancelOrderTarget.OrderProfile = OrderProfile;
+		cancelOrderTarget.OrderTargetAction = Execution::OrderTargetAction::Cancel;
+		return cancelOrderTarget;
 	}
 
     enum AlgoStatus : uint8_t

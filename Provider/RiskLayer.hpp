@@ -97,12 +97,37 @@ public:
 
         // Session state IS the exchange's TradingStatus; Unknown counts as closed. The server must
         // publish each instrument's status at startup or nothing trades (see Spec.md).
-        if (instrument.Header().TradingStatus != Data::TradingStatus::Open)
+        if (!MaySend(instrument.Header().TradingStatus, Execution::OrderTargetAction::Create))
         {
-            orderRejectedReasons.Set(static_cast<int32_t>(Execution::OrderRejectedReason::NotInSession));
+            orderRejectedReasons.Set(static_cast<int32_t>(GetNotInSessionReason(instrument.Header())));
         }
 
         return orderRejectedReasons;
+    }
+
+    // Whether an exchange in this status takes this action: Open and Auction anything, Halted a cancel only, Closed and Unknown nothing (see Spec.md).
+    ALWAYS_INLINE static bool MaySend(Data::TradingStatus tradingStatus, Execution::OrderTargetAction orderTargetAction)
+    {
+        switch (tradingStatus)
+        {
+            case Data::TradingStatus::Open:
+            case Data::TradingStatus::Auction:
+                return true;
+            case Data::TradingStatus::Halted:
+                return orderTargetAction == Execution::OrderTargetAction::Cancel;
+            default:
+                return false;
+        }
+    }
+
+    // How long after an instrument's status changes a session refusal counts as an order sent before the change was known (see Spec.md).
+    static inline Tools::Duration NotInSessionInFlightWindow = Tools::Duration::FromSeconds(int64_t{1});
+
+    // The reason a session refusal of this instrument carries: in flight within the window of its last status change, else NotInSession.
+    ALWAYS_INLINE static Execution::OrderRejectedReason GetNotInSessionReason(const Data::InstrumentHeader& instrumentHeader)
+    {
+        bool isWithinWindow = Tools::Clock::UtcNow() - instrumentHeader.TradingStatusTimestamp <= NotInSessionInFlightWindow;
+        return isWithinWindow ? Execution::OrderRejectedReason::NotInSessionInFlight : Execution::OrderRejectedReason::NotInSession;
     }
 
     ALWAYS_INLINE Tools::Bitset64 ValidateCreate(const Execution::OrderTarget& orderTarget, const Execution::OrderState& orderState)

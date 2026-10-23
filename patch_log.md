@@ -4,6 +4,102 @@ Newest first. Each entry says what changed, why, and what it broke or unblocked.
 
 ---
 
+## 256-byte instrument rows, in-flight session refusals, one session rule, no per-tick header write (C# `89e13d1`+`d7f8ea6`, report 2026-10-12 P33-P36, C22-C25)
+
+**FOR C# CLAUDE:** reply in `csharp_alignment_report_2026-10-12.md` §13. Nothing for C# to change.
+
+- **P33** (WIRE, lockstep L14, fresh shared memory):
+  - `Data::InstrumentHeader` is 128 bytes: `Tools::Timestamp TradingStatusTimestamp` at 64, then 56 reserved bytes (in the JSON, last).
+  - `InstrumentHeader128` is renamed `InstrumentHeader256` (256-byte union, `Raw[256]`), as in C#. `FutureHeader`/`ForexHeader` fields
+    start at 128, and `LeggedHeader` is 192 bytes (asserted).
+  - `Server::OnTradingStatusUpdate` writes the time, then the status with a release store, and only when the status changes.
+  - New `OrderRejectedReason::NotInSessionInFlight = 47`, added to the discard mask, which becomes `0x0100FF0000000000`.
+  - `RiskLayer::GetNotInSessionReason` returns 47 within `NotInSessionInFlightWindow` (1 s) of the change.
+  - `Server::OnOrderRejected` rewrites each bit on its own with the new `Bitset64::Replace`: a done order's `OrderNotFound` becomes
+    `StateIsDone`, and `NotInSession` becomes the window's reason.
+- **P34:** `Server::OnMarketByPrice` no longer writes `ServerHeader.Timestamp`. That was the cache line every risk check reads,
+  found in the 2026-10-20 cache-contention review.
+- **P35:** `RiskLayer::MaySend(status, action)`: Open and Auction allow anything, Halted a cancel only, Closed and Unknown nothing. `ValidateInstrument`
+  uses it for the create check, so a create in `Auction` is no longer refused.
+- **P36:** `ServerSocket::PollLetterBox` peeks the request, decides, and empties the letterbox just before replying.
+- **C22–C25:** C#-only.
+- C23 checked in CME (read-only): iLink reports stamp `ExchangeTimestamp` from `TransactTime`, and MDP incremental ticks from the event's
+  `TransactTime`. Snapshot recovery and the removals-only reset stamp the packet `SendingTime`.
+
+**CME must rename** `InstrumentHeader128` to `InstrumentHeader256`: 31 uses, including the `SecDef::SecDef::InstrumentHeader128` member
+(`SecDef/SecDefFile.hpp` 18, `Tests/SecDefTests.cpp` 5, `Server/CmeServer.hpp` 2, one each in `Cert/CertOrders.hpp`, `Tests/Mdp3BookTests.cpp`,
+`Tests/Mdp3LatencyTests.cpp`, `Tests/OrderTests.cpp`, `Tests/RouterTests.cpp`, `Tests/ServerTests.cpp`). It doesn't build until then. Not done here.
+CME already maps closed-market rejects (1003, 2130, 7024, 7027) to `NotInSession`, so the P33 rewrite fires live.
+
+Verified: HFT builds clean; ToolsTests, DataTests and ExecutionTests pass (the discard-mask check is updated). The JSON harness shows 0 of 161 files differing,
+with `TradingStatusTimestamp` in the sample. Against the real `ServerContext`/`RiskLayer`, all 11 P33–P35 checks pass:
+- the 256-byte row;
+- Closed 0.5 s or exactly 1 s ago gives 47, and 1.5 s ago gives 50;
+- Auction and Open pass, and Halted and Unknown refuse a create;
+- the full `MaySend` table;
+- `OrderNotFound|NotInSession` becomes `StateIsDone|NotInSessionInFlight` and is discarded;
+- `Replace` with a clear source bit changes nothing.
+
+The real-socket handshake (P36) and the P24–P31 tests pass. `Server::OnTradingStatusUpdate` and `OnOrderRejected` were not run end to end.
+
+---
+
+## Message efficiency: the EMT tier (C# `45492da`, `d72578d`, `91d7805`; report 2026-10-12 P32, C21)
+
+**FOR C# CLAUDE:** reply in `csharp_alignment_report_2026-10-12.md` §12. Nothing for C# to change.
+
+- **P32** (`Execution/RateLimit.hpp`, WIRE, lockstep L13): the `MessageEfficiency` row changes.
+  - `Tier0` is renamed `TierEMT` (offset 20, JSON key `"TierEMT"`).
+  - New `double EMTWeightedMessages` at offset 84, so the row grows from 84 to 92 bytes (asserted). `Reset` zeroes it.
+  - New computed `EMTEfficiency()`, written to the JSON second and never read.
+  - `GetMinLimits` (the realtime no-file default) is now `TierEMT` 1,000,000 / 500 with the other tiers 0 (was all 0).
+- Per the user's 2026-10-13 decision, C++ only reads and writes the row and never counts. So the counting and display
+  helpers (`CanSend`/`Send`, `GetMEPTier`, `MessageEfficiencyTier::IsApplied`/`IsWithin`/`GetWarningRatio`, `GetMEPWarningRatio`,
+  the weighter) are not ported.
+- **C21** (the widget's colours): C#-only.
+
+Deploy: the C++ server, every C# process on the box and the desks together with fresh shared memory. Copy the rebuilt
+`MessageEfficiency` files (the new `"TierEMT"` form) to the box first; a file still saying `"Tier0"` loads the EMT off.
+
+Verified: HFT and CME build clean; ToolsTests, DataTests and ExecutionTests pass. The JSON harness shows 0 of 161 files differing, against C# `91d7805`,
+with three new samples:
+- `GetMinLimits` with the EMT default;
+- an old `"Tier0":{900000,400}` line, which loads `TierEMT` 0 on both sides;
+- the report's new-form line with `EMTWeightedMessages` 412.5, which writes `EMTEfficiency` 103.125.
+
+The P24 server test still passes on the 92-byte row, as do the P25–P31 tests.
+
+---
+
+## A user's Pause cancels the algo orders it stops (C# `5497ba0`, report 2026-10-12 P31)
+
+**FOR C# CLAUDE:** reply in `csharp_alignment_report_2026-10-12.md` §11. Nothing for C# to change.
+
+- **P31** (`Server.hpp`): when a `ControlAlgoStatus` asks for `Paused`, `ReadExecution` now calls the new `CancelAlgoOrders`
+  after `OnControlAlgoStatus`.
+  - Which orders: the working orders on the instrument (every strategy's for the master, that strategy's otherwise), and
+    of those only algo orders. Manual orders are never cancelled.
+  - The cancel: `OrderState::NewCancel()` with `Seq` = the owner's target seq + `OrderTarget::s_foreignCancelSeqJump`,
+    sent by the new `SendServerOrderTarget` (written to the owner's execution channel, then `OnOrderTarget`).
+  - The injected-cancel drain uses `SendServerOrderTarget` too, and `TryCloseOutOrders` uses the named constant.
+  - A reject's auto-pause still cancels nothing.
+- New `Context::EnumerateOrders(instrumentId, strategyId, inFlightClientId, onOrder)`, with the same rules as C#'s order
+  walk (a torn row is skipped, the server's state row decides, an in-flight Create counts only for `inFlightClientId`). Also
+  new: `OrderState::NewCancel`, and `OrderTarget::s_foreignCancelSeqJump` = 1,000,000.
+- The client-constructor audit-folder note needs nothing: the C++ client never creates its audit folder before connecting.
+
+Verified: HFT and CME build clean (CME with the user's own `String256` edit). ToolsTests, DataTests and ExecutionTests pass, and the JSON harness
+shows 0 of 159 files differing. Against the real `ServerContext`, with eight hand-written orders, `CancelAlgoOrders`' selection matches C#:
+- a master Pause picks A's two working algo orders and B's;
+- A's Pause picks A's only;
+- a Done order, an unread Create, another instrument's order, a GUI's order booked to A and the house book's order are never picked;
+- each cancel carries seq + 1,000,000.
+
+The `Server` path itself (control → cancel → `OnOrderTarget`) was not run end to end; it needs a full server. The earlier handshake, pid,
+P24 and P25–P28 tests pass.
+
+---
+
 ## Names are 256 bytes (C# `8cf5c1b`+`642cc0c`, report 2026-10-12 P30, C19, C20)
 
 **FOR C# CLAUDE:** reply in `csharp_alignment_report_2026-10-12.md` §10. Nothing for C# to change.

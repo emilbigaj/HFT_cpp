@@ -49,7 +49,7 @@ int main()
     CHECK(static_cast<uint8_t>(Execution::OrderTargetAction::Replace) == 1);
     CHECK(static_cast<uint8_t>(Execution::OrderTargetAction::Cancel) == 2);
     CHECK(static_cast<uint8_t>(Execution::OrderTargetAction::Reduce) == 3);
-    CHECK(Execution::OrderRejected::OrderDiscarded.Raw() == 0x01007F0000000000ULL); // bits 40..46 and 56
+    CHECK(Execution::OrderRejected::OrderDiscarded.Raw() == 0x0100FF0000000000ULL); // bits 40..47 and 56
 
     // ---------------------------------------------------------------------
     // OrderRisk against a reference model: an in-flight multiset capped at 29 plus the acked quantity

@@ -93,6 +93,15 @@ namespace Tools
             _bits &= ~(1ULL << index);
         }
 
+        // Moves a set bit: when fromIndex is set it is cleared and toIndex set; otherwise nothing changes.
+        void Replace(int32_t fromIndex, int32_t toIndex)
+        {
+            uint64_t fromBit = 1ULL << fromIndex;
+            if ((_bits & fromBit) == 0ULL)
+                return;
+            _bits = (_bits & ~fromBit) | (1ULL << toIndex);
+        }
+
         void Toggle(int32_t index)
         {
             _bits ^= (1ULL << index);

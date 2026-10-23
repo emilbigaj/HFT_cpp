@@ -195,14 +195,14 @@ public:
 
         if (!ClientContext.TryGetInstrumentId(instrumentHeaderId, instrumentId))
         {
-            const Data::InstrumentHeader128& header128 = ClientContext.GetInstrumentHeader(instrumentHeaderId).GetReadonlyRef();
+            const Data::InstrumentHeader256& header256 = ClientContext.GetInstrumentHeader(instrumentHeaderId).GetReadonlyRef();
             Provider::AllocateInstrument allocateInstrument
             {
                 .Header = Data::Header<Provider::AllocateType>(Provider::AllocateType::Instrument),
                 .ClientId = ClientId,
                 .InstrumentHeaderId = instrumentHeaderId,
                 .InstrumentId = -1,
-                .Symbol = header128.Symbology()->ToString()
+                .Symbol = header256.Symbology()->ToString()
             };
 
             _socket.Write(Socket::SocketChannel::Admin, allocateInstrument);
@@ -598,7 +598,7 @@ private:
                 OnPositionHeader(rsrc);
                 break;
             }
-            case static_cast<uint8_t>(Execution::OrderType::OrderTarget):   // a cancel the server sent for this client's previous process: recorded by the audit, nothing to apply
+            case static_cast<uint8_t>(Execution::OrderType::OrderTarget):   // a cancel the server sent (a user's pause, or this client's previous process): recorded by the audit, nothing to apply
                 break;
             case static_cast<uint8_t>(Execution::OrderType::RiskLimit):     // an edit of this strategy's limit, sent so the audit keeps its file: the row itself is in shared memory
                 break;
