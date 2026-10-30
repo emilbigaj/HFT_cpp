@@ -4,6 +4,82 @@ Newest first. Each entry says what changed, why, and what it broke or unblocked.
 
 ---
 
+## Position transfer moves both books under both locks (C# `d872704`, report 2026-10-12 P40 updated)
+
+- `Server::OnControlTransferPosition` locks the from row, then the to row, applies both Transfer fills, and unlocks in reverse, so no
+  reader sees one book moved and the other not. Then the new `WriteTransferFill` puts each on record (it replaces `ApplyTransferFill`).
+
+Verified: HFT builds clean; ToolsTests, DataTests and ExecutionTests pass; the JSON harness shows 0 of 175 files differing; the P40 test passes (13 checks).
+
+---
+
+## Spread names keep a foreign leg's root; position transfer between books (C# `e0492b0`, report 2026-10-12 P39, P40)
+
+**FOR C# CLAUDE:** reply in `csharp_alignment_report_2026-10-12.md` §16. One observation for C#, no change asked.
+
+- **P39** (`Data/Symbology.hpp`): `LeggedSymbology` names a leg on the spread's own root as before ("+2026-10-30"). It names a leg on
+  another root by its signed weight, a space, then its own ticker or short symbol ("- ZQ 2028-04-30", "-3 5YY Oct26"); see `NewLegText`.
+  `Symbology::FromString` for a spread reads a token shorter than 11 characters as a leg on another root, followed by its root and its date.
+- **P40** (WIRE, lockstep with the C# desks and Logging):
+  - `ControlType::TransferPosition = 202` and `Provider::ControlTransferPosition`: 32 bytes (asserted), with `Price` defaulting to NaN and
+    `NewTransferFill`. `Execution::FillType::Transfer = 3`.
+  - `Context::CanTransferPosition`.
+  - `Server`: a `ReadExecution` case, `OnControlTransferPosition`, and `ApplyTransferFill`. Each fill goes on its book's row under the
+    lock, then to its channel and the audit; never the firm's row, the RiskLayer or iLink.
+  - The C++ client counts no message efficiency, so the C# client's skip has no twin.
+
+**Before deploying P39:** a spread with a leg on another root is renamed. Move its `.risklimit`/`.position` files from the old name to
+the new one, or they are not read.
+
+Verified: HFT and CME build clean (CME has the user's `InstrumentHeader256` rename); ToolsTests, DataTests and ExecutionTests pass. The JSON harness shows 0 of 175 files
+differing, with new samples: four spreads parsed from their names (two with legs on other roots, one weighted; each prints its name back
+unchanged, short symbols `SR1 +Apr28 - ZQ Apr28` and `10Y +Oct26 -3 5YY Oct26`), `ControlTransferPosition` (set, and the default with NaN)
+and a Transfer fill. Against the real `ServerContext`, all 13 `CanTransferPosition` checks pass:
+- part of the position, the whole of it, too much, the wrong side, zero, no price, the same book, a book without the instrument;
+- a live algo, and the same algo after the master pauses it;
+- an unallocated book throws, as in C#;
+- applied, the transfer leaves 6/4 with the firm's row untouched, and both fills are Transfer with one FillId and are not algo orders.
+
+`Server::OnControlTransferPosition` itself was not run end to end.
+
+---
+
+## MarketByPrice64::Quantity (C# `6d670b0`..`9cc8fe2`, report 2026-10-12 C27, C28)
+
+**FOR C# CLAUDE:** reply in `csharp_alignment_report_2026-10-12.md` §15. Nothing for C# to change.
+
+- `Data::MarketByPrice64::Quantity()` = `Bids.Quantity() + Asks.Quantity()`, as C#'s new `MarketByPrice64.Quantity`.
+- C27 (the Local Mirror's single 100 ms publish cadence, the desk relay) and C28 (the phone app, `Memory.IsInProcess`, and the
+  ARM64/Android guards in `Pause`, `ProcessId.IsAlive`, `Application`, `FileSystemPath.OSType`, `Platform.Name`) are C#-only.
+  `IsProcessAlive(getpid())` is already true on Linux, so C#'s self-check needs no C++ twin.
+
+Verified: HFT builds clean; ToolsTests, DataTests and ExecutionTests pass; the JSON harness shows 0 of 161 files differing against C# `9cc8fe2`.
+(The scratchpad C# clone again came out of the pull with 78 working-tree files deleted; restored from the commit.)
+
+---
+
+## The server keeps an exchange message's NIC stamp; dead rate-limit code deleted (C# `460f8ed`, report 2026-10-12 P37, P38, C26)
+
+**FOR C# CLAUDE:** reply in `csharp_alignment_report_2026-10-12.md` §14. Nothing for C# to change.
+
+- **P37** (`Execution/RateLimit.hpp`): `SessionRateLimit` and `RollingRateLimit::CanSendOrder` are deleted (nothing called them);
+  `TrySendOrder` and `GetCount` are unchanged.
+- **P38** (`Provider/Server.hpp`): the `Clock::UtcNow()` stores into `OrderHeader.NicTimestamp` are deleted in `OnOrderState`,
+  `OnOrderRejected`, and `OnFill` (the state and each fill). The server's own refusal in `OnOrderTarget` is stamped right after
+  `NewOrderRejected`, so a refused Create's Done (built from the reject) takes it too. The stamps on what the server makes
+  itself (InFlight state, injected and pause cancels, close-out cancels, position rows) are unchanged.
+- **C26:** C#-only; it relies on P22, already ported.
+
+**CME must stamp arrivals before this deploys.** `ILink3::FramedMessage::NicTimestamp` (`Wire.hpp:447`) is declared but never
+assigned; the router copies it into every header (`InstrumentRouter.hpp:262`). With the server no longer overwriting, every
+exchange state, fill and reject would carry NIC 0. Fix in `MarketSegmentGateway::Poll` before `Dispatch`: the connection's
+`LastNicTimestamp` when non-zero (kernel bypass), else the `stamp` already taken there (kernel socket). Not done here.
+
+Verified: HFT builds clean; ToolsTests, DataTests and ExecutionTests pass, and the JSON harness shows 0 of 161 files differing. The handshake, pid and
+P24–P33 scenario tests pass. The stamp paths were not run end to end (they need a full server with the CME router).
+
+---
+
 ## 256-byte instrument rows, in-flight session refusals, one session rule, no per-tick header write (C# `89e13d1`+`d7f8ea6`, report 2026-10-12 P33-P36, C22-C25)
 
 **FOR C# CLAUDE:** reply in `csharp_alignment_report_2026-10-12.md` §13. Nothing for C# to change.

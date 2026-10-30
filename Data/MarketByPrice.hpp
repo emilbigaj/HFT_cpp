@@ -358,6 +358,8 @@ namespace Data
 	#pragma pack(push, 1)
 	struct MarketByPrice64
 	{
+		int32_t Quantity() const { return Bids.Quantity() + Asks.Quantity(); }
+
 		SideByPrice64 Bids;
 		SideByPrice64 Asks;
 		Tools::Timestamp ExchangeTimestamp;

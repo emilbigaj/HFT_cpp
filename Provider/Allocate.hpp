@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <limits>
 #include "../Tools/Json.hpp"
 #include "../Tools/String.hpp"
 #include "Bitset.hpp"
@@ -20,6 +21,7 @@ namespace Provider
 	{
 		AlgoStatus = 200,
 		RiskLimit = 201,
+		TransferPosition = 202,
 	};
 }
 
@@ -134,6 +136,54 @@ namespace Provider
 		};
 	};
 	static_assert(Tools::PlainOldData<ControlRiskLimit>);
+
+	// Server workspace -> server request: moves Quantity of the from book's position into the to book at Price, as two Transfer fills;
+	// the firm's row does not move (see Spec.md "Position transfer").
+	struct ControlTransferPosition final
+	{
+		Data::Header<ControlType> Header = Data::Header<ControlType>(ControlType::TransferPosition);
+		int32_t ClientId = -1;          // the requesting GUI's: each Transfer fill's order id carries it, so neither counts as an algo's
+		int32_t InstrumentId = -1;
+		int32_t FromStrategyId = -1;    // 0 the house book
+		int32_t ToStrategyId = -1;
+		int32_t Quantity = 0;           // the part of the from book's position that moves, signed as that position
+		double Price = std::numeric_limits<double>::quiet_NaN();
+
+		// The Transfer fill that books quantity to this strategy at the transfer's price; both fills of a transfer share its FillId.
+		Execution::Fill NewTransferFill(int32_t strategyId, int32_t quantity, Tools::Timestamp timestamp) const
+		{
+			Execution::Fill fill;
+			fill.OrderHeader.OrderId = Execution::OrderId().ClientId(ClientId).StrategyId(strategyId).InstrumentId(InstrumentId);
+			fill.OrderHeader.ExchangeTimestamp = timestamp;
+			fill.OrderHeader.NicTimestamp = timestamp;
+			fill.FillId = static_cast<uint64_t>(timestamp.NanosSinceEpoch);
+			fill.Price = Price;
+			fill.Quantity = quantity;
+			fill.FillType = Execution::FillType::Transfer;
+			return fill;
+		}
+
+		std::string ToString() const
+		{
+			return Tools::Json::Serialize(*this);
+		}
+
+		struct glaze
+		{
+			using T = ControlTransferPosition;
+			static constexpr auto value = glz::object(
+				"Header", &T::Header,
+				"ClientId", &T::ClientId,
+				"InstrumentId", &T::InstrumentId,
+				"FromStrategyId", &T::FromStrategyId,
+				"ToStrategyId", &T::ToStrategyId,
+				"Quantity", &T::Quantity,
+				"Price", &T::Price
+			);
+		};
+	};
+	static_assert(Tools::PlainOldData<ControlTransferPosition>);
+	static_assert(sizeof(ControlTransferPosition) == 32 && offsetof(ControlTransferPosition, Quantity) == 20 && offsetof(ControlTransferPosition, Price) == 24);
 	static_assert(sizeof(ControlRiskLimit) == 28, "ControlRiskLimit must be 28 bytes");
 	static_assert(offsetof(ControlRiskLimit, StrategyId) == 8 && offsetof(ControlRiskLimit, MaxFillsPerSession) == 24);
 

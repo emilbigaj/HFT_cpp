@@ -249,24 +249,33 @@ protected:
 		return result;
 	}
 
-	// C#'s l.Ticker.Replace(l.Root + " ", ""): leg tokens carry only sign+maturity.
-	static std::vector<SymbolLeg> ToLegs(const std::vector<std::unique_ptr<Symbology>>& symbologies, const std::vector<int32_t>& weights, bool shortForm)
+	// A leg in its spread's name: its date alone on the spread's own root ("Apr28"), after a space with its root on another (" ZQ Apr28").
+	static std::string NewLegText(const std::string& root, const Symbology& legSymbology, std::string legText)
+	{
+		if (legSymbology.Root() != root)
+			return " " + legText;
+		// C#'s legText.Replace(root + " ", "")
+		std::string rootAndSpace = root + " ";
+		for (std::size_t position = legText.find(rootAndSpace); position != std::string::npos; position = legText.find(rootAndSpace, position))
+			legText.erase(position, rootAndSpace.length());
+		return legText;
+	}
+
+	// The root appears once, up front; a leg on it carries only sign+maturity ("+2025-12-19"), a leg on another root its own
+	// ticker after a space ("- ZQ 2028-04-30"), so spreads that differ only in a leg's product never share a Symbol.
+	static std::vector<SymbolLeg> ToLegs(const std::string& root, const std::vector<std::unique_ptr<Symbology>>& symbologies, const std::vector<int32_t>& weights, bool shortForm)
 	{
 		std::vector<SymbolLeg> legs;
 		for (size_t i = 0; i < symbologies.size(); i++)
-		{
-			std::string text = shortForm ? symbologies[i]->ShortSymbol() : symbologies[i]->Ticker();
-			text.erase(text.find(symbologies[i]->Root() + " "), symbologies[i]->Root().length() + 1);
-			legs.push_back({ text, weights[i] });
-		}
+			legs.push_back({ NewLegText(root, *symbologies[i], shortForm ? symbologies[i]->ShortSymbol() : symbologies[i]->Ticker()), weights[i] });
 		return legs;
 	}
 
 public:
 	LeggedSymbology(Data::InstrumentType instrumentType, const std::string& exchange, const std::string& root, std::vector<std::unique_ptr<Symbology>> symbologies, std::vector<int32_t> weights)
-	: Symbology(instrumentType, exchange, root, GetLegsTicker(root, ToLegs(symbologies, weights, false)))
+	: Symbology(instrumentType, exchange, root, GetLegsTicker(root, ToLegs(root, symbologies, weights, false)))
 	{
-		_shortSymbol = GetLegsTicker(root, ToLegs(symbologies, weights, true));
+		_shortSymbol = GetLegsTicker(root, ToLegs(root, symbologies, weights, true));
 		_symbologies = std::move(symbologies);
 		_weights = std::move(weights);
 	}
@@ -335,23 +344,32 @@ inline std::unique_ptr<Symbology> Symbology::FromString(const std::string& symbo
 		// Signed leg tokens "±[n]<Date>": root appears once, legs maturity-ascending. Parsed
 		// blindly assuming the format is correct - the ISO date is the fixed-width (10) END of
 		// the token, the digits between the sign and the date are the optional weight magnitude
-		// ("+22026-07-31" = weight 2); anything malformed throws on its own.
-		std::vector<std::unique_ptr<Symbology>> symbologies;
-		std::vector<int32_t> weights;
+		// ("+22026-07-31" = weight 2); anything malformed throws on its own. A token too short to
+		// hold a date is a leg on another root: its sign and weight, then its root and date.
+		std::vector<std::string> legTokens;
 		std::size_t tokenStart = 0;
 		while (tokenStart < remainder.length())
 		{
 			std::size_t tokenEnd = std::min(remainder.find(' ', tokenStart), remainder.length());
-			std::string legToken = remainder.substr(tokenStart, tokenEnd - tokenStart);
+			if (tokenEnd > tokenStart)
+				legTokens.push_back(remainder.substr(tokenStart, tokenEnd - tokenStart));
 			tokenStart = tokenEnd + 1;
-			if (legToken.empty()) continue;
+		}
 
+		std::vector<std::unique_ptr<Symbology>> symbologies;
+		std::vector<int32_t> weights;
+		for (std::size_t tokenIndex = 0; tokenIndex < legTokens.size(); tokenIndex++)
+		{
+			const std::string& legToken = legTokens[tokenIndex];
+			bool isOtherRoot = legToken.length() < 11;   // Why 11: the shortest same-root token is a sign and a 10-character date
+			std::string legRoot = isOtherRoot ? legTokens.at(++tokenIndex) : root;
+			std::string legDate = isOtherRoot ? legTokens.at(++tokenIndex) : legToken.substr(legToken.length() - 10);
 			int32_t sign = legToken[0] == '-' ? -1 : 1;
 			int32_t magnitude = 0;
-			for (int32_t index = 1; index < static_cast<int32_t>(legToken.length()) - 10; index++)
+			for (int32_t index = 1; index < static_cast<int32_t>(legToken.length()) - (isOtherRoot ? 0 : 10); index++)
 				magnitude = magnitude * 10 + (legToken[static_cast<size_t>(index)] - '0');
 
-			symbologies.push_back(std::make_unique<FutureSymbology>(exchange, root, Tools::Timestamp::FromString(legToken.substr(legToken.length() - 10), "%Y-%m-%d")));
+			symbologies.push_back(std::make_unique<FutureSymbology>(exchange, legRoot, Tools::Timestamp::FromString(legDate, "%Y-%m-%d")));
 			weights.push_back(sign * std::max(magnitude, 1));
 		}
 		return std::make_unique<SpreadSymbology>(exchange, root, std::move(symbologies), std::move(weights));

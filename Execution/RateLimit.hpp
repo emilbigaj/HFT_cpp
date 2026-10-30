@@ -233,18 +233,6 @@ namespace Execution
 			return count;
 		}
 
-		[[nodiscard]] bool CanSendOrder(Tools::Timestamp timestamp) const
-		{
-			// Step 1: the window is full
-			if (GetCount(timestamp) >= RateLimit.Limit)
-				return false;
-
-			// Step 2: the send would land in the newest bucket and that bucket is at its burst cap
-			int64_t elapsedNanoseconds = timestamp.NanosSinceEpoch - BucketTimestamp.NanosSinceEpoch;
-			bool isNewestBucketCurrent = elapsedNanoseconds >= 0 && elapsedNanoseconds < BucketNanoseconds();
-			return !isNewestBucketCurrent || Counts[BucketIndex] < UINT8_MAX;
-		}
-
 		bool TrySendOrder(Tools::Timestamp timestamp)
 		{
 			// Step 1: roll the ring up to now, so nothing in it is expired and Total is the count
@@ -337,34 +325,5 @@ namespace Execution
 		&& offsetof(RollingRateLimit, Total) == 28 && offsetof(RollingRateLimit, Counts) == 32);
 	static_assert(Tools::PlainOldData<RollingRateLimit>, "RollingRateLimit must be unmanaged");
 #pragma pack(pop)
-
-	class SessionRateLimit
-	{
-	private:
-		int32_t _limit;
-		int32_t _ordersSentToday;
-
-	public:
-		explicit SessionRateLimit(int32_t limit) : _limit(limit), _ordersSentToday(0) {}
-
-		bool CanSendOrder(Tools::Timestamp /*timestamp*/) const
-		{
-			return _ordersSentToday < _limit;
-		}
-
-		bool TrySendOrder(Tools::Timestamp timestamp)
-		{
-			if (!CanSendOrder(timestamp))
-				return false;
-
-			_ordersSentToday++;
-			return true;
-		}
-
-		void Reset()
-		{
-			_ordersSentToday = 0;
-		}
-	};
 }
 //END_FILE HFT/Execution/RateLimit.hpp

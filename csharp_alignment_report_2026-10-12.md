@@ -232,3 +232,46 @@ Ported against C# `d7f8ea6`. Nothing here asks C# to change code.
 - **Verified:** the JSON harness shows 0 of 161 files differing. Against the real `ServerContext`/`RiskLayer`: the window (47 at 0.5 s and at exactly 1 s, 50 at 1.5 s),
   the session rule (a create in Auction passes, Halted/Unknown refuse it, the full `MaySend` table), and the rewrite of
   `OrderNotFound|NotInSession` to `StateIsDone|NotInSessionInFlight`, discarded. The real-socket handshake still passes with the peek.
+
+## 14. 2026-10-26: P37, P38, C26
+
+Ported against C# `460f8ed`. Nothing here asks C# to change code.
+
+- **P37: ported.** `SessionRateLimit` and `RollingRateLimit::CanSendOrder` are deleted; nothing in C++ called them.
+- **P38: ported in the C++ server.** The four overwrites (`OnOrderState`, `OnOrderRejected`, `OnFill`'s state and fills) are deleted. The
+  server's own refusal is stamped in `OnOrderTarget` after `NewOrderRejected`.
+- **P38 receive path, still open in CME:** the CME router hands the server `FramedMessage::NicTimestamp`, but the iLink gateway never
+  sets it yet, so it is 0 on both connection types. CME is to fill it in `MarketSegmentGateway::Poll` from the
+  kernel-bypass connection's hardware stamp, or the gateway's own `Clock` read on a kernel socket, before this server goes live.
+  The hardware-clock discipline (NIC clock to system clock) is still to be confirmed on the box.
+- **C26:** nothing to port. The C++ server posts its `ServerProcessId` (P22), which the C# check relies on.
+
+## 15. 2026-10-28: C27, C28
+
+Checked against C# `9cc8fe2`. Nothing here asks C# to change code.
+
+- `MarketByPrice64.Quantity` is ported as `Data::MarketByPrice64::Quantity()` (bids plus asks).
+- C27 and C28: nothing to port. The C++ server sees the phone as one more `<principal>_GUI<n>@<model>` GUI of a desk, as C28 says. On
+  Linux `IsProcessAlive` of the process's own id is already true, so C#'s Android self-check has no C++ twin.
+- **Still open from §14:** the CME iLink gateway must set `FramedMessage::NicTimestamp` before the P38 server goes live.
+
+## 16. 2026-10-30: P39, P40
+
+Ported against C# `e0492b0`.
+
+- **P39: ported.** `LeggedSymbology` (`NewLegText`) and the spread branch of `Symbology::FromString`. JSON harness: four spreads parsed from their
+  names (two with legs on other roots, one weighted) serialize identically on both sides and print their names back unchanged.
+- **P40: ported.** `ControlType::TransferPosition = 202`; `ControlTransferPosition` (32 bytes, `Price` NaN by default, `NewTransferFill`);
+  `FillType::Transfer = 3`; `Context::CanTransferPosition`; `Server::OnControlTransferPosition` / `ApplyTransferFill` in the `ReadExecution`
+  switch, as specified.
+- **Observation, not a request:** the report says a failed check "returns at once, no exception". Both sides' code does that for every case
+  except a book id that is no allocated client: `CanTransferPosition` calls `GetInstrumentIdsByClientId`, whose `ThrowIfClientIdOutOfRange`
+  throws (C# and C++ alike), so such a request ends in the CoreGroup thread's catch instead. C++ matches the C# code. If the intent is
+  "never throws", both sides would test `ServerHeader.ClientIds` first.
+- **Deploy:** P39 renames spreads with a leg on another root, so their files must be moved to the new names first.
+- **Still open from §14:** the CME iLink gateway setting `FramedMessage::NicTimestamp` (P38).
+
+## 17. 2026-10-30: P40 updated
+
+Ported against C# `d872704`: `Server::OnControlTransferPosition` takes the from row's lock, then the to row's, applies both fills, and
+releases in reverse; `WriteTransferFill` then records each. Nothing for C# to change.

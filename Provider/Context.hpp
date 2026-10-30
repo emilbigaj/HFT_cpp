@@ -18,6 +18,7 @@
 #include "Session.hpp"
 #include "Tools.hpp"
 #include <cstdint>
+#include <cmath>
 #include <fcntl.h>
 #include <iostream>
 #include <optional>
@@ -311,6 +312,39 @@ public:
 	{
 		return GetPositionHeader(strategyId, instrumentId).GetReadonlyRef().AlgoStatus == Execution::AlgoStatus::Live
 			&& _serverPositionHeaders[instrumentId].GetReadonlyRef().AlgoStatus == Execution::AlgoStatus::Live;
+	}
+
+	// True when the transfer may go ahead against the rows as they are now: the server enforces it and a server workspace's dialog
+	// checks it before sending, so the two never disagree (see Spec.md "Position transfer"). Cold path.
+	bool CanTransferPosition(const Provider::ControlTransferPosition& controlTransferPosition)
+	{
+		int32_t instrumentId = controlTransferPosition.InstrumentId;
+		int32_t fromStrategyId = controlTransferPosition.FromStrategyId;
+		int32_t toStrategyId = controlTransferPosition.ToStrategyId;
+
+		// Step 1: two books, both trading the instrument
+		if (fromStrategyId == toStrategyId)
+			return false;
+		bool isEachBookAllocated = GetInstrumentIdsByClientId(fromStrategyId).GetReadonlyRef()[instrumentId] && GetInstrumentIdsByClientId(toStrategyId).GetReadonlyRef()[instrumentId];
+		if (!isEachBookAllocated)
+			return false;
+
+		// Step 2: part of the from book's position, on its side
+		int32_t fromQuantity = GetPositionHeader(fromStrategyId, instrumentId).GetReadonlyRef().Quantity;
+		int32_t quantity = controlTransferPosition.Quantity;
+		auto sign = [](int32_t value) { return (value > 0) - (value < 0); };
+		bool isPartOfPosition = quantity != 0 && sign(quantity) == sign(fromQuantity) && std::abs(quantity) <= std::abs(fromQuantity);
+		if (!isPartOfPosition)
+			return false;
+
+		// Step 3: a price to book it at
+		if (!std::isfinite(controlTransferPosition.Price))
+			return false;
+
+		// Step 4: no algo may trade either position meanwhile; the house book has none
+		bool isEitherAlgoLive = (fromStrategyId != Execution::OrderIdAllocator::ServerStrategyId && IsAlgoLive(fromStrategyId, instrumentId))
+			|| (toStrategyId != Execution::OrderIdAllocator::ServerStrategyId && IsAlgoLive(toStrategyId, instrumentId));
+		return !isEitherAlgoLive;
 	}
 
     virtual bool TryGetInstrumentId(int32_t instrumentIndex, int32_t& instrumentId) = 0;

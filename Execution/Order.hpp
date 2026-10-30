@@ -154,6 +154,7 @@ namespace Execution
 		Maker = 0,
 		Taker = 1,
 		Auction = 2,
+		Transfer = 3,   // no trade: the server moved a position between two books (see Spec.md "Position transfer")
 	};
 
 #pragma pack(push, 1)

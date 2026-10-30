@@ -305,6 +305,12 @@ public:
                             CancelAlgoOrders(controlAlgoStatus.StrategyId, controlAlgoStatus.InstrumentId);
                         break;
                     }
+                    case static_cast<uint8_t>(Provider::ControlType::TransferPosition):
+                    {
+                        const Provider::ControlTransferPosition& controlTransferPosition = *reinterpret_cast<const Provider::ControlTransferPosition*>(rdst.data());
+                        OnControlTransferPosition(controlTransferPosition);
+                        break;
+                    }
                     default:
                         UnknownExecutionMessages++;
                         break;
@@ -370,6 +376,51 @@ public:
 
         // Step 3: on record as a fill's rows are
         WriteToRecord(strategyId, _serverContext.GetInstrument(instrumentId).Header().CoreGroupId, positionHeader);
+    }
+
+    // CoreGroup thread only: the position rows' sole writer, as OnFill. Moves part of one book's position into another as two Transfer
+    // fills at the request's price, both rows under both locks at once so no reader sees one book moved and the other not; the firm's
+    // row, the exchange and every fill count stay as they were (see Spec.md "Position transfer"). A transfer the check refuses moves
+    // nothing and is dropped silently: the dialog checks the same, so only a race gets here.
+    void OnControlTransferPosition(const Provider::ControlTransferPosition& controlTransferPosition)
+    {
+        // Step 1: the dialog's own check, against the rows as they are now
+        if (!_serverContext.CanTransferPosition(controlTransferPosition))
+            return;
+
+        // Step 2: one fill out of the from book, one into the to book, at one price and time
+        Tools::Timestamp now = Tools::Clock::UtcNow();
+        int32_t quantity = controlTransferPosition.Quantity;
+        Execution::Fill fromFill = controlTransferPosition.NewTransferFill(controlTransferPosition.FromStrategyId, -quantity, now);
+        Execution::Fill toFill = controlTransferPosition.NewTransferFill(controlTransferPosition.ToStrategyId, quantity, now);
+
+        // Step 3: both rows under both locks, acquired from-to and released in reverse, as OnFill does with its two rows
+        int32_t instrumentId = controlTransferPosition.InstrumentId;
+        double multiplier = _serverContext.GetInstrument(instrumentId).Multiplier();
+        Socket::SharedArrayEntry<Execution::PositionHeader>& fromPositionEntry = _serverContext.GetPositionHeader(controlTransferPosition.FromStrategyId, instrumentId);
+        Socket::SharedArrayEntry<Execution::PositionHeader>& toPositionEntry = _serverContext.GetPositionHeader(controlTransferPosition.ToStrategyId, instrumentId);
+        fromPositionEntry.AcquireLock();
+        toPositionEntry.AcquireLock();
+        fromPositionEntry.GetRef().OnFill(fromFill, multiplier);
+        toPositionEntry.GetRef().OnFill(toFill, multiplier);
+        toPositionEntry.ReleaseLock();
+        fromPositionEntry.ReleaseLock();
+
+        // Step 4: each on record once both rows are consistent
+        WriteTransferFill(fromFill);
+        WriteTransferFill(toFill);
+    }
+
+    // One Transfer fill on record as OnFill writes a fill: the fill and its book's row on the book's channel (where Logging's tap
+    // files them; the house book has no channel), the fill in the audit. Never the firm's row: the firm traded nothing.
+    void WriteTransferFill(const Execution::Fill& fill)
+    {
+        int32_t strategyId = fill.OrderHeader.OrderId.StrategyId();
+        int32_t instrumentId = fill.OrderHeader.OrderId.InstrumentId();
+        int32_t coreGroupId = _serverContext.GetInstrument(instrumentId).Header().CoreGroupId;
+        WriteToExecution(strategyId, coreGroupId, fill);
+        WriteToExecution(strategyId, coreGroupId, _serverContext.GetPositionHeader(strategyId, instrumentId).GetRef());
+        WriteToAudit(coreGroupId, fill);
     }
 
     // Cancels the working algo orders a user's pause stops: the master switch every strategy's on the instrument, a strategy's
@@ -506,9 +557,9 @@ public:
         }
     }
 
+    // Keeps the state's NIC stamp: whoever received it from the exchange stamped it (see Spec.md "NIC timestamps")
     Execution::OrderState OnOrderState(Execution::OrderState& orderState)
     {
-        orderState.OrderHeader.NicTimestamp = Tools::Clock::UtcNow();
         Execution::OrderState& existingOrderState = WriteOrderState(orderState);
         WriteToExecution(existingOrderState);
         if (OrderState)
@@ -568,7 +619,6 @@ public:
                 orderState.NewRejected(orderRejected, rejectedState);
                 OnOrderState(rejectedState);
             }
-            orderRejected.OrderHeader.NicTimestamp = Tools::Clock::UtcNow();
             _riskLayer.OnOrderRejected(orderRejected);
             Reject(orderRejected, message);
             return orderRejected;
@@ -625,6 +675,7 @@ public:
 		{
 			Execution::OrderRejected orderRejected;
 			orderTarget.NewOrderRejected(orderRejectedReasons, Execution::OrderRejectedSource::Server, orderRejected);
+			orderRejected.OrderHeader.NicTimestamp = Tools::Clock::UtcNow();   // Why: the server's own refusal is made now; the header it copied carries the client's send time
 			OnOrderRejected(orderRejected, "Rejected by Server Risk Layer");
 		}
     }
@@ -729,9 +780,8 @@ public:
         if (std::abs(orderState.QuantityFilled) <= std::abs(existingOrderState.QuantityFilled))
             return;
 
-        Tools::Timestamp now = Tools::Clock::UtcNow();
-        orderState.OrderHeader.NicTimestamp = now;   // same stamp as its fills: equal NIC keeps ring order (state, fill, position) in the audit
-        for (Execution::Fill& fill : fills)
+        // Why no stamp here: the receiver gave the state and its fills one NIC stamp, which keeps ring order (state, fill, position) in the audit
+        for (const Execution::Fill& fill : fills)
         {
             // Leg ids differ from the order's only in the InstrumentId bits, so GlobalIndex (client +
             // local slot) is the belongs-to-this-order check plain id equality can no longer be.
@@ -739,7 +789,6 @@ public:
             {
                 throw std::out_of_range("Server::OnFill: fill does not belong to the order");
             }
-            fill.OrderHeader.NicTimestamp = now;
         }
 
         int32_t strategyId = orderState.OrderHeader.OrderId.StrategyId();
