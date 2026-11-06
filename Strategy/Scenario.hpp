@@ -88,13 +88,14 @@ public:
                 throw std::logic_error("Clock has been stopped; a simulation Scenario can not be restarted.");
             }
 
-            Tools::Clock::SetBegin(_client.ClientContext.ServerHeader().GetReadonlyRef().Timestamp);
+            // ServerHeader.Timestamp is no longer written by any server (C# P43): the clock is the newest NIC time among the books
+            Tools::Clock::SetBegin(_client.ClientContext.GetLatestMarketDataTimestamp());
             Tools::Clock::SetEnd(Tools::Timestamp::MaxValue);
             auto interject = Tools::Clock::Interject += [this](Tools::Timestamp)
             {
-                // The header follows NIC timestamps written by several RX threads and can step back; OnInterject
+                // The books' NIC timestamps are written by several RX threads and can step back; OnInterject
                 // ignores an earlier time, which would let the clock run straight to End.
-                Tools::Clock::OnInterject(Tools::Timestamp::Max(_client.ClientContext.ServerHeader().GetReadonlyRef().Timestamp, Tools::Clock::UtcNow()));
+                Tools::Clock::OnInterject(Tools::Timestamp::Max(_client.ClientContext.GetLatestMarketDataTimestamp(), Tools::Clock::UtcNow()));
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             };
             auto tickTock = Tools::Clock::TickTock += [this](Tools::Timestamp) { _client.ReadSocket(); };

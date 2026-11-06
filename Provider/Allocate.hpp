@@ -144,7 +144,7 @@ namespace Provider
 		Data::Header<ControlType> Header = Data::Header<ControlType>(ControlType::TransferPosition);
 		int32_t ClientId = -1;          // the requesting GUI's: each Transfer fill's order id carries it, so neither counts as an algo's
 		int32_t InstrumentId = -1;
-		int32_t FromStrategyId = -1;    // 0 the house book
+		int32_t FromStrategyId = -1;    // 0 the ServerStrategy
 		int32_t ToStrategyId = -1;
 		int32_t Quantity = 0;           // the part of the from book's position that moves, signed as that position
 		double Price = std::numeric_limits<double>::quiet_NaN();

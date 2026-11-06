@@ -116,8 +116,8 @@ namespace Provider
 			_logger = std::make_unique<Socket::ClientSocket>(
 				Context.DirectoryPath.string() + ".alert",
 				Context.LoggingServerName,
-				std::vector<int32_t>{Socket::SocketChannel::ExecutionChannelLength},
-				std::vector<int32_t>{Socket::SocketChannel::AdminChannelLength});
+				std::vector<int32_t>{Socket::SocketChannel::ChannelLength},
+				std::vector<int32_t>{Socket::SocketChannel::ChannelLength});
 			_logger->Connect();
 
 			// NOTE: C#'s TaskScheduler.UnobservedTaskException hook has no analogue here (no task

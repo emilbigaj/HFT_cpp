@@ -61,19 +61,6 @@ private:
         return allocate.ClientId;
     }
 
-    // Peek the server's published ServerHeader (shared memory) for the CoreGroup layout, so we can
-    // size our channels BEFORE _socket is built. The server publishes it as a LetterBox named
-    // "<serverName>/ServerHeader" (see ServerContext::Connect / Context). Returns the channel-length
-    // array (identical for both directions). Blocks until the server is up.
-    static std::vector<int32_t> ReadServerChannelLengths(const std::filesystem::path& serverName)
-    {
-        Socket::LetterBox<Provider::ServerHeader> serverHeaderBox(serverName / "ServerHeader", Tools::Access::Read);
-        Provider::ServerHeader serverHeader;
-        while (!serverHeaderBox.TryPeek(serverHeader))
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        return Socket::SocketChannel::BuildChannelLengths(serverHeader.CoreGroupIds);
-    }
-
 public:
 
     const int32_t ClientId;
@@ -121,9 +108,8 @@ public:
     Client(const std::string& clientName, const std::string& serverName)
         : ClientName(Provider::ClientContext::GetDirectoryPath(clientName)),
           ServerName(Provider::ServerContext::GetDirectoryPath(serverName)),
-          // Channel 0 is admin; channels 1..7 are per-CoreGroupId execution channels, sized from the
-          // server's declared CoreGroupIds (read before connecting).
-          _socket(ClientName, ServerName, ReadServerChannelLengths(ServerName), ReadServerChannelLengths(ServerName)),
+          // Channel 0 is admin; channels 1..7 are per-CoreGroupId execution channels, the same eight on every ring (see SocketChannel).
+          _socket(ClientName, ServerName, Socket::SocketChannel::ChannelLengths, Socket::SocketChannel::ChannelLengths),
           _isOrderActive(0ULL),
           ClientId(_socket.Connect()),
           _closeOnThrow{ _socket },

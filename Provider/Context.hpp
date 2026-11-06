@@ -341,7 +341,7 @@ public:
 		if (!std::isfinite(controlTransferPosition.Price))
 			return false;
 
-		// Step 4: no algo may trade either position meanwhile; the house book has none
+		// Step 4: no algo may trade either position meanwhile; the ServerStrategy has none
 		bool isEitherAlgoLive = (fromStrategyId != Execution::OrderIdAllocator::ServerStrategyId && IsAlgoLive(fromStrategyId, instrumentId))
 			|| (toStrategyId != Execution::OrderIdAllocator::ServerStrategyId && IsAlgoLive(toStrategyId, instrumentId));
 		return !isEitherAlgoLive;
@@ -435,6 +435,20 @@ public:
 	Socket::SharedArrayEntry<Execution::RiskLimit>& GetRiskLimit(int32_t clientId, int32_t instrumentId)
 	{
 		return _localRiskLimits[GetLocalPositionIndex(clientId, instrumentId)];
+	}
+
+	// The newest NIC time among this context's books: every instrument's for the server's context, the strategy's own for a
+	// client's. Cold path (a Workspace's clock, each refresh; the simulation scenario's interject).
+	Tools::Timestamp GetLatestMarketDataTimestamp()
+	{
+		Tools::Timestamp latestNicTimestamp = Tools::Timestamp::MinValue;
+		for (int32_t instrumentId : InstrumentIds())
+		{
+			// Why the entry, not GetMarketByPrice64: an instrument freed since InstrumentIds was read would throw; its old time does no harm
+			Tools::Timestamp nicTimestamp = _marketsByPrice[instrumentId].GetReadonlyRef().NicTimestamp;
+			latestNicTimestamp = Tools::Timestamp::Max(nicTimestamp, latestNicTimestamp);
+		}
+		return latestNicTimestamp;
 	}
 
 	Socket::SharedArrayEntry<Execution::MessageEfficiency>& GetMessageEfficiency(int32_t productGroupId)
@@ -733,7 +747,7 @@ public:
 		return DirectoriesPath() / modeStr / serverName;
 	}
 
-	// The house book's directory: the Strategies tree under the server's leaf name. Strategy 0 has no
+	// The ServerStrategy's directory: the Strategies tree under the server's leaf name. Strategy 0 has no
 	// socket to take a name from, so its position files hang off this instead. See Spec.md.
 	const std::filesystem::path ServerStrategyName;
 
@@ -744,7 +758,7 @@ public:
 		// region, and Context::EnsureConnected() then spins forever on a box nobody writes.
 		Socket::LetterBox<Provider::ServerHeader> serverHeaderBox(std::filesystem::path(serverNameStr) / "ServerHeader", Tools::Access::Write);
 
-		// Reserve the house book before anyone can connect. AllocateClientId hands out
+		// Reserve the ServerStrategy before anyone can connect. AllocateClientId hands out
 		// ClientIds.LowestClear(), so without this the FIRST client to attach takes id 0 and every
 		// manual order from a server workspace would be attributed to it. Pre-setting the bit both
 		// keeps it out of the allocator and makes the slot addressable — ThrowIfClientIdOutOfRange
@@ -801,10 +815,16 @@ public:
 		return _clientSocketHeaders[clientId];
 	}
 
+	// The directory a client's books are filed under: its socket's name, or ServerStrategyName for strategy 0, which has no socket (see Spec.md).
+	std::string GetClientName(int32_t clientId)
+	{
+		return clientId == Execution::OrderIdAllocator::ServerStrategyId ? ServerStrategyName.string() : GetSocketHeader(clientId).GetReadonlyRef().ClientName.ToString();
+	}
+
     int32_t AllocateClientId(const Socket::SocketHeader& socketHeader)
     {       
         // The server's leaf name is reserved for strategy 0's directory — a client named after the
-        // server would share the house book's files. See Spec.md.
+        // server would share the ServerStrategy's files. See Spec.md.
         if (socketHeader.ClientName == Tools::String256(ServerStrategyName.string()))
             return static_cast<int32_t>(Socket::ConnectRefusal::ReservedClientName);
 
@@ -971,10 +991,7 @@ public:
 		Data::InstrumentHeader256& header256 = GetInstrumentHeader(instrumentHeaderId).GetRef();
 		std::unique_ptr<Data::Symbology> symbology = header256.Symbology();
 
-		// Strategy 0 has no socket to take a name from; its book lives at ServerStrategyName (see Spec.md).
-		std::string clientName = clientId == Execution::OrderIdAllocator::ServerStrategyId
-			? ServerStrategyName.string()
-			: GetSocketHeader(clientId).GetReadonlyRef().ClientName.ToString();
+		std::string clientName = GetClientName(clientId);
 		std::string positionPath = GetPositionFilePath(clientName, symbology->Symbol()).string();
 		std::optional<std::string> positionLine = Tools::ReadLastLine(positionPath);
 		Execution::PositionHeader positionHeader = positionLine ? Tools::Json::Deserialize<Execution::PositionHeader>(positionLine.value()) : Execution::PositionHeader{};
@@ -1151,7 +1168,7 @@ public:
 // --- Inline definitions that need complete Context class definition ---
 
 // A ServerContext's positions are the server-wide rows; no client owns their order slots (only
-// Client.Create ever sets one), so the house id is the correct inert owner. Matches C#.
+// Client.Create ever sets one), so the ServerStrategy id is the correct inert owner. Matches C#.
 inline void Context::CreatePosition(Data::Instrument& instrument)
 {
 	Tools::RAIISpinLock lock(_lock);

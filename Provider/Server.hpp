@@ -133,8 +133,8 @@ public:
       _serverHeaderBox((InitDirectories(), ServerContext::Connect(serverHeader))),
       _serverSocket(ServerName.string(), serverHeader.ClientIds.Length()),
       _serverContext(ServerName, Tools::Access::Write),
-      _loggingServer(ServerName.string() + ".server", _serverContext.LoggingServerName, {Socket::SocketChannel::AdminChannelLength}, {Socket::SocketChannel::AdminChannelLength}),
-      _audit(ServerName.string() + ".audit", _serverContext.LoggingServerName, Socket::SocketChannel::BuildChannelLengths(serverHeader.CoreGroupIds), {Socket::SocketChannel::AdminChannelLength}),
+      _loggingServer(ServerName.string() + ".server", _serverContext.LoggingServerName, {Socket::SocketChannel::ChannelLength}, {Socket::SocketChannel::ChannelLength}),
+      _audit(ServerName.string() + ".audit", _serverContext.LoggingServerName, Socket::SocketChannel::ChannelLengths, {Socket::SocketChannel::ChannelLength}),
       _riskLayer(_serverContext, Execution::OrderRejectedSource::Server),
       _loggableManager()
     {
@@ -143,9 +143,9 @@ public:
         _serverSocket.Persistance = serverHeader.Persistance;
 
         _instrumentData.resize(static_cast<size_t>(serverHeader.InstrumentIds.Length()));
-        // +1: channel index == CoreGroupId, so we need slots 0..HighestSet() (matches BuildChannelLengths).
-        _clientIdsByCoreGroupId.resize(static_cast<size_t>(serverHeader.CoreGroupIds.HighestSet() + 1));
-        _drainAcknowledgedByCoreGroupId = std::make_unique<PaddedCounter[]>(static_cast<size_t>(serverHeader.CoreGroupIds.HighestSet() + 1));
+        // One slot per channel: channel index == CoreGroupId.
+        _clientIdsByCoreGroupId.resize(static_cast<size_t>(Socket::SocketChannel::ChannelCount));
+        _drainAcknowledgedByCoreGroupId = std::make_unique<PaddedCounter[]>(static_cast<size_t>(Socket::SocketChannel::ChannelCount));
         _drainRequestAtCloseByClientId.resize(static_cast<size_t>(serverHeader.ClientIds.Length()));
 
         // One OrderTarget injection queue per EXECUTION CoreGroup (admin carries no order targets).
@@ -191,6 +191,14 @@ public:
 
         _loggingServer.Connect();
         _audit.Connect();
+
+        // The ServerStrategy has no client, so it gets a socket of its own, Detached like a restored strategy's: the server's writes to
+        // strategy 0's channel land in it, and Logging taps and files it under ServerStrategyName as it does a strategy's (see Spec.md
+        // "Strategy 0"). Why not OnClientAllocated: its subscribers record real clients, and this one must never be reloaded as one.
+        Socket::SocketHeader serverStrategySocketHeader(ServerName.string(), _serverContext.ServerStrategyName.string(), Socket::SocketChannel::ChannelLengths, Socket::SocketChannel::ChannelLengths, static_cast<int32_t>(getpid()));
+        serverStrategySocketHeader.ClientId = Execution::OrderIdAllocator::ServerStrategyId;
+        _serverSocket.CreateDetatchedClient(serverStrategySocketHeader);
+        _loggingServer.Write(serverStrategySocketHeader);
 
     }
 
@@ -250,8 +258,11 @@ public:
     // One reader thread per (client, channel) => SPSC-safe; different segments touch different
     // ReadOnlySockets. It also drains the injection queue first (hub cancels + RX replays).
     // Realtime: the caller wraps each call in try/catch -> AlertManager::OnException and keeps polling; an exception must never end the process.
-    void ReadExecution(int32_t coreGroupId)
+    // Drains the injected targets and every client's channel for this CoreGroup. Returns true if it read anything.
+    bool ReadExecution(int32_t coreGroupId)
     {
+        bool isRead = false;
+
         // Drain injected OrderTargets first (hub cancels + RX replays): sole reader, no lock. Copy out
         // and Dequeue before sending so the slot frees ahead of a slow SendOrder.
         if (Tools::ByteQueue* injected = _orderTargetQueues[static_cast<size_t>(coreGroupId)].get())
@@ -262,6 +273,7 @@ public:
                 Execution::OrderTarget orderTarget = *reinterpret_cast<const Execution::OrderTarget*>(qsrc.data());
                 injected->Dequeue();
                 SendServerOrderTarget(orderTarget);
+                isRead = true;
             }
         }
 
@@ -273,6 +285,8 @@ public:
             {
                 if (rdst.empty())
                     continue;
+                isRead = true;
+
                 uint8_t msgType = rdst[0];
                 switch (msgType)
                 {
@@ -322,6 +336,7 @@ public:
         int64_t drainRequest = _drainRequest.Value.load(std::memory_order_acquire);
         if (drainRequest != _drainAcknowledgedByCoreGroupId[coreGroupId].Value.load(std::memory_order_relaxed))
             _drainAcknowledgedByCoreGroupId[coreGroupId].Value.store(drainRequest, std::memory_order_release);
+        return isRead;
     }
 
     // CoreGroup thread only - the row's sole writer. Config fields in place under the seq bump; the working quantities live on
@@ -329,7 +344,7 @@ public:
     // never writes .risklimit files: Logging appends the row put on record.
     void OnControlRiskLimit(const Provider::ControlRiskLimit& controlRiskLimit)
     {
-        // Step 1: the row: the firm's for strategy 0, never a strategy's (the house book's orders are manual, checked by the firm's alone)
+        // Step 1: the row: the firm's for strategy 0, never a strategy's (the ServerStrategy's orders are manual, checked by the firm's alone)
         int32_t strategyId = controlRiskLimit.StrategyId;
         bool isServerRiskLimit = strategyId == Execution::OrderIdAllocator::ServerStrategyId;
         Socket::SharedArrayEntry<Execution::RiskLimit>& riskLimitEntry = isServerRiskLimit ? _serverContext.GetRiskLimit(controlRiskLimit.InstrumentId) : _serverContext.GetRiskLimit(strategyId, controlRiskLimit.InstrumentId);
@@ -362,7 +377,7 @@ public:
     // row; strategy 0's (a server workspace's) is the server row, the master switch every algo on the instrument also needs Live.
     void OnControlAlgoStatus(int32_t strategyId, int32_t instrumentId, Execution::AlgoStatus algoStatus)
     {
-        // Step 1: the switch: the master is the server row, never a strategy's (the house book has no algo of its own)
+        // Step 1: the switch: the master is the server row, never a strategy's (the ServerStrategy has no algo of its own)
         bool isMasterSwitch = strategyId == Execution::OrderIdAllocator::ServerStrategyId;
         Socket::SharedArrayEntry<Execution::PositionHeader>& positionEntry = isMasterSwitch ? _serverContext.GetPositionHeader(instrumentId) : _serverContext.GetPositionHeader(strategyId, instrumentId);
 
@@ -412,7 +427,7 @@ public:
     }
 
     // One Transfer fill on record as OnFill writes a fill: the fill and its book's row on the book's channel (where Logging's tap
-    // files them; the house book has no channel), the fill in the audit. Never the firm's row: the firm traded nothing.
+    // files them, the ServerStrategy's included), the fill in the audit. Never the firm's row: the firm traded nothing.
     void WriteTransferFill(const Execution::Fill& fill)
     {
         int32_t strategyId = fill.OrderHeader.OrderId.StrategyId();
@@ -424,7 +439,7 @@ public:
     }
 
     // Cancels the working algo orders a user's pause stops: the master switch every strategy's on the instrument, a strategy's
-    // switch that strategy's. Algo orders only: a manual order (a GUI's, the house book's) is never touched. CoreGroup thread only.
+    // switch that strategy's. Algo orders only: a manual order (a GUI's, the ServerStrategy's) is never touched. CoreGroup thread only.
     void CancelAlgoOrders(int32_t strategyId, int32_t instrumentId)
     {
         bool isMasterSwitch = strategyId == Execution::OrderIdAllocator::ServerStrategyId;
@@ -701,6 +716,9 @@ public:
         OpenInstrumentData(instrumentId, allocateInstrument.Symbol.ToString());
 
         WriteToAudit(Socket::SocketChannel::Admin, allocateInstrument);
+        // Why: the ServerStrategy is allocated every instrument (OnAllocateInstrument below) but never asked, so it gets the admin reply a
+        // strategy gets for its own request, from which Logging's tap names its fill and position files
+        WriteToAdmin(Execution::OrderIdAllocator::ServerStrategyId, allocateInstrument);
 
         return instrumentId;
     }
@@ -739,7 +757,7 @@ private:
 
         _serverContext.AllocateInstrument(clientId, instrumentId);
 
-        // Strategy 0 is the house book: it holds the union of every client's allocations, which is what
+        // Strategy 0 is the ServerStrategy: it holds the union of every client's allocations, which is what
         // lets a server workspace trade anything anyone can see without a validator special-case. It gets
         // no core-group poll bit (no socket) and no admin echo (nobody listening). See Spec.md.
         if (clientId != Execution::OrderIdAllocator::ServerStrategyId)
@@ -1046,6 +1064,9 @@ public:
                 continue;
 
             Socket::SocketHeader socketHeader = Tools::Json::Deserialize<Socket::SocketHeader>(line);
+            // Why the constant layout, not the record's: a record written before the layout was constant (2026-11-07) carries the
+            // channels its server had then, and a ring built from it would not be the one its client maps (see Spec.md)
+            socketHeader.SetChannelLengths(Socket::SocketChannel::ChannelLengths, Socket::SocketChannel::ChannelLengths);
             socketHeader.ClientId = _serverContext.AllocateClientId(socketHeader);
             // At startup a refused client is a broken clients file, not a connect to answer: stop loudly
             if (socketHeader.ClientId < 0)
@@ -1075,7 +1096,7 @@ public:
                           << allocateInstrument.ExchangeInstrumentId << ") is no longer listed; not restored." << std::endl;
                 continue;
             }
-            // The full client path, not the server-only one: it restores the client and house-book
+            // The full client path, not the server-only one: it restores the client and ServerStrategy
             // allocations and fires AllocateInstrument, which the CME adapter needs to rebuild routers
             // and market data for orders still working at the exchange after a restart.
             OnAllocateInstrument(allocateInstrument.ClientId, allocateInstrument);

@@ -35,28 +35,15 @@ namespace Socket
 	class SocketChannel
 	{
 	public:
-		static constexpr int32_t AdminChannelLength = Tools::Memory::HugePageLength;
-		static constexpr int32_t ExecutionChannelLength = Tools::Memory::HugePageLength;
+		static constexpr int32_t ChannelLength = Tools::Memory::HugePageLength;   // every channel, admin and execution alike, is one hugepage
+		static constexpr int32_t ChannelCount = 8;                                // channel index == CoreGroupId: 0 admin, 1..7 execution; a SocketHeader holds at most 8 per direction
 		static const int32_t Admin = 0;
 
-		// Build the per-direction channel-length array from a CoreGroups bitset (channel index ==
-		// CoreGroupId). Size = highest set bit + 1, so unset indices below it become 0-length gaps.
-		// Channel 0 = admin (AdminChannelLength); 1..7 = execution (ExecutionChannelLength). Both
-		// directions use this same shape. CoreGroupIds must set bit 0 (admin) and stay within 0..7.
-		static std::vector<int32_t> BuildChannelLengths(Tools::Bitset64 coreGroupIds)
-		{
-			coreGroupIds.Set(Admin);
-			
-			int32_t highest = coreGroupIds.HighestSet();
-			if (highest > 7)
-				throw std::invalid_argument("SocketChannel::BuildChannelLengths: CoreGroupId > 7 (max 8 channels).");
-
-			std::vector<int32_t> lengths(static_cast<size_t>(highest + 1), 0);
-			for (int32_t coreGroupId : coreGroupIds)
-				lengths[static_cast<size_t>(coreGroupId)] = (coreGroupId == Admin) ? AdminChannelLength : ExecutionChannelLength;
-
-			return lengths;
-		}
+		// The per-direction channel lengths of every ring on every server: one channel per possible CoreGroupId, whether the server has
+		// that group or not. Why constant: a ring is mapped by its client, the server, Logging and the week's replay at different times,
+		// and a layout computed from the server's groups was computed differently by each once a group was added mid-week (see Spec.md
+		// "The ring's channel layout is constant"). Who reads which channel is decided by allocation, not by the layout.
+		static inline const std::vector<int32_t> ChannelLengths = std::vector<int32_t>(static_cast<size_t>(ChannelCount), ChannelLength);
 
 		// Per-instrument broadcast ring: one writer (the server), many readers (subscribed clients).
 		// Named "{serverName}_{symbol}_data"; Tools::Memory sanitizes the name (spaces/dashes are fine).
@@ -113,7 +100,12 @@ namespace Socket
 			ClientName = clientName;
 			Timestamp = Tools::Timestamp::UtcNow();
 			ClientProcessId = clientProcessId;
+			SetChannelLengths(clientToServerLengths, serverToClientLengths);
+		}
 
+		// Both directions' channel counts and lengths, at most 8 each.
+		void SetChannelLengths(const std::vector<int32_t>& clientToServerLengths, const std::vector<int32_t>& serverToClientLengths)
+		{
 			ClientToServerChannelCount = std::min(8, static_cast<int32_t>(clientToServerLengths.size()));
 			for (int32_t i = 0; i < ClientToServerChannelCount; i++)
 			{

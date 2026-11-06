@@ -150,7 +150,15 @@ namespace Tools
 				int error = errno; close(fileDescriptor);
 				throw std::runtime_error("Memory::CreateOrOpenShared: fstat failed: " + fullPath + ": " + std::strerror(error));
 			}
-			if (fileStatus.st_size < static_cast<off_t>(length))
+			// Why only a new file grows: an existing region of another length is another build's layout, and a mapping over it would
+			// read every ring and row one offset off, silently (see Spec.md "The ring's channel layout is constant")
+			if (fileStatus.st_size != 0 && fileStatus.st_size != static_cast<off_t>(length))
+			{
+				close(fileDescriptor);
+				throw std::runtime_error("Memory::CreateOrOpenShared: " + fullPath + " is " + std::to_string(fileStatus.st_size) + " bytes, this build maps " + std::to_string(length)
+					+ "; a region of another build holds the name: stop every process that maps it, delete the file, start again");
+			}
+			if (fileStatus.st_size == 0)
 			{
 				if (ftruncate(fileDescriptor, static_cast<off_t>(length)) == -1)
 				{

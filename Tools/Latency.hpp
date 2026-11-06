@@ -73,7 +73,6 @@ namespace Tools
 	class Latency
 	{
 	public:
-		static inline bool Enabled = true;
 		static inline std::function<void(std::span<const LatencyRecord>)> OnFlush = nullptr;
 		static constexpr int32_t MaxRecords = 1024;
 		
@@ -119,7 +118,7 @@ namespace Tools
 
 		explicit Latency(int32_t callId) : _recordIndex(-1), _parentIndex(s_currentParentIndex), _startTicks(0), _isCanceled(false)
 		{
-			if (!Enabled)
+			if (!OnFlush)   // Why: a probe nobody listens to measures nothing; 47 million a day cost a C# backtest 0.9 s (C# patch_log.md 2026-11-04)
 			{
 				return;
 			}
@@ -155,7 +154,7 @@ namespace Tools
 		// that goes negative clamps to 0 there.
 		static void Record(int32_t callId, Tools::Duration duration) noexcept
 		{
-			if (!Enabled)
+			if (!OnFlush)
 			{
 				return;
 			}
@@ -175,7 +174,7 @@ namespace Tools
 
 		~Latency()
 		{
-			if (!Enabled)
+			if (_recordIndex < 0)   // this probe was skipped: nothing to balance, whoever subscribed meanwhile
 			{
 				return;
 			}

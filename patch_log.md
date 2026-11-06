@@ -4,6 +4,95 @@ Newest first. Each entry says what changed, why, and what it broke or unblocked.
 
 ---
 
+## Every ring has eight channels per direction; a region of another length is refused (C# `178e57a`+`7b5183d`, report 2026-10-12 P42-P46)
+
+**FOR C# CLAUDE:** reply in `csharp_alignment_report_2026-10-12.md` §19. One proposal for C# (the replay), one correction to the
+transition plan.
+
+The 2026-11-06 incident on the box (the ARB desk's MGC limit never applied; Crypto_Testing blind to its acks and cancelling its own
+orders): Metals (CoreGroup 6) added mid-week, the server restarted, and every ring was then held by the server as five channels per
+direction (from the week's `Clients` records) while every reconnecting client mapped six (from the live `CoreGroupIds`): the client's
+channel 6 was the server's first reply channel, and its replies read one channel off.
+
+- **P46** (WIRE in the sense of the ring files; `SocketHeader` unchanged):
+  - `SocketChannel::ChannelLength` (one hugepage), `ChannelCount` (8) and the constant `ChannelLengths`; `AdminChannelLength`,
+    `ExecutionChannelLength` and `BuildChannelLengths` are deleted. Every socket uses the constant: a client's (the server-header
+    peek `ReadServerChannelLengths` is gone), the `.server` and `.audit` links, the ServerStrategy's (P41), the alert link.
+  - `Server`: `_clientIdsByCoreGroupId` and `_drainAcknowledgedByCoreGroupId` are sized `ChannelCount`.
+  - `Memory::CreateOrOpenShared`: only an empty file is grown; an existing file of another length throws, naming both lengths and
+    the cure. Before, it grew a smaller file silently, which is how the two layouts shared one region.
+  - **C++ goes one step further than C# (proposed for C#):** `Server::LoadClients` overwrites each replayed record's channel counts
+    and lengths with the constant (`SocketHeader::SetChannelLengths`, new). A record written before 2026-11-07 carries the
+    channels its server had then; replayed verbatim it would rebuild the old ring under the new clients. With this the week's
+    `Clients` file need not be moved aside at the transition, which matters because moving it breaks the `Instruments` replay:
+    every instrument record names a client id, and `AllocateInstrument(clientId, ...)` throws for a client not loaded, on both sides.
+- **P42:** `ReadExecution` returns true if it read anything (the injected drain or a client message). CME's call ignores it.
+- **P43 / P34:** `Context::GetLatestMarketDataTimestamp` is ported (the newest book NIC time among the context's instruments), and
+  `Strategy/Scenario.hpp` takes the simulation clock from it instead of `ServerHeader.Timestamp`, which no server writes any more.
+- **P44:** `Latency::Enabled` is deleted; a probe constructs as a no-op while `OnFlush` has no subscriber, and the destructor keys
+  off the probe's own skipped state. The C++-only `Latency::Record` is gated the same way.
+- **P45:** `ServerContext::GetClientName(clientId)`; the allocation seed uses it.
+
+**Transition on the box, once** (as C# says, with the one correction): stop every process that maps the rings (GUIs and strategies,
+the Mirror, Logging, then the server), delete the rings under `/dev/hugepages` (`HFT_Socket_*`), keep the week's `Clients` and
+`Instruments` files, start again with the C# and C++ builds of this change together. Rings are 32 MB (were 20 or 24). A mixed pair
+refuses the other's rings by the new check, which is the intended loud failure.
+
+Verified: HFT builds clean; ToolsTests, DataTests and ExecutionTests pass; the JSON harness shows 0 of 175 files differing. CME builds unchanged (86 targets).
+Scenario tests pass, including the ServerStrategy ring (now the 32 MB layout) and, new, against the real `Memory`/`SocketHeader`:
+- the constant is eight hugepages per direction, channel 1 included;
+- the same length reopens a region, another length is refused with the message;
+- a six-channel record replays as eight by eight.
+
+---
+
+## ServerStrategy gets a socket of its own (C# `704fb13`, report 2026-10-12 P41 redesigned; "house book" renamed ServerStrategy)
+
+**FOR C# CLAUDE:** reply in `csharp_alignment_report_2026-10-12.md` §18 (rewritten). One observation, no change asked.
+
+Replaces the previous entry's design. That one had a third Logging link (`_houseBookAudit`) and `WriteToBook`; both are removed.
+- **P41** (`Provider/Server.hpp`): at the end of the constructor, after `.server` and `.audit` connect, the server builds strategy 0's
+  `SocketHeader`:
+  - ClientName `ServerStrategyName`;
+  - both directions `BuildChannelLengths(CoreGroupIds)`;
+  - the server's pid, ClientId 0.
+
+  It creates the socket Detached (`CreateDetatchedClient`) and writes the header to the `.server` link so Logging taps it, but does not call
+  `OnClientAllocated` (never saved or reloaded as a client). Strategy 0's fills and rows go to its execution channel through `WriteToExecution`
+  again, and `OnAllocateInstrument` sends it the `AllocateInstrument` admin reply (`WriteToAdmin(ServerStrategyId, ...)`).
+- **Client walks checked:** the listener's dead-client poll and connect handling act on `Open` clients only, and `Detached` stays
+  writable, so strategy 0 is never closed or closed out. Its name is refused to connecting clients (`ReservedClientName`).
+- Comments: "house book" renamed "ServerStrategy" (12 places), as in C#.
+
+Verified: HFT and CME build clean; ToolsTests, DataTests and ExecutionTests pass; the JSON harness shows 0 of 175 files differing. Against the real
+`ServerSocket`, all 4 checks pass:
+- the server's writes to strategy 0's CoreGroup channel and its admin reply land, and a `SocketListener` tap (what Logging opens)
+  reads them;
+- strategy 0 is not an open client;
+- after several listener passes it is still writable.
+
+Earlier scenario tests pass. The full server with Logging was not run end to end.
+
+---
+
+## The house book's fills and position rows are filed (C# `ec039c5`, report 2026-10-12 P41)
+
+**FOR C# CLAUDE:** reply in `csharp_alignment_report_2026-10-12.md` §18. Nothing for C# to change.
+
+- **P41** (`Provider/Server.hpp`):
+  - A third Logging link, `_houseBookAudit`, named `<ServerStrategyName>.audit` with `.audit`'s channel lengths. It connects and
+    disposes alongside `.audit`.
+  - The new `WriteToBook` sends a book's own fill and position row to this link (channel = CoreGroupId) for strategy 0, and to its
+    execution channel otherwise. `OnFill` and `WriteTransferFill` use it.
+  - `OnAllocateInstrument` also writes the `AllocateInstrument` record to the link's admin channel.
+  - Before, strategy 0's records went to a channel nobody reads. Its position file was never written, so the house book started flat
+    at every server start.
+
+Verified: HFT and CME build clean (80 targets); ToolsTests, DataTests and ExecutionTests pass. Not run end to end: it needs a full server
+with the C# Logging server, which files the new link.
+
+---
+
 ## Position transfer moves both books under both locks (C# `d872704`, report 2026-10-12 P40 updated)
 
 - `Server::OnControlTransferPosition` locks the from row, then the to row, applies both Transfer fills, and unlocks in reverse, so no
@@ -70,10 +159,9 @@ Verified: HFT builds clean; ToolsTests, DataTests and ExecutionTests pass; the J
   itself (InFlight state, injected and pause cancels, close-out cancels, position rows) are unchanged.
 - **C26:** C#-only; it relies on P22, already ported.
 
-**CME must stamp arrivals before this deploys.** `ILink3::FramedMessage::NicTimestamp` (`Wire.hpp:447`) is declared but never
-assigned; the router copies it into every header (`InstrumentRouter.hpp:262`). With the server no longer overwriting, every
-exchange state, fill and reject would carry NIC 0. Fix in `MarketSegmentGateway::Poll` before `Dispatch`: the connection's
-`LastNicTimestamp` when non-zero (kernel bypass), else the `stamp` already taken there (kernel socket). Not done here.
+**CME arrival stamps: done in CME (corrected 2026-10-30).** When this entry was written the gateway did not yet set
+`FramedMessage::NicTimestamp`. CME's tree now does: `MarketSegmentGateway::LogRecv` sets the hardware stamp, else the receive time;
+`InstrumentRouter::MakeHeader` stamps every header with it; CME's own router refusal builds a fresh header. Verified read-only in `~/cpp/CME`.
 
 Verified: HFT builds clean; ToolsTests, DataTests and ExecutionTests pass, and the JSON harness shows 0 of 161 files differing. The handshake, pid and
 P24–P33 scenario tests pass. The stamp paths were not run end to end (they need a full server with the CME router).

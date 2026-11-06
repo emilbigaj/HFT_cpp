@@ -240,10 +240,13 @@ Ported against C# `460f8ed`. Nothing here asks C# to change code.
 - **P37: ported.** `SessionRateLimit` and `RollingRateLimit::CanSendOrder` are deleted; nothing in C++ called them.
 - **P38: ported in the C++ server.** The four overwrites (`OnOrderState`, `OnOrderRejected`, `OnFill`'s state and fills) are deleted. The
   server's own refusal is stamped in `OnOrderTarget` after `NewOrderRejected`.
-- **P38 receive path, still open in CME:** the CME router hands the server `FramedMessage::NicTimestamp`, but the iLink gateway never
-  sets it yet, so it is 0 on both connection types. CME is to fill it in `MarketSegmentGateway::Poll` from the
-  kernel-bypass connection's hardware stamp, or the gateway's own `Clock` read on a kernel socket, before this server goes live.
-  The hardware-clock discipline (NIC clock to system clock) is still to be confirmed on the box.
+- **P38 receive path, done in CME (corrected 2026-10-30; the first version of this section said it was open):**
+  - `MarketSegmentGateway::LogRecv` stamps every received message's `FramedMessage::NicTimestamp`: the TCPDirect hardware
+    arrival stamp, else the kernel socket's receive time, so it is never zero. Gap-held messages keep their stamp when replayed.
+  - `InstrumentRouter::MakeHeader` puts that stamp on every header made while a report is reconciled, so a state and its fills
+    (spread legs included) share one stamp. Outside a report it stamps `UtcNow()`.
+  - CME's own router refusal (`OnOrderRefused`) now builds its header the same way rather than passing the client's send time through.
+  - Still to confirm on the box: the NIC clock disciplined to the system clock.
 - **C26:** nothing to port. The C++ server posts its `ServerProcessId` (P22), which the C# check relies on.
 
 ## 15. 2026-10-28: C27, C28
@@ -253,7 +256,7 @@ Checked against C# `9cc8fe2`. Nothing here asks C# to change code.
 - `MarketByPrice64.Quantity` is ported as `Data::MarketByPrice64::Quantity()` (bids plus asks).
 - C27 and C28: nothing to port. The C++ server sees the phone as one more `<principal>_GUI<n>@<model>` GUI of a desk, as C28 says. On
   Linux `IsProcessAlive` of the process's own id is already true, so C#'s Android self-check has no C++ twin.
-- **Still open from §14:** the CME iLink gateway must set `FramedMessage::NicTimestamp` before the P38 server goes live.
+- **P38 receive path:** done in CME (see §14, corrected).
 
 ## 16. 2026-10-30: P39, P40
 
@@ -268,10 +271,52 @@ Ported against C# `e0492b0`.
   except a book id that is no allocated client: `CanTransferPosition` calls `GetInstrumentIdsByClientId`, whose `ThrowIfClientIdOutOfRange`
   throws (C# and C++ alike), so such a request ends in the CoreGroup thread's catch instead. C++ matches the C# code. If the intent is
   "never throws", both sides would test `ServerHeader.ClientIds` first.
-- **Deploy:** P39 renames spreads with a leg on another root, so their files must be moved to the new names first.
-- **Still open from §14:** the CME iLink gateway setting `FramedMessage::NicTimestamp` (P38).
+- **Deploy:** P39 renames spreads with a leg on another root, so their files must be moved to the new names first. CME reports
+  4,253 such spreads in the production catalog (CL/BZ, KE/ZW, NG/HH, TTF/TTP and others), but no spread `.position` or `.risklimit`
+  files under `CME_Production`, so nothing needs moving there.
+- **P38 receive path:** done in CME (see §14, corrected).
 
 ## 17. 2026-10-30: P40 updated
 
 Ported against C# `d872704`: `Server::OnControlTransferPosition` takes the from row's lock, then the to row's, applies both fills, and
 releases in reverse; `WriteTransferFill` then records each. Nothing for C# to change.
+
+## 18. 2026-10-30: P41 (rewritten for C# `704fb13`)
+
+Ported against C# `704fb13`. Nothing here asks C# to change code. The first version of this section described the third-link design (`ec039c5`),
+which C++ ported and then replaced with this one the same day.
+
+- At the end of `Server`'s constructor: strategy 0's `SocketHeader` (ServerName, ClientName `ServerStrategyName`, both directions
+  `BuildChannelLengths(CoreGroupIds)`, the server's pid, ClientId 0), `_serverSocket.CreateDetatchedClient`, then `_loggingServer.Write` of the
+  header; no `OnClientAllocated`. Fills and rows of strategy 0 use `WriteToExecution` unchanged. `OnAllocateInstrument` adds
+  `WriteToAdmin(ServerStrategyId, allocateInstrument)`.
+- **Client walks:** the C++ dead-client poll and connect handling act on `Open` clients only, and `Detached` is writable, so strategy 0 is
+  never closed or closed out. The connect path cannot reach it (`ReservedClientName`).
+- **Verified:** against the real `ServerSocket`, writes to strategy 0's CoreGroup and admin channels land and a `SocketListener` tap reads them;
+  strategy 0 is not an open client and stays writable after several listener passes.
+- **Observation, not a request:** `CreateDetatchedClient` throws when `Persistance` is false, in C# and C++ alike. With this change the
+  server's constructor calls it unconditionally, so a server started with `Persistance = false` no longer starts on either side. Every
+  current server runs with it true; if `false` should stay usable, both sides would guard the call.
+- Comments: "house book" is "ServerStrategy" in C++ too.
+
+## 19. 2026-11-07: P42–P46
+
+Ported against C# `7b5183d`. One proposal for C#, one correction to the P46 transition plan.
+
+- **P46: ported.** `SocketChannel::ChannelLength`, `ChannelCount` = 8, the constant `ChannelLengths`; the builder and the two lengths are
+  deleted; every socket (clients, `.server`, `.audit`, the ServerStrategy's, the alert link) uses the constant; the two per-group arrays
+  are sized `ChannelCount`; `Memory::CreateOrOpenShared` grows only an empty file and refuses another length with the same message as C#.
+- **Proposal (C++ does it; C# should too):** `Server::LoadClients` overwrites each replayed record's channel counts and lengths with the
+  constant before `CreateDetatchedClient`. A record written before 2026-11-07 carries the channels its server had then (this week's hold
+  six), and replayed verbatim it rebuilds the old ring under clients that map eight. With the overwrite the week's `Clients` file needs no
+  move at the transition.
+- **Correction to the transition plan:** "move the week's `Clients` file aside" breaks the start on both sides as the code stands: the
+  `Instruments` replay names client ids (1, 2, 3, 10 this week), and `AllocateInstrument(clientId, ...)` throws through
+  `GetSocketHeader`'s range check for a client that was not loaded. Either move both files (every instrument id changes, and saved
+  workspaces restore by `InstrumentId`) or replay the clients with the constant layout, as above. The rings under `/dev/hugepages`
+  must still be deleted in the same stop.
+- **P42: ported** (`ReadExecution` returns whether it read anything; CME ignores it). **P43:** the C++ server stopped writing the field at
+  P34; `Strategy/Scenario.hpp` read it as the simulation clock and now takes `Context::GetLatestMarketDataTimestamp()` (ported from P34)
+  instead. **P44: ported**, including the C++-only `Latency::Record`. **P45: ported.**
+- **Verified:** build, the three suites, JSON harness 0 of 175, CME unchanged; against the real `Memory` and `SocketHeader`: the same
+  length reopens, another length is refused, and a six-channel record replays as eight by eight. The transition itself was not run.
