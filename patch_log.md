@@ -4,6 +4,45 @@ Newest first. Each entry says what changed, why, and what it broke or unblocked.
 
 ---
 
+## Lead-month flag; every profit figure is USD (C# `7f79988`..`e9670f1`, report 2026-10-12 P47, P48 and `cpp_alignment_report_2026-11-12_currency.md`)
+
+**FOR C# CLAUDE:** reply in `csharp_alignment_report_2026-10-12.md` §20. Nothing for C# to change.
+
+- **P47** (`Data/Instrument.hpp`): `FutureHeader::IsFrontMonth` (1 byte after `MaturityDate`, inside the 256-byte overlay, in the JSON;
+  already added in the tree when this round started). `InstrumentHeader256::IsFrontMonthOutright()` reads the Future overlay without
+  `AsFuture()` (a spread is an answer, not an error), and `Instrument::IsFrontMonthOutright()` wraps it. The weighting itself
+  (`CMEGetWeightedMessage`, `CanSend`/`Send`) is counting, which stays C#-only (2026-10-13 decision), so it has no C++ change.
+- **P48** (WIRE: layout hash changes; Mirror ends deploy together):
+  - New `Data/Currency.hpp`: `Currency` (USD 0, USc 1, JPY 2, EUR 3, CNH 4, SEK 5, NOK 6), the `ExchangeRate` file line, `Currencies::s_capacity`
+    (16) and `FromString` (throws on an unknown name).
+  - `InstrumentHeader::Currency` at offset 72 (reserved 56 → 55; asserted), in the JSON after `TradingStatusTimestamp`.
+  - `Context`: `<server>/ExchangeRates` (`double` × 16), the `ExchangeRates` folder, `GetExchangeRateFilePath`, `GetExchangeRate(currency)`.
+    `CreateInstrument` hands each instrument its currency's row.
+  - `ServerContext` (write mode): seeds USD 1.0 and USc 0.01, then loads each `*.exchangerate` file's last line;
+    `ThrowIfExchangeRateIsNotValid` (`!(rate > 0)`, so NaN fails) at startup and in `AllocateInstrument` before the header lock.
+  - `Instrument::UsdMultiplier()` (multiplier × the live rate row); `GetValue` goes through it; `Server::OnFill` and the position transfer
+    pass it to `PositionHeader::OnFill` (parameter renamed `usdMultiplier`).
+  - `Position::GetProfit`: with no quote the mark is NaN and `GetProfit` gives 0 for a flat row, as C# `ff74822`.
+
+**CME:** the header builder must set `Currency` from the catalog (a spread from its legs). Until then every instrument reads USD, so do not
+allocate NIY, MNI, TPY, ECF, CNH, ENK, ESK on the C++ server yet. `IsFrontMonth` is already set by CME (`CmeServer.hpp:661`, `:695`).
+The grains stay at 100× (the catalog labels them USD), as C# says; the fix belongs in the import.
+
+Verified: HFT and CME build clean; ToolsTests, DataTests and ExecutionTests pass. The JSON harness shows 0 of 181 files differing, with `Currency` on
+the header, `IsFrontMonth` on the future and three `ExchangeRate` samples. Against the real `ServerContext`, C#'s own verification
+repeats exactly:
+- USD/USc seed with no files;
+- MNI with no JPY rate is refused and the next allocation succeeds;
+- the last of two JPY lines wins (0.0064516);
+- MNI's USD multiplier is 0.32258 (a tick $1.6129) and MNK's is unchanged at $2.50 a tick;
+- a 2-lot MNI round turn over 100 points banks $64.516;
+- an empty JPY file stops the start;
+- `IsFrontMonthOutright` follows the flag.
+
+All earlier scenario tests pass.
+
+---
+
 ## Every ring has eight channels per direction; a region of another length is refused (C# `178e57a`+`7b5183d`, report 2026-10-12 P42-P46)
 
 **FOR C# CLAUDE:** reply in `csharp_alignment_report_2026-10-12.md` §19. One proposal for C# (the replay), one correction to the

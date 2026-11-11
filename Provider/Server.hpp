@@ -411,13 +411,13 @@ public:
 
         // Step 3: both rows under both locks, acquired from-to and released in reverse, as OnFill does with its two rows
         int32_t instrumentId = controlTransferPosition.InstrumentId;
-        double multiplier = _serverContext.GetInstrument(instrumentId).Multiplier();
+        double usdMultiplier = _serverContext.GetInstrument(instrumentId).UsdMultiplier();
         Socket::SharedArrayEntry<Execution::PositionHeader>& fromPositionEntry = _serverContext.GetPositionHeader(controlTransferPosition.FromStrategyId, instrumentId);
         Socket::SharedArrayEntry<Execution::PositionHeader>& toPositionEntry = _serverContext.GetPositionHeader(controlTransferPosition.ToStrategyId, instrumentId);
         fromPositionEntry.AcquireLock();
         toPositionEntry.AcquireLock();
-        fromPositionEntry.GetRef().OnFill(fromFill, multiplier);
-        toPositionEntry.GetRef().OnFill(toFill, multiplier);
+        fromPositionEntry.GetRef().OnFill(fromFill, usdMultiplier);
+        toPositionEntry.GetRef().OnFill(toFill, usdMultiplier);
         toPositionEntry.ReleaseLock();
         fromPositionEntry.ReleaseLock();
 
@@ -828,8 +828,8 @@ public:
         {
             int32_t instrumentId = fill.OrderHeader.OrderId.InstrumentId();
             Data::Instrument& instrument = _serverContext.GetInstrument(instrumentId);
-            _serverContext.GetPositionHeader(instrumentId).GetRef().OnFill(fill, instrument.Multiplier());
-            _serverContext.GetPositionHeader(strategyId, instrumentId).GetRef().OnFill(fill, instrument.Multiplier());
+            _serverContext.GetPositionHeader(instrumentId).GetRef().OnFill(fill, instrument.UsdMultiplier());
+            _serverContext.GetPositionHeader(strategyId, instrumentId).GetRef().OnFill(fill, instrument.UsdMultiplier());
             _riskLayer.OnFill(fill);
         }
 

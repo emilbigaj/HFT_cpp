@@ -729,7 +729,9 @@ namespace Execution
 
 		// The tickSize parameter is gone: fill.Price is already a price (leg fills arrive at
 		// increments finer than the trading grid, so ticks cannot represent them).
-		void OnFill(const Fill& fill, double multiplier)
+		// RealizedProfit banks in dollars at the rate that applied when it was earned, as the clearer sweeps the day's yen: a
+		// realized figure never changes afterwards, so an audit line means the same tomorrow (see Spec.md).
+		void OnFill(const Fill& fill, double usdMultiplier)
 		{
 			int32_t quantity = fill.Quantity;
 			double price = fill.Price;
@@ -750,7 +752,7 @@ namespace Execution
 			else
 			{
 				int32_t closed = std::min(std::abs(oldQty), std::abs(quantity));
-				double pnl = (price - AvgPrice) * closed * oldSide * multiplier;
+				double pnl = (price - AvgPrice) * closed * oldSide * usdMultiplier;
 				RealizedProfit += pnl;
 
 				if (newQty == 0)

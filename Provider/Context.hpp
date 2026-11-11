@@ -117,6 +117,11 @@ public:
 		return directoryPath / "RateLimits" / (coreGroupName + ".ratelimit");
 	}
 
+	static std::filesystem::path GetExchangeRateFilePath(const std::filesystem::path& directoryPath, Data::Currency currency)
+	{
+		return directoryPath / "ExchangeRates" / (std::string(magic_enum::enum_name(currency)) + ".exchangerate");
+	}
+
 	static std::filesystem::path GetCoreGroupFilePath(const std::filesystem::path& directoryPath, const std::string& coreGroupName)
 	{
 		return directoryPath / "CoreGroups" / (coreGroupName + ".coregroup");
@@ -142,6 +147,7 @@ public:
 	const std::filesystem::path MessageEfficiencyDirectoryPath;
 	const std::filesystem::path RateLimitsDirectoryPath;
 	const std::filesystem::path CoreGroupsDirectoryPath;
+	const std::filesystem::path ExchangeRatesDirectoryPath;
 	const std::filesystem::path AuditDirectoryPath;
 	const std::filesystem::path SeriesDirectoryPath;
 	const std::filesystem::path WorkspaceDirectoryPath;
@@ -187,6 +193,8 @@ protected:
 	// Per strategy and instrument: its own orders, written by that strategy's RiskLayer. Under the server's name so the Mirror
 	// copies them to a remote desk.
 	Socket::SharedArray<Execution::WorkingRisk> _localWorkingRisks;
+	// Per Currency: dollars for one of its units, server-written at startup.
+	Socket::SharedArray<double> _exchangeRates;
 
 	// The allocation ThrowIfInstrumentIdOutOfRange tests: ServerHeader.InstrumentIds for the server,
 	// InstrumentIdsByClientId[ClientId] for a client (C# overrides it per context). Set by each derived
@@ -214,6 +222,7 @@ protected:
     MessageEfficiencyDirectoryPath(directoryPath / "MessageEfficiency"),
     RateLimitsDirectoryPath(directoryPath / "RateLimits"),
     CoreGroupsDirectoryPath(directoryPath / "CoreGroups"),
+    ExchangeRatesDirectoryPath(directoryPath / "ExchangeRates"),
     AuditDirectoryPath(GetAuditDirectoryPath(directoryPath)),
     SeriesDirectoryPath(directoryPath / "Series"),
     WorkspaceDirectoryPath(directoryPath / "Workspaces"),
@@ -237,7 +246,9 @@ protected:
     _serverPositionHeaders(serverName / "ServerPositionHeaders", ServerHeader().GetReadonlyRef().InstrumentIds.Length(), ServerAccess),
     _localRiskLimits(serverName / "LocalRiskLimits", ServerHeader().GetReadonlyRef().LocalPositionsCapacity(), ServerAccess, false),
     // Why writable on both sides: the server seeds each row at allocation, the strategy moves it
-    _localWorkingRisks(serverName / "LocalWorkingRisks", ServerHeader().GetReadonlyRef().LocalPositionsCapacity(), ServerAccess == Tools::Access::Write ? Tools::Access::Write : ClientAccess, false)
+    _localWorkingRisks(serverName / "LocalWorkingRisks", ServerHeader().GetReadonlyRef().LocalPositionsCapacity(), ServerAccess == Tools::Access::Write ? Tools::Access::Write : ClientAccess, false),
+    // Dollars for one unit of each currency, by Currency value. The server loads it at startup; the Mirror copies it to every desk.
+    _exchangeRates(serverName / "ExchangeRates", Data::Currencies::s_capacity, ServerAccess)
 	{
         std::cout << Tools::GetTypeName(typeid(*this)) << "(" << serverName << ", " << directoryPath.string() << ", "
                   << static_cast<int>(serverAccess) << ", " << static_cast<int>(clientAccess) << ")" << std::endl;
@@ -249,6 +260,7 @@ protected:
         std::filesystem::create_directories(MessageEfficiencyDirectoryPath);
         std::filesystem::create_directories(RateLimitsDirectoryPath);
         std::filesystem::create_directories(CoreGroupsDirectoryPath);
+        std::filesystem::create_directories(ExchangeRatesDirectoryPath);
         std::filesystem::create_directories(AuditDirectoryPath);
         std::filesystem::create_directories(SeriesDirectoryPath);
         std::filesystem::create_directories(WorkspaceDirectoryPath);
@@ -451,6 +463,13 @@ public:
 		return latestNicTimestamp;
 	}
 
+	// One per Currency, server-written at startup: the dollars one of its units is worth, which every
+	// instrument of that currency reads its profit through.
+	Socket::SharedArrayEntry<double>& GetExchangeRate(Data::Currency currency)
+	{
+		return _exchangeRates[static_cast<int32_t>(currency)];
+	}
+
 	Socket::SharedArrayEntry<Execution::MessageEfficiency>& GetMessageEfficiency(int32_t productGroupId)
 	{
 		return _messageEfficiency[productGroupId];
@@ -608,13 +627,14 @@ protected:
 
 		Socket::SharedArrayEntry<Data::InstrumentHeader256>& header256Entry = GetInstrumentHeader(instrumentHeaderId);
 		const Data::InstrumentHeader& instrHeader = header256Entry.GetReadonlyRef().AsInstrumentHeader();
+		Socket::SharedArrayEntry<double>& exchangeRateEntry = GetExchangeRate(instrHeader.Currency);
 
 		Socket::SharedArrayEntry<Data::MarketByPrice64>& mbpEntry = _marketsByPrice[instrumentId];
 		std::unique_ptr<Data::Instrument> instrument = nullptr;
 
 		if (instrHeader.InstrumentType == Data::InstrumentType::Future)
 		{
-			instrument = std::make_unique<class Data::Future>(instrumentId, header256Entry.Cast<Data::FutureHeader>(), mbpEntry);
+			instrument = std::make_unique<class Data::Future>(instrumentId, header256Entry.Cast<Data::FutureHeader>(), mbpEntry, exchangeRateEntry);
 		}
 		else if (instrHeader.InstrumentType == Data::InstrumentType::Spread)
 		{
@@ -633,11 +653,11 @@ protected:
 			// C# throws here too: Spread's constructor dereferences both legs.
 			if (!longLeg || !shortLeg)
 				throw std::runtime_error(std::string(typeid(*this).name()) + ".CreateInstrument(" + std::to_string(instrumentId) + "), spread header must carry one positive and one negative leg.");
-			instrument = std::make_unique<class Data::Spread>(instrumentId, header256Entry.Cast<Data::LeggedHeader>(), mbpEntry, *longLeg, *shortLeg);
+			instrument = std::make_unique<class Data::Spread>(instrumentId, header256Entry.Cast<Data::LeggedHeader>(), mbpEntry, exchangeRateEntry, *longLeg, *shortLeg);
 		}
 		else if (instrHeader.InstrumentType == Data::InstrumentType::Forex)
 		{
-			instrument = std::make_unique<class Data::Forex>(instrumentId, header256Entry.Cast<Data::ForexHeader>(), mbpEntry);
+			instrument = std::make_unique<class Data::Forex>(instrumentId, header256Entry.Cast<Data::ForexHeader>(), mbpEntry, exchangeRateEntry);
 		}
 		else
 		{
@@ -733,7 +753,35 @@ public:
 				rateLimit.RateLimitId = coreGroupId;
 				_rateLimits[coreGroupId].Write(Execution::RollingRateLimit(rateLimit));
 			}
+
+			// USD and USc are conversions, not quotes: nothing fetches them, so they are not worth a daily file. A file still wins.
+			_exchangeRates[static_cast<int32_t>(Data::Currency::USD)].Write(1.0);
+			_exchangeRates[static_cast<int32_t>(Data::Currency::USc)].Write(0.01);
+
+			// Dollars for one unit of every currency that has a file, its last line, as .risklimit is read. Why only the files
+			// present: a box that trades no yen needs no yen file, and an instrument whose currency has none is refused at
+			// allocation instead of being priced at zero. A replay values its yen at the file's newest rate (see Spec.md).
+			for (const std::filesystem::directory_entry& entry : std::filesystem::directory_iterator(ExchangeRatesDirectoryPath))
+			{
+				if (!entry.is_regular_file() || entry.path().extension() != ".exchangerate")
+					continue;
+				Data::Currency currency = Data::Currencies::FromString(entry.path().stem().string());
+				std::optional<std::string> exchangeRateLine = Tools::ReadLastLine(entry.path().string());
+				double usdRate = exchangeRateLine ? Tools::Json::Deserialize<Data::ExchangeRate>(exchangeRateLine.value()).UsdRate : std::numeric_limits<double>::quiet_NaN();
+				ThrowIfExchangeRateIsNotValid(currency, usdRate);
+				_exchangeRates[static_cast<int32_t>(currency)].Write(usdRate);
+			}
 		}
+	}
+
+	// A currency's rate must exist and be positive: NaN means its file is empty, 0 means it has no file at all.
+	// Why not on the read path: it is written once at startup and cannot change during the run (see Spec.md).
+	static void ThrowIfExchangeRateIsNotValid(Data::Currency currency, double usdRate)
+	{
+		// Why not <= 0: every comparison against NaN is false, so a missing rate would walk straight past that test
+		if (!(usdRate > 0))
+			throw std::runtime_error("ServerContext::ThrowIfExchangeRateIsNotValid(" + std::string(magic_enum::enum_name(currency)) + "): rate is " + std::to_string(usdRate)
+				+ ", must be greater than 0; add " + std::string(magic_enum::enum_name(currency)) + ".exchangerate to the server's ExchangeRates folder and restart.");
 	}
 
 	static inline std::filesystem::path DirectoriesPath()
@@ -907,6 +955,8 @@ public:
 
 		if (serverHeader.InstrumentIds.IsFull())
 			throw std::runtime_error(std::string(typeid(*this).name()) + ".AllocateInstrument(" + std::to_string(instrumentHeaderId) + "), InstrumentIds is Full.");
+		// The server refuses an instrument it cannot price. Why before the lock: a throw past AcquireLock leaves the ServerHeader row odd for every reader
+		ThrowIfExchangeRateIsNotValid(header.Currency, GetExchangeRate(header.Currency).GetReadonlyRef());
 
 		instrumentId = serverHeader.InstrumentIds.LowestClear();
 
@@ -1192,15 +1242,10 @@ inline Profit Position::GetProfit()
 		.Ask = Data::Level { .Ticks = 0, .Quantity = 0 }
 	};
 
-	if (Instrument.TryGetQuote(quote))
-	{
-		double floating = Instrument.GetProfit(positionHeader.AvgPrice, quote.MidPrice(), positionHeader.Quantity);
-		return Profit(Tools::Clock::UtcNow(), floating + positionHeader.RealizedProfit, floating, positionHeader.RealizedProfit, positionHeader.Quantity, positionHeader.AvgPrice, quote.MidPrice());
-	}
-	else
-	{
-		return Profit(Tools::Clock::UtcNow(), std::nan(""), std::nan(""), positionHeader.RealizedProfit, positionHeader.Quantity, positionHeader.AvgPrice, std::nan(""));
-	}
+	// No quote (the instrument is not Open, or a side is empty) marks at NaN, which GetProfit turns into 0 for a flat row: nothing to revalue.
+	double midPrice = Instrument.TryGetQuote(quote) ? quote.MidPrice() : std::nan("");
+	double floating = Instrument.GetProfit(positionHeader.AvgPrice, midPrice, positionHeader.Quantity);
+	return Profit(Tools::Clock::UtcNow(), floating + positionHeader.RealizedProfit, floating, positionHeader.RealizedProfit, positionHeader.Quantity, positionHeader.AvgPrice, midPrice);
 }
 
 inline bool Position::TryGetQuote(Data::Quote& quote)

@@ -320,3 +320,18 @@ Ported against C# `7b5183d`. One proposal for C#, one correction to the P46 tran
   instead. **P44: ported**, including the C++-only `Latency::Record`. **P45: ported.**
 - **Verified:** build, the three suites, JSON harness 0 of 175, CME unchanged; against the real `Memory` and `SocketHeader`: the same
   length reopens, another length is refused, and a six-channel record replays as eight by eight. The transition itself was not run.
+
+## 20. 2026-11-11: P47, P48
+
+Ported against C# `e9670f1`. Nothing here asks C# to change code.
+
+- **P47:** `FutureHeader::IsFrontMonth`, `InstrumentHeader256::IsFrontMonthOutright()` (reads the Future overlay directly, not through
+  the throwing `AsFuture()`), `Instrument::IsFrontMonthOutright()`. The weighting itself is not ported: C++ never counts message
+  efficiency (2026-10-13). CME already stamps the flag from the lead months.
+- **P48:** ported per `cpp_alignment_report_2026-11-12_currency.md` §7, steps 1 and 3–6. `Data/Currency.hpp` (enum, `ExchangeRate`,
+  `Currencies`); `InstrumentHeader::Currency` @72; `<server>/ExchangeRates` (`double` × 16); `GetExchangeRate`; the startup seed and
+  load; `ThrowIfExchangeRateIsNotValid` at startup and before the header lock in `AllocateInstrument`; `UsdMultiplier` in `GetValue`
+  and at every `OnFill` site; `Position::GetProfit` marks a flat row at 0 with no quote. Step 2 (the header writer setting `Currency`)
+  is CME's, and is not done yet. Step 7 (redeploy every Mirror end) applies.
+- **Verified:** the JSON harness shows 0 of 181 files differing. Against the real `ServerContext`, every assertion of the currency report's §8 holds with
+  the same figures (0.32258; $1.6129 and $2.50 a tick; $64.516 banked; the refusal and the server staying usable; the empty-file stop).

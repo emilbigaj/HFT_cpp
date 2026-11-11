@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Json.hpp"
+#include "Currency.hpp"
 #include "String.hpp"
 #include "Timestamp.hpp"
 #include "SharedArray.hpp"
@@ -59,7 +60,8 @@ namespace Data
 		int32_t ExchangeInstrumentId;
 		Tools::String4 ProductGroupRoot;   // the group CME counts its message efficiency under (MDP3 SecurityGroup, tag 1151), set by whoever builds the header
 		Tools::Timestamp TradingStatusTimestamp = Tools::Timestamp(0);   // @64: exchange time TradingStatus last changed; MinValue never. Server only, written before TradingStatus
-		uint8_t _reserved[56] = {};
+		Data::Currency Currency = Data::Currency::USD;   // @72: what the contract pays in, from the catalog; USD unstamped, set by whoever builds the header
+		uint8_t _reserved[55] = {};
 		std::string ToString() const
 		{
 			return Tools::Json::Serialize(*this);
@@ -83,7 +85,8 @@ namespace Data
 				"InstrumentId", &T::InstrumentId,
 				"ExchangeInstrumentId", &T::ExchangeInstrumentId,
 				"ProductGroupRoot", &T::ProductGroupRoot,
-				"TradingStatusTimestamp", &T::TradingStatusTimestamp
+				"TradingStatusTimestamp", &T::TradingStatusTimestamp,
+				"Currency", &T::Currency
 			);
 		};
 	};
@@ -93,6 +96,7 @@ namespace Data
 	// verified against C# field order - the 09-10 report's "offset 7" counts from 1.
 	static_assert(offsetof(InstrumentHeader, TradingStatus) == 6);
 	static_assert(offsetof(InstrumentHeader, ProductGroupId) == 7 && offsetof(InstrumentHeader, ProductGroupRoot) == 60 && offsetof(InstrumentHeader, TradingStatusTimestamp) == 64);
+	static_assert(offsetof(InstrumentHeader, Currency) == 72);
 
 	struct ForexHeader
 	{
@@ -127,6 +131,7 @@ namespace Data
 		Data::InstrumentHeader InstrumentHeader;
 		double Multiplier;
 		Tools::Timestamp MaturityDate;
+		bool IsFrontMonth;
 		// MaturityType deleted (was the tail byte after MaturityDate; no other offsets moved):
 		// the date alone identifies a contract, and bare-ISO-date symbols sort chronologically.
 
@@ -147,7 +152,8 @@ namespace Data
 				"Symbology", glz::custom<glz::skip{}, Tools::NullIfThrows<&T::Symbology>>,
 				"InstrumentHeader", &T::InstrumentHeader,
 				"Multiplier", &T::Multiplier,
-				"MaturityDate", &T::MaturityDate
+				"MaturityDate", &T::MaturityDate,
+				"IsFrontMonth", &T::IsFrontMonth
 			);
 		};
 	};
@@ -237,6 +243,13 @@ namespace Data
 		const InstrumentHeader& AsInstrumentHeader() const
 		{
 			return Base;
+		}
+
+		// CME charges message efficiency's full weight only for a lead-month outright, a tenth for a back month and for every
+		// spread (see Spec.md). Why not AsFuture: it throws for a spread, which is the common answer here, not an error.
+		bool IsFrontMonthOutright() const
+		{
+			return Base.InstrumentType == InstrumentType::Future && Future.IsFrontMonth;
 		}
 		
 		// Overlay accessors are TYPE-GUARDED: a realtime context holds spreads and unfilled slots
@@ -339,10 +352,13 @@ namespace Data
 		Socket::SharedArrayEntry<MarketByPrice64> _mbpEntry;
         std::unique_ptr<Data::Symbology> _symbology;
         double _multiplier = 1.0;
+		// This instrument's currency's row in the server's ExchangeRates, handed over at construction: one load, no lookup, per fill.
+		Socket::SharedArrayEntry<double> _exchangeRateEntry;
 
-		Instrument(int32_t id, Socket::SharedArrayEntry<InstrumentHeader256> headerEntry, Socket::SharedArrayEntry<MarketByPrice64> mbpEntry)
+		Instrument(int32_t id, Socket::SharedArrayEntry<InstrumentHeader256> headerEntry, Socket::SharedArrayEntry<MarketByPrice64> mbpEntry, Socket::SharedArrayEntry<double> exchangeRateEntry)
         : _headerEntry(headerEntry),
           _mbpEntry(mbpEntry),
+          _exchangeRateEntry(exchangeRateEntry),
           InstrumentId(id),
           TickDecimals(Tools::GetNumberOfDecimalPlaces(TickSize()))
 		{
@@ -502,9 +518,22 @@ namespace Data
 			return GetValue(sellPrice - buyPrice) * quantity;
 		}
 
+		// The contract's multiplier in dollars: its own, times its currency's rate. Read live, never cached: a GUI open for a
+		// week must see a new rate, and every profit figure in the system is USD whatever the contract quotes in (see Spec.md).
+		double UsdMultiplier() const
+		{
+			return Multiplier() * _exchangeRateEntry.GetReadonlyRef();
+		}
+
+		// What CME's message-efficiency weight turns on: false for a spread and for a back month (see InstrumentHeader256).
+		bool IsFrontMonthOutright() const
+		{
+			return _headerEntry.GetReadonlyRef().IsFrontMonthOutright();
+		}
+
 		double GetValue(double price) const
 		{
-			return price * Multiplier();
+			return price * UsdMultiplier();
 		}
 
 		double TicksToPrice(int32_t ticks) const
@@ -612,7 +641,7 @@ namespace Data
 	public:
 
 
-		Future(int32_t id, Socket::SharedArrayEntry<Data::FutureHeader> headerEntry, Socket::SharedArrayEntry<MarketByPrice64> mbpEntry) : Instrument(id, headerEntry.Cast<InstrumentHeader256>(), mbpEntry)
+		Future(int32_t id, Socket::SharedArrayEntry<Data::FutureHeader> headerEntry, Socket::SharedArrayEntry<MarketByPrice64> mbpEntry, Socket::SharedArrayEntry<double> exchangeRateEntry) : Instrument(id, headerEntry.Cast<InstrumentHeader256>(), mbpEntry, exchangeRateEntry)
 		{
 			_symbology = FutureHeader().Symbology();
 			_multiplier = FutureHeader().Multiplier;
@@ -632,7 +661,7 @@ namespace Data
 	class Forex final : public Instrument
 	{
 	public:
-		Forex(int32_t id, Socket::SharedArrayEntry<Data::ForexHeader> headerEntry, Socket::SharedArrayEntry<MarketByPrice64> mbpEntry) : Instrument(id, headerEntry.Cast<InstrumentHeader256>(), mbpEntry)
+		Forex(int32_t id, Socket::SharedArrayEntry<Data::ForexHeader> headerEntry, Socket::SharedArrayEntry<MarketByPrice64> mbpEntry, Socket::SharedArrayEntry<double> exchangeRateEntry) : Instrument(id, headerEntry.Cast<InstrumentHeader256>(), mbpEntry, exchangeRateEntry)
 		{
 			_symbology = ForexHeader().Symbology();
 			_multiplier = 1.0;
@@ -664,7 +693,7 @@ namespace Data
 		const Future& _short;
 
 	public:
-		Spread(int32_t id, Socket::SharedArrayEntry<Data::LeggedHeader> headerEntry, Socket::SharedArrayEntry<MarketByPrice64> mbpEntry, const Future& longFuture, const Future& shortFuture) : Instrument(id, headerEntry.Cast<Data::InstrumentHeader256>(), mbpEntry), _long(longFuture), _short(shortFuture)
+		Spread(int32_t id, Socket::SharedArrayEntry<Data::LeggedHeader> headerEntry, Socket::SharedArrayEntry<MarketByPrice64> mbpEntry, Socket::SharedArrayEntry<double> exchangeRateEntry, const Future& longFuture, const Future& shortFuture) : Instrument(id, headerEntry.Cast<Data::InstrumentHeader256>(), mbpEntry, exchangeRateEntry), _long(longFuture), _short(shortFuture)
 		{
 			_symbology = Legged().Symbology();
 			_legs = { Data::InstrumentLeg{ longFuture.InstrumentId, 1 }, Data::InstrumentLeg{ shortFuture.InstrumentId, -1 } };
