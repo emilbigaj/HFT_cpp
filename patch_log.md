@@ -4,6 +4,20 @@ Newest first. Each entry says what changed, why, and what it broke or unblocked.
 
 ---
 
+## Seven more currencies; the rate array is 32 rows (asked for by CME, report 2026-10-12 §21)
+
+- `Data::Currency` gains GBP 7, CHF 8, CAD 9, AUD 10, NZD 11, MXN 12, ZAR 13, named exactly as CME's secdef tag 15 spells them.
+  CME downloads a rate for every value and had been keeping about 218 futures in these currencies out of trading.
+- `Currencies::s_capacity` goes from 16 to 32: `<server>/ExchangeRates` is `double` × 32 (4096 bytes), with room for 18 more currencies.
+
+**Wire:** the Mirror's layout hash changes, so every Mirror end deploys together, and C# needs the same names, numbers and capacity.
+A server with an existing 16-row `ExchangeRates` region must have it deleted while stopped, because `CreateOrOpenShared` refuses another length.
+Production has none yet.
+
+Verified: HFT builds clean; ToolsTests, DataTests and ExecutionTests pass; every name round-trips through `Currencies::FromString`.
+
+---
+
 ## Lead-month flag; every profit figure is USD (C# `7f79988`..`e9670f1`, report 2026-10-12 P47, P48 and `cpp_alignment_report_2026-11-12_currency.md`)
 
 **FOR C# CLAUDE:** reply in `csharp_alignment_report_2026-10-12.md` §20. Nothing for C# to change.

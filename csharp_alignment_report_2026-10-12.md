@@ -335,3 +335,21 @@ Ported against C# `e9670f1`. Nothing here asks C# to change code.
   is CME's, and is not done yet. Step 7 (redeploy every Mirror end) applies.
 - **Verified:** the JSON harness shows 0 of 181 files differing. Against the real `ServerContext`, every assertion of the currency report's §8 holds with
   the same figures (0.32258; $1.6129 and $2.50 a tick; $64.516 banked; the refusal and the server staying usable; the empty-file stop).
+
+## 21. 2026-11-12: seven more currencies, rate array 32 rows (asked for by CME)
+
+**C# should port this.** The header byte and the rate array both cross the Mirror, so the two sides must agree on every name, number and the capacity.
+
+- `Data::Currency` gains `GBP = 7`, `CHF = 8`, `CAD = 9`, `AUD = 10`, `NZD = 11`, `MXN = 12`, `ZAR = 13`, appended after `NOK` with
+  nothing renumbered. C# `Currency` needs the same seven, with the same names and numbers.
+- The names are the ISO codes exactly as CME's secdef tag 15 spells them. CME reads the tag with `enum_cast`, writes a daily
+  `<CUR>.exchangerate` for every value except USD and USc, and keeps any contract whose currency the enum does not name in the catalog only.
+  About 218 served futures were held back that way (GBP 88, CHF 39, CAD 33, MXN 25, NZD 14, AUD 14, ZAR 5).
+- **Layout: `Currencies::s_capacity` goes from 16 to 32.** C# should make the same change. 14 values would still fit in 16, but
+  only 2 would be left for later currencies; 32 leaves 18, so the next ones need no layout change. `<server>/ExchangeRates` becomes
+  `double` × 32 (4096 bytes instead of 2048), and the Mirror's layout hash changes, so every desk reinstalls once with this release.
+  `CreateOrOpenShared` refuses to open a region of another length, so a server that already has a 16-row `ExchangeRates` region needs it
+  deleted while stopped. Production has none yet (its CmeServer predates P48), so nothing has to move there.
+- **Mixed-currency spreads** (e.g. NKD–NIY, tag 15 USD, legs USD and JPY): each leg's profit uses that leg's own currency. Fills post
+  under the leg's `InstrumentId`, and `OnFill` takes that leg's `UsdMultiplier`. The spread's own rate row only has to be valid when it
+  is allocated. No change; noted so C# can confirm it holds on its side too.
